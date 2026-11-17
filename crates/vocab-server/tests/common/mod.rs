@@ -1,18 +1,19 @@
 //! Shared harness of the integration tests: a temporary database, a manual
-//! clock, the HTTP router (logged in with a synthetic `test-` password) and
+//! clock, the HTTP router (set up through the first-run setup with the
+//! start's setup code and a synthetic `test-` password, then logged in) and
 //! synthetic packs (`test-` ids, invented sentences only).
 
 // Each test binary that includes this module uses a different subset of it.
 #![allow(dead_code)]
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{HeaderValue, Request, StatusCode, header};
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use tower::ServiceExt;
-use vocab_server::auth::{self, Auth, Credentials};
+use vocab_server::auth::{Auth, SetupCode};
 use vocab_server::catalog::{self, WordId, WordTraits};
 use vocab_server::clock::{Clock, DayRule, ManualClock, Moment, StudyDay, Timestamp};
 use vocab_server::config::Limits;
@@ -36,64 +37,96 @@ pub fn prague() -> DayRule {
 /// `public_origin` of the test apps (placeholder domain of the design).
 pub const ORIGIN: &str = "https://vocab.example.home";
 pub const PASSWORD: &str = "test-password-for-the-integration-tests";
-pub const IMPORT_TOKEN: &str = "test-import-token-for-the-integration-tests";
 
-/// `VOCAB_PASSWORD_HASH_B64` of [`PASSWORD`], hashed once per test binary.
-pub fn password_hash_b64() -> &'static str {
-    static HASH: OnceLock<String> = OnceLock::new();
-    HASH.get_or_init(|| auth::hash_password(PASSWORD).expect("hash the test password"))
-}
-
-pub fn credentials() -> Credentials {
-    Credentials::new(password_hash_b64(), IMPORT_TOKEN).expect("test credentials")
-}
-
-/// Auth with the design's 180-day sessions.
-pub fn auth() -> Auth {
-    Auth::new(credentials(), ORIGIN, 180)
+/// Auth with the design's 180-day sessions, and its start's setup code.
+pub fn auth() -> (Arc<Auth>, SetupCode) {
+    let (auth, code) = Auth::new(ORIGIN, 180).expect("auth");
+    (Arc::new(auth), code)
 }
 
 /// Auth whose sessions outlive any clock jump of a test (100 years), for
 /// tests about other things than sessions.
-pub fn long_auth() -> Auth {
-    Auth::new(credentials(), ORIGIN, 36_500)
+pub fn long_auth() -> (Arc<Auth>, SetupCode) {
+    let (auth, code) = Auth::new(ORIGIN, 36_500).expect("auth");
+    (Arc::new(auth), code)
 }
 
-/// Log in through `router`; returns the `name=value` cookie pair.
-pub async fn login(router: &axum::Router) -> String {
+/// A JSON POST as the app's page sends it, with an optional cookie.
+pub fn post_json(uri: &str, body: &Value, cookie: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::ORIGIN, ORIGIN)
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(cookie) = cookie {
+        builder = builder.header(header::COOKIE, cookie);
+    }
+    builder.body(Body::from(body.to_string())).expect("request")
+}
+
+/// The `name=value` pair of a response's session cookie.
+pub fn cookie_pair_of(response: &axum::response::Response) -> Option<String> {
+    let cookie = response.headers().get(header::SET_COOKIE)?.to_str().ok()?;
+    cookie.split(';').next().map(str::to_owned)
+}
+
+/// Sign in through `router`: the first-run setup with `code` and
+/// [`PASSWORD`] when the app is not set up yet, a login otherwise. Returns
+/// the `name=value` cookie pair.
+pub async fn login(router: &axum::Router, code: &SetupCode) -> String {
+    let setup = json!({ "code": code.to_string(), "password": PASSWORD });
     let response = router
         .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/auth/login")
-                .header(header::ORIGIN, ORIGIN)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(json!({ "password": PASSWORD }).to_string()))
-                .expect("request"),
-        )
+        .oneshot(post_json("/api/auth/setup", &setup, None))
         .await
         .expect("response");
-    assert_eq!(response.status(), StatusCode::OK, "test login");
-    let cookie = response
-        .headers()
-        .get(header::SET_COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .expect("session cookie");
-    cookie.split(';').next().expect("cookie pair").to_owned()
+    let response = if response.status() == StatusCode::CONFLICT {
+        router
+            .clone()
+            .oneshot(post_json(
+                "/api/auth/login",
+                &json!({ "password": PASSWORD }),
+                None,
+            ))
+            .await
+            .expect("response")
+    } else {
+        response
+    };
+    assert_eq!(response.status(), StatusCode::OK, "test setup or login");
+    cookie_pair_of(&response).expect("session cookie")
 }
 
-/// `router` as a logged-in browser of the app's origin would use it: logs
-/// in on the first request and adds the session cookie and the `Origin`
-/// header to every request that does not set them itself.
-pub fn logged_in(router: axum::Router) -> axum::Router {
+/// Create a connector token with the session `cookie` (and the password,
+/// which creating one asks for again); returns the token.
+pub async fn connector_token(router: &axum::Router, cookie: &str) -> String {
+    let response = router
+        .clone()
+        .oneshot(post_json(
+            "/api/auth/connector-token",
+            &json!({ "current_password": PASSWORD }),
+            Some(cookie),
+        ))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK, "create connector token");
+    let bytes = to_bytes(response.into_body(), 1 << 16).await.expect("body");
+    let body: Value = serde_json::from_slice(&bytes).expect("json");
+    body["token"].as_str().expect("token").to_owned()
+}
+
+/// `router` as a logged-in browser of the app's origin would use it: sets
+/// the app up (or logs in) on the first request and adds the session cookie
+/// and the `Origin` header to every request that does not set them itself.
+pub fn logged_in(router: axum::Router, code: SetupCode) -> axum::Router {
     let cookie: Arc<tokio::sync::OnceCell<String>> = Arc::new(tokio::sync::OnceCell::new());
     let inner = router;
     axum::Router::new().fallback_service(tower::service_fn(move |mut request: Request<Body>| {
         let inner = inner.clone();
         let cookie = Arc::clone(&cookie);
+        let code = code.clone();
         async move {
-            let pair = cookie.get_or_init(|| login(&inner)).await;
+            let pair = cookie.get_or_init(|| login(&inner, &code)).await;
             let headers = request.headers_mut();
             if !headers.contains_key(header::COOKIE) {
                 headers.insert(header::COOKIE, HeaderValue::from_str(pair).expect("cookie"));
@@ -127,13 +160,14 @@ pub fn env() -> Env {
 pub fn env_in(dir: tempfile::TempDir, now: &str) -> Env {
     let db = Db::open(dir.path()).expect("db");
     let clock = Arc::new(ManualClock::new(ts(now)));
+    let (auth, code) = long_auth();
     let state = AppState::with_clock(
         db.clone(),
         Arc::clone(&clock) as Arc<dyn Clock>,
         prague(),
-        long_auth(),
+        auth,
     );
-    let router = logged_in(http::app(state, &Limits::default()));
+    let router = logged_in(http::app(state, &Limits::default()), code);
     Env {
         dir,
         db,

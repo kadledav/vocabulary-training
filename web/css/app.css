@@ -1079,14 +1079,22 @@ button.guarded:disabled {
 
 /* ── Login ──────────────────────────────────────────────────────────────── */
 
-form.login {
+form.login,
+form.credentials {
   display: grid;
   gap: 0.75rem;
   max-width: 24rem;
   margin-top: 1.5rem;
 }
 
-form.login input[type="password"] {
+form.credentials {
+  margin-top: 0.75rem;
+}
+
+form.login input[type="password"],
+form.login input[type="text"],
+form.credentials input[type="password"],
+.connector-token input[type="text"] {
   width: 100%;
   min-height: 2.75rem;
   font: inherit;
@@ -1099,4 +1107,15 @@ form.login input[type="password"] {
 
 .settings.account {
   margin-top: 2rem;
+}
+
+.connector-token {
+  display: grid;
+  gap: 0.75rem;
+  max-width: 24rem;
+}
+
+.connector-token input[type="text"] {
+  font-family: ui-monospace, monospace;
+  font-size: 0.85rem;
 }

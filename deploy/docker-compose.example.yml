@@ -1,7 +1,8 @@
 # Compose stack of the vocabulary app (design §12.2, R-80, R-81, R-83, R-85).
-# Copy to the home repo as docker/vocabulary/docker-compose.yml, next to a
-# .env made from .env.example. Set `image:` to the tag AND digest printed in
-# the release notes (see README.md). The TTS service joins in M6.
+# Copy to the home repo as docker/vocabulary/docker-compose.yml. No .env and
+# no secrets: the password is set in the app on first start (setup code in
+# `docker logs vocabulary`, see README.md). Set `image:` to the tag AND digest
+# printed in the release notes. The TTS service joins in M6.
 name: vocabulary
 
 services:
@@ -9,7 +10,7 @@ services:
     container_name: vocabulary
     image: ghcr.io/kadledav/vocabulary-training:X.Y.Z@sha256:DIGEST-FROM-THE-RELEASE-NOTES
     restart: unless-stopped
-    # The owner's TrueNAS user and group (owner of data/ and cache/, see
+    # The owner's TrueNAS user and group (owner of the dataset, see
     # README.md); change the second number if your group ID differs.
     user: "3101:3101"
     read_only: true
@@ -24,12 +25,10 @@ services:
       - VOCAB_TIMEZONE=Europe/Prague
       - VOCAB_DAY_ROLLOVER_HOUR=4
       - VOCAB_LOG_LEVEL=info
-      # Secrets from .env (README.md §2).
-      - VOCAB_PASSWORD_HASH_B64=${VOCAB_PASSWORD_HASH_B64:?set in .env}
-      - VOCAB_IMPORT_TOKEN=${VOCAB_IMPORT_TOKEN:?set in .env}
     volumes:
-      - /mnt/tank/services/vocabulary/data:/data
-      - /mnt/tank/services/vocabulary/cache:/cache
+      # The dataset root: the database, and the cache in /data/cache (made by
+      # the app).
+      - /mnt/tank/services/vocabulary:/data
     mem_limit: 256m
     memswap_limit: 256m
     cpus: 1.0

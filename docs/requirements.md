@@ -177,7 +177,7 @@ The pass/fail line between 3 and 4 is visible in the button row. Labels are in E
 
 **R-81 MUST — No public internet exposure.** Reachable only via the Traefik `home` entrypoint (LAN / VPN) and optionally mesh VPN. **Not** routed on the public `websecure` entrypoint. Any mesh VPN access requires an explicit change to the mesh-VPN ACL, limited to the owner's devices (not `*`).
 
-**R-82 MUST — Authentication.** The UI requires login even on the private network (other household devices share the network). The import API used by the connector requires a separate secret token. Secrets come from `.env` (never committed).
+**R-82 MUST — Authentication.** The UI requires login even on the private network (other household devices share the network). The import API used by the connector requires a separate secret token. No secrets in the environment: on first start the owner sets the password (≥ 12 characters) with a one-time setup code from the container log; the password can be changed in Settings (logs out every other device) and reset with a `reset-password` command; the connector token is created in Settings and shown once. Only hashes are stored.
 
 **R-83 MUST — Hardened container.**
 - Minimal image (`scratch` / distroless): no shell, no package manager.
@@ -195,13 +195,12 @@ The pass/fail line between 3 and 4 is visible in the button row. Labels are in E
 
 | Host path | Container mount | Content |
 |---|---|---|
-| `/mnt/tank/services/vocabulary/data` | read-write | SQLite database |
-| `/mnt/tank/services/vocabulary/cache` | read-write | generated audio files (regenerable from the DB) |
+| `/mnt/tank/services/vocabulary` | `/data`, read-write | SQLite database; `cache/` with generated audio files (regenerable from the DB), created by the app |
 
-- **Backup** is done by the existing daily ZFS replication `tank/services` → `backup-tank/services`. Snapshots are atomic, so the live SQLite file is captured consistently; the app needs **no backup logic of its own**. The SQLite database must therefore use a crash-safe journal mode (WAL or rollback journal, `synchronous` ≥ NORMAL) and keep all its files (incl. `-wal`/`-shm`) inside `data/`.
-- Configuration (non-secret `VOCAB_*` settings) and secrets (login password hash / connector token) come from the Compose environment (`.env`); there is no config volume.
-- The container's fixed non-root UID/GID is documented (deployment: 3101:3101); the dataset owner/ACL grants it write on `data` and `cache`.
-- A restore procedure (stop container → restore `data/` from a snapshot or the replica → start) is documented in the stack's README and tested once before phase 1 is accepted.
+- **Backup** is done by the existing daily ZFS replication `tank/services` → `backup-tank/services`. Snapshots are atomic, so the live SQLite file is captured consistently; the app needs **no backup logic of its own**. The SQLite database must therefore use a crash-safe journal mode (WAL or rollback journal, `synchronous` ≥ NORMAL) and keep all its files (incl. `-wal`/`-shm`) together in the data directory.
+- Configuration (non-secret `VOCAB_*` settings) comes from the Compose environment; there is no config volume and no secret in the environment (R-82).
+- The container's fixed non-root UID/GID is documented (deployment: 3101:3101); the dataset owner (set in TrueNAS) is that user; the app creates its directories itself.
+- A restore procedure (stop container → restore the database files from a snapshot or the replica → start) is documented in the stack's README and tested once before phase 1 is accepted.
 - **R-86 SHOULD** — Export of all vocabulary + progress to a single JSON file from the UI.
 
 ## 12. Engineering rules (apply to every agent)

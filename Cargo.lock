@@ -1662,7 +1662,6 @@ version = "0.1.0"
 dependencies = [
  "argon2",
  "axum",
- "base64ct",
  "fsrs",
  "getrandom 0.4.3",
  "hex",
@@ -1672,6 +1671,7 @@ dependencies = [
  "include_dir",
  "jiff",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",

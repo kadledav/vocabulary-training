@@ -1,7 +1,7 @@
 //! The `auth_session` table (design §4.2, §9.1). Only this module touches it.
 //!
 //! A row holds the SHA-256 of the session token (never the token itself),
-//! the fingerprint of the password hash that was configured at login, and
+//! the fingerprint of the password hash that was current at login, and
 //! the expiry. Timestamps are `format_timestamp` text, so they compare
 //! correctly as strings.
 
@@ -76,6 +76,26 @@ pub fn purge(tx: &Transaction<'_>, fingerprint: &str, now: &str) -> rusqlite::Re
     tx.execute(
         "DELETE FROM auth_session WHERE expires_at <= ?2 OR password_fingerprint <> ?1",
         params![fingerprint, now],
+    )?;
+    Ok(())
+}
+
+/// End every session (setup, `reset-password`).
+pub fn delete_all(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    tx.execute("DELETE FROM auth_session", [])?;
+    Ok(())
+}
+
+/// After a password change: end every session but `keep`, and bind `keep`
+/// to the new password's fingerprint.
+pub fn keep_only(tx: &Transaction<'_>, keep: &str, fingerprint: &str) -> rusqlite::Result<()> {
+    tx.execute(
+        "DELETE FROM auth_session WHERE token_sha256 <> ?1",
+        params![keep],
+    )?;
+    tx.execute(
+        "UPDATE auth_session SET password_fingerprint = ?2 WHERE token_sha256 = ?1",
+        params![keep, fingerprint],
     )?;
     Ok(())
 }

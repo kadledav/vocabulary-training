@@ -1,8 +1,9 @@
 //! SQLite connection, PRAGMAs, migrations and integrity check (design §4).
 //!
 //! The module owns the SQLite file set in the data directory
-//! (`vocabulary.sqlite` plus its `-wal`/`-shm` files; nothing else is written
-//! there, R-85) and the schema version (`PRAGMA user_version`). Other modules
+//! (`vocabulary.sqlite` plus its `-wal`/`-shm` files and the process lock
+//! `vocabulary.lock`; besides them the data directory holds only the cache
+//! directory, R-85) and the schema version (`PRAGMA user_version`). Other modules
 //! get a connection only through [`Db::read`] and [`Db::write`]; the SQL for a
 //! table lives in the module that owns the table (R-92).
 //!
@@ -17,6 +18,9 @@ use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 
 /// File name of the database inside the data directory.
 const DB_FILE_NAME: &str = "vocabulary.sqlite";
+/// Lock file: held by the one process that may use the database (see
+/// [`DataDirLock`]).
+const LOCK_FILE_NAME: &str = "vocabulary.lock";
 
 /// Embedded, forward-only migrations; entry `i` brings the schema to version `i + 1`.
 const MIGRATIONS: &[(&str, &str)] = &[
@@ -32,12 +36,24 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0003_session_item_format",
         include_str!("../migrations/0003_session_item_format.sql"),
     ),
+    (
+        "0004_auth_owner",
+        include_str!("../migrations/0004_auth_owner.sql"),
+    ),
 ];
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
     #[error("data directory {0} does not exist or is not a directory")]
     DataDir(PathBuf),
+    #[error(
+        "there is no database in {0}; is the data directory mounted? (only `serve` creates one)"
+    )]
+    NoDatabase(PathBuf),
+    #[error("the database in {0} is in use by a running vocab-server: stop the stack first")]
+    InUse(PathBuf),
+    #[error("cannot lock the database in {0}: {1}")]
+    Lock(PathBuf, std::io::Error),
     #[error("sqlite: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("could not enable {0}")]
@@ -59,6 +75,35 @@ pub enum DbError {
     Worker(String),
 }
 
+/// Exclusive use of the data directory by this process, for as long as the
+/// value lives: an advisory `flock` on `vocabulary.lock`. `serve` holds it
+/// for its lifetime, so a `reset-password` or `check` run next to a running
+/// server (e.g. `docker compose run`) is refused instead of changing the
+/// database behind the server's in-memory state.
+#[derive(Debug)]
+pub struct DataDirLock {
+    _file: std::fs::File,
+}
+
+impl DataDirLock {
+    /// Take the lock without waiting.
+    pub fn acquire(data_dir: &Path) -> Result<Self, DbError> {
+        let fail = |err| DbError::Lock(data_dir.to_owned(), err);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(data_dir.join(LOCK_FILE_NAME))
+            .map_err(fail)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Self { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => Err(DbError::InUse(data_dir.to_owned())),
+            Err(std::fs::TryLockError::Error(err)) => Err(fail(err)),
+        }
+    }
+}
+
 /// Handle to the database; cheap to clone.
 #[derive(Debug, Clone)]
 pub struct Db {
@@ -73,6 +118,24 @@ impl Db {
         if !data_dir.is_dir() {
             return Err(DbError::DataDir(data_dir.to_owned()));
         }
+        Self::open_file(data_dir)
+    }
+
+    /// Is there a database file in `data_dir`?
+    pub fn exists(data_dir: &Path) -> bool {
+        data_dir.join(DB_FILE_NAME).is_file()
+    }
+
+    /// Like [`Db::open`], but only an existing database: a wrong or empty
+    /// mount is an error rather than a fresh, empty database.
+    pub fn open_existing(data_dir: &Path) -> Result<Self, DbError> {
+        if !Self::exists(data_dir) {
+            return Err(DbError::NoDatabase(data_dir.to_owned()));
+        }
+        Self::open_file(data_dir)
+    }
+
+    fn open_file(data_dir: &Path) -> Result<Self, DbError> {
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_CREATE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX;

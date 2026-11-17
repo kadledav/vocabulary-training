@@ -4,35 +4,45 @@
 //! * `serve` (default): open/check/migrate the database, serve HTTP.
 //! * `healthcheck`: `GET /healthz` on the local listener; exit 0 when healthy
 //!   (the runtime image has no shell or curl).
-//! * `check`: open the database, run `quick_check` and migrations, exit.
-//! * `hash-password`: read one password line from stdin, print the base64
-//!   of its argon2id PHC string for `VOCAB_PASSWORD_HASH_B64`.
+//! * `check`: open the existing database, run `quick_check` and migrations,
+//!   exit.
+//! * `reset-password`: with the app stopped, clear the password, every
+//!   session and the connector token; the next start is in setup state.
+//!
+//! `serve`, `check` and `reset-password` lock the data directory, so the
+//! last two refuse to run next to a running server.
 
-use std::io::{BufRead, IsTerminal, Read, Write};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
-use vocab_server::auth::{self, Auth, Credentials};
+use vocab_server::auth::{self, Auth, SetupCode};
 use vocab_server::clock::{Moment, Timestamp};
 use vocab_server::config::Config;
-use vocab_server::db::Db;
+use vocab_server::db::{DataDirLock, Db, DbError};
 use vocab_server::http::{self, AppState};
 use vocab_server::workflows;
 
-const USAGE: &str = "usage: vocab-server [serve | healthcheck | check | hash-password]
+const USAGE: &str = "usage: vocab-server [serve | healthcheck | check | reset-password]
 
-  serve          open the database (integrity check + migrations) and serve HTTP (default)
-  healthcheck    GET /healthz on the local listener; exit code 0 when healthy
-  check          open the database (integrity check + migrations) and exit
-  hash-password  read one password line from stdin; print the value for VOCAB_PASSWORD_HASH_B64
+  serve           open the database (integrity check + migrations) and serve HTTP (default)
+  healthcheck     GET /healthz on the local listener; exit code 0 when healthy
+  check           open the existing database (integrity check + migrations) and exit
+  reset-password  with the app stopped: clear the password, every session and the
+                  connector token; the next start asks for a new password (setup
+                  code in the log)
 
 Configuration (environment): $VOCAB_PUBLIC_ORIGIN (required), $VOCAB_TIMEZONE
 (default Europe/Prague), $VOCAB_DAY_ROLLOVER_HOUR (default 4), $VOCAB_LOG_LEVEL
 (default info), $VOCAB_LISTEN (default 0.0.0.0:8080), $VOCAB_DATA_DIR (default
-/data), $VOCAB_CACHE_DIR (default /cache).
-Secrets (required by serve): $VOCAB_PASSWORD_HASH_B64, $VOCAB_IMPORT_TOKEN.";
+/data), $VOCAB_CACHE_DIR (default <data dir>/cache). No secrets: the password
+and the connector token are set in the app.";
 
 fn main() -> ExitCode {
+    // Everything the app creates (database, WAL, lock, cache files and
+    // directories) is for its own user only, also when /data already exists
+    // with a wider mode. Existing directories are not changed.
+    rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o077));
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args
         .iter()
@@ -43,7 +53,7 @@ fn main() -> ExitCode {
         [] | ["serve"] => serve(),
         ["healthcheck"] => healthcheck(),
         ["check"] => check(),
-        ["hash-password"] => hash_password(),
+        ["reset-password"] => reset_password(),
         ["help" | "-h" | "--help"] => {
             println!("{USAGE}");
             ExitCode::SUCCESS
@@ -74,20 +84,54 @@ fn init_logging(config: &Config) {
         .init();
 }
 
-fn open_db(config: &Config) -> Result<Db, ExitCode> {
-    Db::open(&config.paths.data_dir).map_err(|err| {
-        tracing::error!(error = %err, data_dir = %config.paths.data_dir.display(), "database check failed");
+/// Create the data and cache directories if needed, then open the database.
+/// How a subcommand opens the database.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Open {
+    /// `serve`: create the directories and the database when missing.
+    Create,
+    /// `check`, `reset-password`: only an existing database (a wrong mount
+    /// must not look like success).
+    Existing,
+}
+
+/// Lock the data directory (refused while another process holds it), then
+/// open the database. The lock lasts as long as the returned guard.
+fn open_db(config: &Config, open: Open) -> Result<(DataDirLock, Db), ExitCode> {
+    let data_dir = &config.paths.data_dir;
+    let fail = |err: DbError| {
+        tracing::error!(error = %err, data_dir = %data_dir.display(), "database check failed");
         ExitCode::FAILURE
-    })
+    };
+    match open {
+        Open::Create => {
+            if let Err(err) = config.paths.prepare() {
+                tracing::error!(error = %err, "storage is not usable");
+                return Err(ExitCode::FAILURE);
+            }
+        }
+        Open::Existing => {
+            if !Db::exists(data_dir) {
+                return Err(fail(DbError::NoDatabase(data_dir.clone())));
+            }
+        }
+    }
+    let lock = DataDirLock::acquire(data_dir).map_err(fail)?;
+    let db = match open {
+        Open::Create => Db::open(data_dir),
+        Open::Existing => Db::open_existing(data_dir),
+    }
+    .map_err(fail)?;
+    Ok((lock, db))
 }
 
 fn check() -> ExitCode {
     let result = load_config().and_then(|config| {
         init_logging(&config);
-        open_db(&config)
+        open_db(&config, Open::Existing)
     });
     match result {
-        Ok(_db) => {
+        Ok(_opened) => {
             tracing::info!("database check passed");
             ExitCode::SUCCESS
         }
@@ -109,35 +153,34 @@ fn healthcheck() -> ExitCode {
     }
 }
 
-/// Read one line (the password) from stdin and print the base64 PHC string.
-/// The input is not hidden: run it in a private shell (deploy/README.md).
-fn hash_password() -> ExitCode {
-    let stdin = std::io::stdin();
-    if stdin.is_terminal() {
-        eprint!(
-            "Password ({} or more characters; the input is visible): ",
-            auth::MIN_PASSWORD_CHARS
-        );
-        let _ = std::io::stderr().flush();
-    }
-    let mut line = String::new();
-    // One byte more than the longest password plus the line break, so an
-    // overlong line is detected without reading unbounded input.
-    let limit = u64::try_from(auth::MAX_PASSWORD_BYTES + 3).unwrap_or(u64::MAX);
-    if let Err(err) = stdin.lock().take(limit).read_line(&mut line) {
-        eprintln!("vocab-server hash-password: cannot read the password: {err}");
-        return ExitCode::FAILURE;
-    }
-    let password = line
-        .strip_suffix('\n')
-        .map_or(line.as_str(), |l| l.strip_suffix('\r').unwrap_or(l));
-    match auth::hash_password(password) {
-        Ok(encoded) => {
-            println!("{encoded}");
+/// Back to setup state (deploy/README.md: run it with the stack stopped).
+fn reset_password() -> ExitCode {
+    let (_lock, db) = match load_config().and_then(|config| {
+        init_logging(&config);
+        open_db(&config, Open::Existing)
+    }) {
+        Ok(opened) => opened,
+        Err(code) => return code,
+    };
+    let result = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .map_err(|err| err.to_string())
+        .and_then(|runtime| {
+            runtime
+                .block_on(auth::reset_password(&db))
+                .map_err(|err| err.to_string())
+        });
+    match result {
+        Ok(()) => {
+            println!(
+                "The password, every session and the connector token are cleared. The next \
+                 start is in setup state: open the app and enter the setup code from the log \
+                 (docker logs vocabulary), then create a new connector token in Settings."
+            );
             ExitCode::SUCCESS
         }
         Err(err) => {
-            eprintln!("vocab-server hash-password: {err}");
+            eprintln!("vocab-server reset-password: {err}");
             ExitCode::FAILURE
         }
     }
@@ -149,17 +192,16 @@ fn serve() -> ExitCode {
         Err(code) => return code,
     };
     init_logging(&config);
-    // No password hash or import token: refuse to start (no "open" mode).
-    let credentials = match Credentials::from_env() {
-        Ok(credentials) => credentials,
+    let (auth, setup_code) = match Auth::new(&config.public_origin, config.session_days) {
+        Ok(auth) => auth,
         Err(err) => {
-            tracing::error!(error = %err, "missing or invalid secrets");
+            tracing::error!(error = %err, "cannot make the setup code");
             return ExitCode::FAILURE;
         }
     };
-    let auth = Auth::new(credentials, &config.public_origin, config.session_days);
-    let db = match open_db(&config) {
-        Ok(db) => db,
+    // Held until `serve` returns: no other process may use the database.
+    let (_lock, db) = match open_db(&config, Open::Create) {
+        Ok(opened) => opened,
         Err(code) => return code,
     };
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -172,7 +214,7 @@ fn serve() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(run_server(config, db, auth)) {
+    match runtime.block_on(run_server(config, db, auth, setup_code)) {
         Ok(()) => {
             tracing::info!("stopped");
             ExitCode::SUCCESS
@@ -184,7 +226,20 @@ fn serve() -> ExitCode {
     }
 }
 
-async fn run_server(config: Config, db: Db, auth: Auth) -> std::io::Result<()> {
+async fn run_server(
+    config: Config,
+    db: Db,
+    auth: Auth,
+    setup_code: SetupCode,
+) -> std::io::Result<()> {
+    let setup_required = auth
+        .setup_required(&db)
+        .await
+        .map_err(|err| std::io::Error::other(format!("cannot read the owner's password: {err}")))?;
+    if setup_required {
+        announce_setup(&setup_code);
+    }
+    drop(setup_code);
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     tracing::info!(
         listen = %listener.local_addr()?,
@@ -202,10 +257,21 @@ async fn run_server(config: Config, db: Db, auth: Auth) -> std::io::Result<()> {
         }
     }
     let app = http::app(
-        AppState::new(db, config.day_rule.clone(), auth),
+        AppState::new(db, config.day_rule.clone(), Arc::new(auth)),
         &config.limits,
     );
     http::serve(listener, app, &config.limits, shutdown_signal()).await
+}
+
+/// The one place the setup code is shown: a WARN line of the log (also on
+/// stderr when the log level hides warnings, so it can never be lost).
+fn announce_setup(code: &SetupCode) {
+    let line = format!("Setup required: open the app and enter setup code {code}");
+    if tracing::enabled!(tracing::Level::WARN) {
+        tracing::warn!("{line}");
+    } else {
+        eprintln!("{line}");
+    }
 }
 
 /// Resolves on SIGTERM (`docker stop`) or Ctrl-C.

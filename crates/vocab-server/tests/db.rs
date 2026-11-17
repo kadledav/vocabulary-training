@@ -13,6 +13,7 @@ const FIXTURE: &str = include_str!("fixtures/schema_v1_synthetic.sql");
 /// Every table of design §4.2.
 const TABLES: &[&str] = &[
     "audio_clip",
+    "auth_owner",
     "auth_session",
     "card",
     "field_conflict",
@@ -67,7 +68,7 @@ fn r85_empty_database_migrates_to_v1_with_foreign_keys_and_integrity_ok() {
     let version: u32 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("user_version");
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
 
     let mut stmt = conn
         .prepare("SELECT name, strict FROM pragma_table_list WHERE schema = 'main' AND name NOT LIKE 'sqlite_%' ORDER BY name")
@@ -246,7 +247,7 @@ fn r85_reopening_is_idempotent() {
     let version: u32 = inspect(&data)
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("user_version");
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
 }
 
 #[test]
@@ -259,7 +260,7 @@ fn r85_newer_schema_is_refused() {
     match Db::open(&data) {
         Err(DbError::SchemaTooNew {
             found: 99,
-            known: 3,
+            known: 4,
         }) => {}
         other => panic!("expected SchemaTooNew, got {other:?}"),
     }
@@ -331,7 +332,7 @@ fn r85_v1_database_with_data_migrates_to_v2() {
     let version: u32 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("user_version");
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     let (headword, spelling): (String, Option<i64>) = conn
         .query_row(
             "SELECT headword, spelling FROM word WHERE id = 1",
@@ -385,7 +386,7 @@ fn r85_v2_database_with_data_migrates_to_v3() {
     let version: u32 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("user_version");
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     let (items, with_format): (i64, i64) = conn
         .query_row(
             "SELECT count(*), count(format) FROM session_item",

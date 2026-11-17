@@ -1,7 +1,8 @@
 //! Authentication and request protection (design §9; R-82, R-83) through the
-//! real router: sessions, cookie attributes, password rotation, the import
-//! token's scope, the CSRF guard, the login throttle and the per-endpoint
-//! limits. Secrets are synthetic (`test-…`).
+//! real router: first-run setup, sessions, cookie attributes, password
+//! change, the connector token's scope, the CSRF guard, the login throttle
+//! and the per-endpoint limits. Secrets are synthetic (`test-…`) or made by
+//! the app itself.
 
 mod common;
 
@@ -12,7 +13,7 @@ use axum::http::{Method, Request, StatusCode, header};
 use axum::response::Response;
 use serde_json::{Value, json};
 use tower::ServiceExt;
-use vocab_server::auth::{Auth, Credentials, hash_password};
+use vocab_server::auth::{self, Auth, SetupCode};
 use vocab_server::clock::{Clock, ManualClock};
 use vocab_server::config::Limits;
 use vocab_server::db::Db;
@@ -25,13 +26,17 @@ struct App {
     dir: tempfile::TempDir,
     clock: Arc<ManualClock>,
     router: axum::Router,
+    db: Db,
+    /// This start's setup code.
+    code: SetupCode,
 }
 
-fn app_with(dir: tempfile::TempDir, auth: Auth) -> App {
+/// The app on the database in `dir` (a restart when it was used before).
+fn app_with(dir: tempfile::TempDir, (auth, code): (Arc<Auth>, SetupCode)) -> App {
     let db = Db::open(dir.path()).expect("db");
     let clock = Arc::new(ManualClock::new(START.parse().expect("ts")));
     let state = AppState::with_clock(
-        db,
+        db.clone(),
         Arc::clone(&clock) as Arc<dyn Clock>,
         common::prague(),
         auth,
@@ -40,11 +45,30 @@ fn app_with(dir: tempfile::TempDir, auth: Auth) -> App {
         dir,
         clock,
         router: http::app(state, &Limits::default()),
+        db,
+        code,
     }
 }
 
-fn app() -> App {
+/// A first start: setup state.
+fn fresh() -> App {
     app_with(tempfile::tempdir().expect("tempdir"), common::auth())
+}
+
+/// A set-up app (password [`common::PASSWORD`]) without any session.
+async fn app() -> App {
+    let app = fresh();
+    let response = app.setup(&app.code.to_string(), common::PASSWORD).await;
+    assert_eq!(response.status(), StatusCode::OK, "setup");
+    let cookie = cookie_pair(&response).expect("cookie");
+    app.send(request(
+        &Method::POST,
+        "/api/auth/logout",
+        "{}",
+        &[("cookie", &cookie)],
+    ))
+    .await;
+    app
 }
 
 /// A request as the app's own page would send it (Origin, JSON) plus `extra` headers.
@@ -82,6 +106,32 @@ impl App {
             .oneshot(request)
             .await
             .expect("response")
+    }
+
+    async fn setup(&self, code: &str, password: &str) -> Response {
+        self.send(request(
+            &Method::POST,
+            "/api/auth/setup",
+            &json!({ "code": code, "password": password }).to_string(),
+            &[],
+        ))
+        .await
+    }
+
+    async fn change_password(&self, cookie: &str, current: &str, new: &str) -> Response {
+        self.send(request(
+            &Method::POST,
+            "/api/auth/password",
+            &json!({ "current_password": current, "new_password": new }).to_string(),
+            &[("cookie", cookie)],
+        ))
+        .await
+    }
+
+    /// Log in and create a connector token; returns it.
+    async fn connector_token(&self) -> String {
+        let cookie = self.login().await;
+        common::connector_token(&self.router, &cookie).await
     }
 
     async fn login_with(&self, password: &str) -> Response {
@@ -148,7 +198,7 @@ fn minutes(n: i64) -> jiff::SignedDuration {
 // ── which route needs what ─────────────────────────────────────────────────
 
 #[test]
-fn r82_only_health_login_and_the_shell_are_public() {
+fn r82_only_health_setup_login_and_the_shell_are_public() {
     let routes = http::routes();
     let public: Vec<(Method, &str)> = routes
         .iter()
@@ -161,6 +211,8 @@ fn r82_only_health_login_and_the_shell_are_public() {
             (Method::GET, "/healthz"),
             (Method::GET, "/"),
             (Method::GET, "/assets/{build}/{*path}"),
+            (Method::GET, "/api/auth/setup"),
+            (Method::POST, "/api/auth/setup"),
             (Method::POST, "/api/auth/login"),
         ]
     );
@@ -174,9 +226,9 @@ fn r82_only_health_login_and_the_shell_are_public() {
         assert_eq!(
             *access == Access::ImportToken,
             connector,
-            "{method} {path}: the import token is for connector routes only"
+            "{method} {path}: the connector token is for connector routes only"
         );
-        if path.starts_with("/api/") && *path != "/api/auth/login" {
+        if path.starts_with("/api/") && !["/api/auth/login", "/api/auth/setup"].contains(path) {
             assert_ne!(*access, Access::Public, "{method} {path}");
         }
     }
@@ -185,9 +237,9 @@ fn r82_only_health_login_and_the_shell_are_public() {
 
 #[tokio::test]
 async fn r82_every_session_route_answers_401_without_a_valid_session() {
-    let app = app();
+    let app = app().await;
     let stale = format!("{COOKIE}={}", "ab".repeat(32));
-    let bearer = format!("Bearer {}", common::IMPORT_TOKEN);
+    let bearer = format!("Bearer {}", app.connector_token().await);
     let mut checked = 0;
     for route in http::routes()
         .into_iter()
@@ -228,7 +280,7 @@ async fn r82_every_session_route_answers_401_without_a_valid_session() {
 
 #[tokio::test]
 async fn r82_public_routes_work_without_a_session() {
-    let app = app();
+    let app = app().await;
     for uri in ["/healthz", "/"] {
         let response = app.send(request(&Method::GET, uri, "", &[])).await;
         assert_eq!(response.status(), StatusCode::OK, "{uri}");
@@ -239,7 +291,7 @@ async fn r82_public_routes_work_without_a_session() {
 
 #[tokio::test]
 async fn r82_login_sets_a_host_only_secure_http_only_strict_cookie() {
-    let app = app();
+    let app = app().await;
     let response = app.login_with(common::PASSWORD).await;
     assert_eq!(response.status(), StatusCode::OK);
     let cookie = set_cookie(&response).expect("Set-Cookie");
@@ -279,7 +331,7 @@ async fn r82_login_sets_a_host_only_secure_http_only_strict_cookie() {
 
 #[tokio::test]
 async fn r82_wrong_password_gets_401_and_no_cookie() {
-    let app = app();
+    let app = app().await;
     for password in ["test-password-wrong", "", &format!("{} ", common::PASSWORD)] {
         let response = app.login_with(password).await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{password:?}");
@@ -300,7 +352,7 @@ async fn r82_wrong_password_gets_401_and_no_cookie() {
 
 #[tokio::test]
 async fn r82_a_session_opens_the_api_and_logout_ends_it() {
-    let app = app();
+    let app = app().await;
     let cookie = app.login().await;
     for uri in [
         "/api/today",
@@ -329,7 +381,7 @@ async fn r82_a_session_opens_the_api_and_logout_ends_it() {
 
 #[tokio::test]
 async fn r82_sessions_last_180_days_and_slide_when_older_than_7_days() {
-    let app = app();
+    let app = app().await;
     let cookie = app.login().await;
     app.advance(days(7));
     let response = app.get_with_cookie("/api/today", &cookie).await;
@@ -360,7 +412,7 @@ async fn r82_sessions_last_180_days_and_slide_when_older_than_7_days() {
 
 #[tokio::test]
 async fn r82_a_session_survives_a_restart() {
-    let first = app();
+    let first = app().await;
     let cookie = first.login().await;
     let restarted = app_with(first.dir, common::auth());
     let response = restarted.get_with_cookie("/api/today", &cookie).await;
@@ -368,31 +420,250 @@ async fn r82_a_session_survives_a_restart() {
 }
 
 #[tokio::test]
-async fn r82_a_new_password_ends_every_session() {
-    let first = app();
-    let cookie = first.login().await;
-    // The owner sets a new hash in .env and restarts.
-    let new_password = "test-password-after-rotation";
-    let hash = hash_password(new_password).expect("hash");
-    let rotated = Auth::new(
-        Credentials::new(&hash, common::IMPORT_TOKEN).expect("credentials"),
-        common::ORIGIN,
-        180,
-    );
-    let app = app_with(first.dir, rotated);
-    let response = app.get_with_cookie("/api/today", &cookie).await;
+async fn r82_changing_the_password_keeps_only_the_changing_session() {
+    let app = app().await;
+    let other = app.login().await;
+    let mine = app.login().await;
+    let new_password = "test-password-after-the-change";
+
+    // A wrong current password is a failed login; a short new one is refused.
+    let response = app
+        .change_password(&mine, "test-password-wrong", new_password)
+        .await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(error_code(response).await, "invalid_password");
+    let response = app
+        .change_password(&mine, common::PASSWORD, "test-short")
+        .await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(error_code(response).await, "invalid_new_password");
+    assert_eq!(
+        app.get_with_cookie("/api/today", &other).await.status(),
+        StatusCode::OK
+    );
+    // Without a session: 401.
+    let response = app
+        .send(request(
+            &Method::POST,
+            "/api/auth/password",
+            &json!({ "current_password": common::PASSWORD, "new_password": new_password })
+                .to_string(),
+            &[],
+        ))
+        .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let response = app
+        .change_password(&mine, common::PASSWORD, new_password)
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        set_cookie(&response).is_none(),
+        "the session stays as it is"
+    );
+    assert_eq!(
+        app.get_with_cookie("/api/today", &mine).await.status(),
+        StatusCode::OK
+    );
+    let response = app.get_with_cookie("/api/today", &other).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "other sessions end"
+    );
     let response = app.login_with(common::PASSWORD).await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "old password");
-    let response = app.login_with(new_password).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let new_cookie = cookie_pair(&response).expect("cookie");
+    assert_eq!(app.login_with(new_password).await.status(), StatusCode::OK);
+
+    // After a restart (sessions bound to the new password's fingerprint).
+    let restarted = app_with(app.dir, common::auth());
     assert_eq!(
-        app.get_with_cookie("/api/today", &new_cookie)
+        restarted
+            .get_with_cookie("/api/today", &mine)
             .await
             .status(),
         StatusCode::OK
     );
+    assert_eq!(
+        restarted
+            .get_with_cookie("/api/today", &other)
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        restarted.login_with(new_password).await.status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn r83_password_change_body_is_limited_to_2_kib() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let body = format!(
+        r#"{{"current_password":"x","new_password":"{}"}}"#,
+        "x".repeat(2100)
+    );
+    let response = app
+        .send(request(
+            &Method::POST,
+            "/api/auth/password",
+            &body,
+            &[("cookie", &cookie)],
+        ))
+        .await;
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+// ── first-run setup (§9.1) ─────────────────────────────────────────────────
+
+async fn setup_required(app: &App) -> bool {
+    let response = app
+        .send(request(&Method::GET, "/api/auth/setup", "", &[]))
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    json_body(response).await["required"]
+        .as_bool()
+        .expect("required")
+}
+
+#[tokio::test]
+async fn r82_first_start_asks_for_the_setup_code_and_a_new_password() {
+    let app = fresh();
+    let code = app.code.to_string();
+    assert!(setup_required(&app).await);
+    let response = app.login_with(common::PASSWORD).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(error_code(response).await, "setup_required");
+    assert_eq!(
+        app.get_with_cookie("/api/today", "x=y").await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    // Wrong code; right code with a short password: nothing is set up.
+    let response = app.setup("ABCD-EFGH-JK", common::PASSWORD).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(set_cookie(&response).is_none());
+    assert_eq!(error_code(response).await, "invalid_setup_code");
+    let response = app.setup(&code, "test-short1").await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(error_code(response).await, "invalid_new_password");
+    assert!(setup_required(&app).await);
+
+    // The code as typed on a phone: lower case, without dashes.
+    let typed = code.replace('-', "").to_lowercase();
+    let response = app.setup(&typed, common::PASSWORD).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let cookie = cookie_pair(&response).expect("logged in");
+    assert_eq!(
+        app.get_with_cookie("/api/today", &cookie).await.status(),
+        StatusCode::OK
+    );
+    assert!(!setup_required(&app).await);
+    let conn = rusqlite::Connection::open(app.dir.path().join("vocabulary.sqlite")).expect("open");
+    let stored: String = conn
+        .query_row("SELECT password_phc FROM auth_owner", [], |r| r.get(0))
+        .expect("stored hash");
+    // Built, so that no literal hash prefix is in the source (secret scanner).
+    let prefix = ["", "argon2id", "v=19", "m=19456,t=2,p=1", ""].join("$");
+    assert!(stored.starts_with(&prefix), "{stored}");
+
+    // Once set up, setup is refused for good: same code, and after a restart.
+    let response = app.setup(&code, "test-password-of-an-intruder").await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(error_code(response).await, "already_set_up");
+    let restarted = app_with(app.dir, common::auth());
+    let code = restarted.code.to_string();
+    let response = restarted.setup(&code, "test-password-of-an-intruder").await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(!setup_required(&restarted).await);
+    assert_eq!(
+        restarted.login_with(common::PASSWORD).await.status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn r82_two_concurrent_setups_exactly_one_wins() {
+    let app = fresh();
+    let code = app.code.to_string();
+    let (a, b) = tokio::join!(
+        app.setup(&code, "test-password-first-of-two"),
+        app.setup(&code, "test-password-second-of-two"),
+    );
+    let mut statuses = [a.status(), b.status()];
+    statuses.sort();
+    assert_eq!(statuses, [StatusCode::OK, StatusCode::CONFLICT]);
+    let winner = if a.status() == StatusCode::OK {
+        "test-password-first-of-two"
+    } else {
+        "test-password-second-of-two"
+    };
+    assert_eq!(app.login_with(winner).await.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn r82_wrong_setup_codes_count_toward_the_login_lockout() {
+    let app = fresh();
+    for _ in 0..4 {
+        let response = app.setup("0000-0000-00", common::PASSWORD).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+    let response = app.setup("0000-0000-00", common::PASSWORD).await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(retry_after(&response), 15 * 60);
+    // Even the right code waits for the lockout.
+    let response = app.setup(&app.code.to_string(), common::PASSWORD).await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    app.advance(minutes(15));
+    let response = app.setup(&app.code.to_string(), common::PASSWORD).await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn r83_setup_body_is_limited_to_2_kib() {
+    let app = fresh();
+    let body = format!(r#"{{"code":"x","password":"{}"}}"#, "x".repeat(2100));
+    let response = app
+        .send(request(&Method::POST, "/api/auth/setup", &body, &[]))
+        .await;
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(setup_required(&app).await);
+}
+
+#[tokio::test]
+async fn r82_reset_password_returns_to_setup_and_ends_every_session() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let token = app.connector_token().await;
+    auth::reset_password(&app.db).await.expect("reset");
+    let restarted = app_with(app.dir, common::auth());
+    assert!(setup_required(&restarted).await);
+    assert_eq!(
+        restarted
+            .get_with_cookie("/api/today", &cookie)
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let response = restarted.login_with(common::PASSWORD).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    // The connector token is revoked too (a reset may follow a compromise).
+    let response = restarted
+        .send(bare(
+            &Method::GET,
+            "/api/connector/v1/sources",
+            "",
+            &[("authorization", &format!("Bearer {token}"))],
+        ))
+        .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let code = restarted.code.to_string();
+    let response = restarted
+        .setup(&code, "test-password-after-the-reset")
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 // ── CSRF guard (§9.3) ──────────────────────────────────────────────────────
@@ -406,7 +677,7 @@ fn state_changing_routes() -> Vec<RouteInfo> {
 
 #[tokio::test]
 async fn r82_state_changing_requests_from_another_origin_are_refused() {
-    let app = app();
+    let app = app().await;
     let cookie = app.login().await;
     let routes = state_changing_routes();
     assert!(routes.iter().any(|r| r.path == "/api/auth/login"));
@@ -446,7 +717,7 @@ async fn r82_state_changing_requests_from_another_origin_are_refused() {
 
 #[tokio::test]
 async fn r82_state_changing_requests_need_a_json_content_type() {
-    let app = app();
+    let app = app().await;
     let cookie = app.login().await;
     for route in state_changing_routes() {
         let uri = concrete(route.path);
@@ -486,17 +757,142 @@ async fn r82_state_changing_requests_need_a_json_content_type() {
     assert_eq!(response.status(), StatusCode::OK);
 }
 
-// ── import token (§9.2) ────────────────────────────────────────────────────
+// ── connector token (§9.2) ─────────────────────────────────────────────────
 
 #[tokio::test]
-async fn r82_the_import_token_works_only_on_connector_routes() {
-    let app = app();
+async fn r82_without_a_created_token_the_connector_routes_refuse_everything() {
+    let app = app().await;
     let cookie = app.login().await;
-    let bearer = format!("Bearer {}", common::IMPORT_TOKEN);
+    let connector = "/api/connector/v1/sources";
+    for value in ["Bearer ", "Bearer x", &format!("Bearer {}", "0".repeat(64))] {
+        let response = app
+            .send(bare(
+                &Method::GET,
+                connector,
+                "",
+                &[("authorization", value)],
+            ))
+            .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{value}");
+    }
+    let response = app
+        .get_with_cookie("/api/auth/connector-token", &cookie)
+        .await;
+    assert_eq!(
+        json_body(response).await,
+        json!({ "exists": false, "created_at": null })
+    );
+}
+
+#[tokio::test]
+async fn r82_a_new_connector_token_is_shown_once_and_replaces_the_old_one() {
+    let app = app().await;
+    let cookie = app.login().await;
+    // Creating one needs a session.
+    let response = app
+        .send(request(
+            &Method::POST,
+            "/api/auth/connector-token",
+            "{}",
+            &[],
+        ))
+        .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    // ...and the current password again: a wrong one is a failed login.
+    for body in [
+        json!({ "current_password": "test-password-wrong" }),
+        json!({}),
+    ] {
+        let response = app
+            .send(request(
+                &Method::POST,
+                "/api/auth/connector-token",
+                &body.to_string(),
+                &[("cookie", &cookie)],
+            ))
+            .await;
+        assert!(response.status().is_client_error(), "{body}");
+        assert_ne!(response.status(), StatusCode::OK, "{body}");
+    }
+    let response = app
+        .get_with_cookie("/api/auth/connector-token", &cookie)
+        .await;
+    assert_eq!(
+        json_body(response).await["exists"],
+        false,
+        "nothing created"
+    );
+    for _ in 0..4 {
+        app.send(request(
+            &Method::POST,
+            "/api/auth/connector-token",
+            &json!({ "current_password": "test-password-wrong" }).to_string(),
+            &[("cookie", &cookie)],
+        ))
+        .await;
+    }
+    let response = app.login_with(common::PASSWORD).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "throttled like login"
+    );
+    app.advance(minutes(15));
+
+    let first = common::connector_token(&app.router, &cookie).await;
+    assert_eq!(first.len(), 64);
+    let response = app
+        .get_with_cookie("/api/auth/connector-token", &cookie)
+        .await;
+    let status = json_body(response).await;
+    assert_eq!(status["exists"], true, "{status}");
+    assert!(status["created_at"].is_string(), "{status}");
+    assert!(status.get("token").is_none(), "{status}");
+    let conn = rusqlite::Connection::open(app.dir.path().join("vocabulary.sqlite")).expect("open");
+    let stored: String = conn
+        .query_row("SELECT connector_token_sha256 FROM auth_owner", [], |r| {
+            r.get(0)
+        })
+        .expect("digest");
+    assert_eq!(stored.len(), 64);
+    assert_ne!(stored, first, "only the digest is stored");
+
+    let second = common::connector_token(&app.router, &cookie).await;
+    assert_ne!(first, second);
+    let get = |token: String| {
+        app.send(bare(
+            &Method::GET,
+            "/api/connector/v1/sources",
+            "",
+            &[("authorization", &format!("Bearer {token}"))],
+        ))
+    };
+    assert_eq!(get(first).await.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(get(second.clone()).await.status(), StatusCode::OK);
+    // Also after a restart.
+    let restarted = app_with(app.dir, common::auth());
+    let response = restarted
+        .send(bare(
+            &Method::GET,
+            "/api/connector/v1/sources",
+            "",
+            &[("authorization", &format!("Bearer {second}"))],
+        ))
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn r82_the_connector_token_works_only_on_connector_routes() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let token = common::connector_token(&app.router, &cookie).await;
+    let bearer = format!("Bearer {token}");
     let connector = "/api/connector/v1/sources";
 
     for scheme in ["Bearer", "bearer"] {
-        let value = format!("{scheme} {}", common::IMPORT_TOKEN);
+        let value = format!("{scheme} {token}");
         let response = app
             .send(bare(
                 &Method::GET,
@@ -508,11 +904,11 @@ async fn r82_the_import_token_works_only_on_connector_routes() {
         assert_eq!(response.status(), StatusCode::OK, "{scheme}");
         assert!(json_body(response).await.is_array());
     }
-    let wrong = format!("Bearer {}x", common::IMPORT_TOKEN);
+    let wrong = format!("Bearer {token}x");
     for headers in [
         vec![("cookie", cookie.as_str())],
         vec![("authorization", wrong.as_str())],
-        vec![("authorization", common::IMPORT_TOKEN)],
+        vec![("authorization", token.as_str())],
         vec![],
     ] {
         let response = app.send(bare(&Method::GET, connector, "", &headers)).await;
@@ -565,7 +961,7 @@ fn retry_after(response: &Response) -> u64 {
 
 #[tokio::test]
 async fn r82_five_failed_logins_lock_logins_for_15_minutes_doubling() {
-    let app = app();
+    let app = app().await;
     let existing = app.login().await;
 
     let response = fail_logins(&app, 4).await;
@@ -602,7 +998,7 @@ async fn r82_five_failed_logins_lock_logins_for_15_minutes_doubling() {
 
 #[tokio::test]
 async fn r82_the_lockout_doubling_starts_over_after_a_quiet_day() {
-    let app = app();
+    let app = app().await;
     assert_eq!(retry_after(&fail_logins(&app, 5).await), 15 * 60);
     app.advance(minutes(15));
     assert_eq!(retry_after(&fail_logins(&app, 5).await), 30 * 60);
@@ -613,7 +1009,7 @@ async fn r82_the_lockout_doubling_starts_over_after_a_quiet_day() {
 
 #[tokio::test]
 async fn r82_failures_spread_over_more_than_15_minutes_do_not_lock() {
-    let app = app();
+    let app = app().await;
     for _ in 0..4 {
         assert_eq!(
             fail_logins(&app, 1).await.status(),
@@ -636,7 +1032,7 @@ async fn r82_failures_spread_over_more_than_15_minutes_do_not_lock() {
 
 #[tokio::test]
 async fn r83_login_body_is_limited_to_2_kib() {
-    let app = app();
+    let app = app().await;
     let fits = format!(r#"{{"password":"{}"}}"#, "x".repeat(2048 - 15));
     assert_eq!(fits.len(), 2048);
     let response = app
@@ -652,7 +1048,7 @@ async fn r83_login_body_is_limited_to_2_kib() {
 
 #[tokio::test]
 async fn r83_paste_import_is_limited_to_30_requests_per_10_minutes() {
-    let app = app();
+    let app = app().await;
     let cookie = app.login().await;
     let body = json!({ "text": "not a pack" }).to_string();
     let send =
@@ -688,8 +1084,8 @@ async fn r83_paste_import_is_limited_to_30_requests_per_10_minutes() {
 
 #[tokio::test]
 async fn r83_connector_is_limited_to_30_requests_per_10_minutes() {
-    let app = app();
-    let bearer = format!("Bearer {}", common::IMPORT_TOKEN);
+    let app = app().await;
+    let bearer = format!("Bearer {}", app.connector_token().await);
     let send = || {
         app.send(bare(
             &Method::GET,

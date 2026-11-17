@@ -46,7 +46,7 @@ use serde::Deserialize;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 
-use crate::auth::{Auth, CsrfRejection, LoginError, SessionCheck};
+use crate::auth::{Auth, AuthError, CsrfRejection, SessionCheck};
 use crate::catalog::{self, SourceId, WordId, WordQuery};
 use crate::clock::{Clock, DayRule, Moment, SystemClock};
 use crate::config::Limits;
@@ -97,7 +97,7 @@ const PREVIEW_TIMEOUT_MESSAGE: &str =
 const DRAIN_FACTOR: usize = 4;
 const TIMEOUT_MESSAGE: &str = "The request took too long";
 
-/// Body limit of `POST /api/auth/login` (§9.4).
+/// Body limit of login, setup and password change (§9.4).
 const LOGIN_BODY_BYTES: usize = 2 * 1024;
 /// Body limit of the connector routes (§9.4).
 const CONNECTOR_BODY_BYTES: usize = 1024 * 1024;
@@ -117,24 +117,24 @@ pub struct AppState {
     clock: Arc<dyn Clock>,
     /// Where study days begin (config `timezone`, `day_rollover_hour`).
     day_rule: DayRule,
-    /// Password, sessions, import token, CSRF guard.
+    /// Password, setup, sessions, connector token, CSRF guard.
     auth: Arc<Auth>,
     /// Body limit of the import routes (set by [`app`] from the limits).
     import_body_bytes: usize,
 }
 
 impl AppState {
-    pub fn new(db: Db, day_rule: DayRule, auth: Auth) -> Self {
+    pub fn new(db: Db, day_rule: DayRule, auth: Arc<Auth>) -> Self {
         Self::with_clock(db, Arc::new(SystemClock), day_rule, auth)
     }
 
     /// With a controllable clock (tests).
-    pub fn with_clock(db: Db, clock: Arc<dyn Clock>, day_rule: DayRule, auth: Auth) -> Self {
+    pub fn with_clock(db: Db, clock: Arc<dyn Clock>, day_rule: DayRule, auth: Arc<Auth>) -> Self {
         Self {
             db,
             clock,
             day_rule,
-            auth: Arc::new(auth),
+            auth,
             import_body_bytes: Limits::default().import_body_bytes,
         }
     }
@@ -150,13 +150,13 @@ impl AppState {
 /// Who may call a route (design §9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Access {
-    /// Anyone: health check, login, and the shell needed to render the
-    /// login screen.
+    /// Anyone: health check, setup, login, and the shell needed to render
+    /// the login and setup screens.
     Public,
     /// A logged-in browser (session cookie). Also the rule for a method a
     /// known path does not have; unknown paths only get a 404.
     Session,
-    /// The connector (`Authorization: Bearer <import token>`), never a
+    /// The connector (`Authorization: Bearer <connector token>`), never a
     /// session cookie; only `/api/connector/v1/*`.
     ImportToken,
 }
@@ -276,9 +276,26 @@ fn endpoints() -> Vec<Endpoint> {
             web_assets::ASSET_PATH,
             web_assets::asset,
         ),
+        endpoint(Standard, Public, Get, "/api/auth/setup", setup_status),
+        endpoint(Login, Public, Post, "/api/auth/setup", setup),
         endpoint(Login, Public, Post, "/api/auth/login", login),
         endpoint(Standard, Session, Post, "/api/auth/logout", logout),
         endpoint(Standard, Session, Get, "/api/auth/me", me),
+        endpoint(Login, Session, Post, "/api/auth/password", change_password),
+        endpoint(
+            Standard,
+            Session,
+            Get,
+            "/api/auth/connector-token",
+            connector_token_status,
+        ),
+        endpoint(
+            Login,
+            Session,
+            Post,
+            "/api/auth/connector-token",
+            create_connector_token,
+        ),
         endpoint(Standard, Session, Get, "/api/import/recent", import_recent),
         endpoint(
             ImportPreview,
@@ -460,8 +477,22 @@ async fn healthz(State(state): State<AppState>) -> Response {
 
 // ── authentication (design §9) ─────────────────────────────────────────────
 
+/// `Debug` of the request bodies with a password or setup code: the field
+/// names only, never the values.
+macro_rules! redacted_debug {
+    ($($body:ident),+) => {$(
+        impl std::fmt::Debug for $body {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(concat!(stringify!($body), "(***)"))
+            }
+        }
+    )+};
+}
+
+redacted_debug!(LoginBody, SetupBody, PasswordChangeBody, ConnectorTokenBody);
+
 /// Body of `POST /api/auth/login`.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LoginBody {
     password: String,
@@ -512,29 +543,191 @@ async fn login(
         .login(&state.db, &state.clock, body.password, user_agent)
         .await
     {
-        Ok(cookie) => {
-            let mut response = ok_status().into_response();
-            set_cookie(&mut response, &cookie);
-            response
-        }
-        Err(LoginError::WrongPassword) => error_response(
+        Ok(cookie) => with_session_cookie(&cookie),
+        Err(err) => auth_error(&err),
+    }
+}
+
+fn with_session_cookie(cookie: &str) -> Response {
+    let mut response = ok_status().into_response();
+    set_cookie(&mut response, cookie);
+    response
+}
+
+/// The answer to a failed login, setup, password change or token creation.
+fn auth_error(err: &AuthError) -> Response {
+    match err {
+        AuthError::WrongPassword => error_response(
             StatusCode::UNAUTHORIZED,
             "invalid_password",
             "Wrong password.",
         ),
-        Err(LoginError::Locked { retry_after_secs }) => {
+        AuthError::WrongSetupCode => error_response(
+            StatusCode::UNAUTHORIZED,
+            "invalid_setup_code",
+            "Wrong setup code.",
+        ),
+        AuthError::Locked { retry_after_secs } => {
             let mut response = error_response(
                 StatusCode::TOO_MANY_REQUESTS,
                 "locked",
                 &format!(
-                    "Too many failed logins. Try again in {}.",
-                    minutes_text(retry_after_secs)
+                    "Too many failed attempts. Try again in {}.",
+                    minutes_text(*retry_after_secs)
                 ),
             );
-            retry_after(&mut response, retry_after_secs);
+            retry_after(&mut response, *retry_after_secs);
             response
         }
-        Err(err @ LoginError::Internal(_)) => internal_error(&err),
+        AuthError::SetupRequired => error_response(
+            StatusCode::CONFLICT,
+            "setup_required",
+            "The app is not set up yet: set a password with the setup code first.",
+        ),
+        AuthError::AlreadySetUp => error_response(
+            StatusCode::CONFLICT,
+            "already_set_up",
+            "The app is already set up. Log in instead.",
+        ),
+        AuthError::NewPassword(reason) => error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_new_password",
+            &format!("The new password is not accepted: {reason}."),
+        ),
+        AuthError::Internal(_) => internal_error(err),
+    }
+}
+
+/// Body of `POST /api/auth/setup`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetupBody {
+    code: String,
+    password: String,
+}
+
+/// `GET /api/auth/setup`: whether the app still needs to be set up (tells
+/// the page to show the setup screen instead of the login).
+async fn setup_status(State(state): State<AppState>) -> Response {
+    match state.auth.setup_required(&state.db).await {
+        Ok(required) => Json(serde_json::json!({ "required": required })).into_response(),
+        Err(err) => internal_error(&err),
+    }
+}
+
+async fn setup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<SetupBody>, JsonRejection>,
+) -> Response {
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => {
+            return rejected_body(
+                &rejection,
+                "The body must be JSON {\"code\": \"…\", \"password\": \"…\"}.",
+            );
+        }
+    };
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok());
+    match state
+        .auth
+        .setup(
+            &state.db,
+            &state.clock,
+            body.code,
+            body.password,
+            user_agent,
+        )
+        .await
+    {
+        Ok(cookie) => with_session_cookie(&cookie),
+        Err(err) => auth_error(&err),
+    }
+}
+
+/// Body of `POST /api/auth/password`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PasswordChangeBody {
+    current_password: String,
+    new_password: String,
+}
+
+async fn change_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<PasswordChangeBody>, JsonRejection>,
+) -> Response {
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => {
+            return rejected_body(
+                &rejection,
+                "The body must be JSON {\"current_password\": \"…\", \"new_password\": \"…\"}.",
+            );
+        }
+    };
+    match state
+        .auth
+        .change_password(
+            &state.db,
+            &state.clock,
+            &headers,
+            body.current_password,
+            body.new_password,
+        )
+        .await
+    {
+        Ok(()) => ok_status().into_response(),
+        Err(err) => auth_error(&err),
+    }
+}
+
+/// `GET /api/auth/connector-token`: whether a connector token exists (never
+/// the token itself).
+async fn connector_token_status(State(state): State<AppState>) -> Response {
+    match state.auth.connector_token_created_at(&state.db).await {
+        Ok(created_at) => Json(serde_json::json!({
+            "exists": created_at.is_some(),
+            "created_at": created_at,
+        }))
+        .into_response(),
+        Err(err) => internal_error(&err),
+    }
+}
+
+/// Body of `POST /api/auth/connector-token`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConnectorTokenBody {
+    current_password: String,
+}
+
+/// `POST /api/auth/connector-token`: a new token, shown this once; the old
+/// one stops working. Needs the current password.
+async fn create_connector_token(
+    State(state): State<AppState>,
+    body: Result<Json<ConnectorTokenBody>, JsonRejection>,
+) -> Response {
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => {
+            return rejected_body(
+                &rejection,
+                "The body must be JSON {\"current_password\": \"…\"}.",
+            );
+        }
+    };
+    match state
+        .auth
+        .create_connector_token(&state.db, &state.clock, body.current_password)
+        .await
+    {
+        Ok(token) => Json(serde_json::json!({ "token": token })).into_response(),
+        Err(err) => auth_error(&err),
     }
 }
 
@@ -694,7 +887,7 @@ async fn list_sources(State(state): State<AppState>) -> Response {
     }
 }
 
-/// `GET /api/connector/v1/sources` (import token only): the sources with
+/// `GET /api/connector/v1/sources` (connector token only): the sources with
 /// their reading position and word count, for the connector (R-12).
 async fn connector_sources(state: State<AppState>) -> Response {
     list_sources(state).await
@@ -1087,19 +1280,24 @@ fn unauthenticated() -> Response {
     error_response(StatusCode::UNAUTHORIZED, "unauthenticated", "Log in first.")
 }
 
-/// Access control of every route (design §9): import token for the
+/// Access control of every route (design §9): connector token for the
 /// connector; CSRF guard and (unless public) a live session for the rest.
 async fn protect(State(guard): State<Guard>, request: Request, next: Next) -> Response {
     let auth = &guard.state.auth;
     let access = guard.access_of(&request);
     if access == Access::ImportToken {
-        if auth.has_import_token(request.headers()) {
-            return next.run(request).await;
+        match auth
+            .has_connector_token(&guard.state.db, request.headers())
+            .await
+        {
+            Ok(true) => return next.run(request).await,
+            Ok(false) => {}
+            Err(err) => return internal_error(&err),
         }
         let mut response = error_response(
             StatusCode::UNAUTHORIZED,
             "unauthenticated",
-            "A valid import token is required.",
+            "A valid connector token is required.",
         );
         response
             .headers_mut()
@@ -1455,5 +1653,42 @@ mod tests {
             .port();
         let addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port);
         assert!(healthcheck(addr, Duration::from_secs(1)).is_err());
+    }
+
+    #[test]
+    fn r82_bodies_with_secrets_never_show_them_in_debug() {
+        let secret = "test-password-never-logged";
+        let shown = [
+            format!(
+                "{:?}",
+                LoginBody {
+                    password: secret.to_owned()
+                }
+            ),
+            format!(
+                "{:?}",
+                SetupBody {
+                    code: secret.to_owned(),
+                    password: secret.to_owned()
+                }
+            ),
+            format!(
+                "{:?}",
+                PasswordChangeBody {
+                    current_password: secret.to_owned(),
+                    new_password: secret.to_owned()
+                }
+            ),
+            format!(
+                "{:?}",
+                ConnectorTokenBody {
+                    current_password: secret.to_owned()
+                }
+            ),
+        ];
+        for text in shown {
+            assert!(!text.contains(secret), "{text}");
+            assert!(text.ends_with("(***)"), "{text}");
+        }
     }
 }

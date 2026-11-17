@@ -22,10 +22,11 @@ struct TestApp {
 fn app() -> TestApp {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = Db::open(dir.path()).expect("db");
-    let router = common::logged_in(http::app(
-        AppState::new(db, prague(), common::auth()),
-        &Limits::default(),
-    ));
+    let (auth, code) = common::auth();
+    let router = common::logged_in(
+        http::app(AppState::new(db, prague(), auth), &Limits::default()),
+        code,
+    );
     TestApp { _dir: dir, router }
 }
 
@@ -214,11 +215,9 @@ mod served {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("addr");
             let (stop, stopped) = oneshot::channel::<()>();
-            let app = http::app(
-                AppState::new(db, super::prague(), super::common::auth()),
-                &limits,
-            );
-            let cookie = super::common::login(&app).await;
+            let (auth, code) = super::common::auth();
+            let app = http::app(AppState::new(db, super::prague(), auth), &limits);
+            let cookie = super::common::login(&app, &code).await;
             let task = tokio::spawn(async move {
                 http::serve(listener, app, &limits, async {
                     let _ = stopped.await;

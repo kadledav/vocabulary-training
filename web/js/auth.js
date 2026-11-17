@@ -1,11 +1,29 @@
 // @ts-check
 /**
- * Login and logout (design §9.1). The session itself is an HttpOnly cookie
- * the page never sees; the page only remembers where to go back to after
- * logging in.
+ * First-run setup, login, logout, password change and the connector token
+ * (design §9.1, §9.2). The session itself is an HttpOnly cookie the page
+ * never sees; the page only remembers where to go back to after logging in.
  */
 
-import { postJson } from './api.js';
+import { getJson, postJson } from './api.js';
+
+/** Shortest new password, in characters (the server checks it too). */
+export const MIN_PASSWORD_CHARS = 12;
+
+/**
+ * Why `password` cannot be a new password (with its repetition), or null.
+ *
+ * @param {string} password
+ * @param {string} repeated
+ * @returns {string | null}
+ */
+export function newPasswordProblem(password, repeated) {
+  if ([...password].length < MIN_PASSWORD_CHARS) {
+    return `The new password needs at least ${MIN_PASSWORD_CHARS} characters.`;
+  }
+  if (password !== repeated) return 'The two new passwords differ.';
+  return null;
+}
 
 const RETURN_KEY = 'vocab.after-login';
 const LOGIN_HASH = '#/login';
@@ -58,4 +76,49 @@ export function login(password) {
 /** @returns {Promise<import('./api.js').ApiResult<{ status: string }>>} */
 export function logout() {
   return postJson('/api/auth/logout', {});
+}
+
+/**
+ * Whether the app still needs to be set up (no password yet).
+ *
+ * @returns {Promise<import('./api.js').ApiResult<{ required: boolean }>>}
+ */
+export function setupStatus() {
+  return getJson('/api/auth/setup');
+}
+
+/**
+ * First run: the setup code from the server log and the new password.
+ *
+ * @param {string} code
+ * @param {string} password
+ * @returns {Promise<import('./api.js').ApiResult<{ status: string }>>}
+ */
+export function setUp(code, password) {
+  return postJson('/api/auth/setup', { code, password });
+}
+
+/**
+ * @param {string} currentPassword
+ * @param {string} newPassword
+ * @returns {Promise<import('./api.js').ApiResult<{ status: string }>>}
+ */
+export function changePassword(currentPassword, newPassword) {
+  return postJson('/api/auth/password', { current_password: currentPassword, new_password: newPassword });
+}
+
+/** @returns {Promise<import('./api.js').ApiResult<{ exists: boolean, created_at: string | null }>>} */
+export function connectorTokenStatus() {
+  return getJson('/api/auth/connector-token');
+}
+
+/**
+ * A new connector token (shown once; replaces the old one). Asks for the
+ * current password again.
+ *
+ * @param {string} currentPassword
+ * @returns {Promise<import('./api.js').ApiResult<{ token: string }>>}
+ */
+export function createConnectorToken(currentPassword) {
+  return postJson('/api/auth/connector-token', { current_password: currentPassword });
 }

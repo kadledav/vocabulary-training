@@ -36,7 +36,7 @@ COPY crates crates
 COPY web web
 RUN cargo build --release --locked --target x86_64-unknown-linux-musl -p vocab-server \
  && install -D -m 0755 target/x86_64-unknown-linux-musl/release/vocab-server /out/vocab-server \
- && mkdir -p /out/data /out/cache
+ && mkdir -p /out/data
 
 # ── runtime stage ───────────────────────────────────────────────────────────
 FROM gcr.io/distroless/static-debian13:nonroot@sha256:25ac8f0c3b2334a9eb05452266bd4697864a8c8ef0ef71e5e6480d7f92868329
@@ -47,12 +47,12 @@ LABEL org.opencontainers.image.title="vocabulary-training" \
       org.opencontainers.image.licenses="MIT"
 
 COPY --from=build /out/vocab-server /vocab-server
-# Mount points. /data and /cache belong to the image's default user, so a
-# fresh named volume is writable; bind mounts get their ownership from the
-# host (deploy/README.md runs the app as 3101:3101). Configuration comes from
-# the environment (VOCAB_PUBLIC_ORIGIN, …); there is no config file.
+# The one mount point. /data belongs to the image's default user, so a fresh
+# named volume is writable; a bind mount gets its ownership from the host
+# (deploy/README.md runs the app as 3101:3101). The app creates the cache
+# directory (/data/cache) itself. Configuration comes from the environment
+# (VOCAB_PUBLIC_ORIGIN, …); there is no config file and there are no secrets.
 COPY --from=build --chown=65532:65532 /out/data /data
-COPY --from=build --chown=65532:65532 /out/cache /cache
 
 USER 65532:65532
 EXPOSE 8080

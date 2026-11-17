@@ -7,23 +7,27 @@
 //! | `VOCAB_DAY_ROLLOVER_HOUR` | `4` | local hour (0-23) a study day starts |
 //! | `VOCAB_LOG_LEVEL` | `info` | `error`, `warn`, `info`, `debug`, `trace` |
 //! | `VOCAB_LISTEN` | `0.0.0.0:8080` | listen address (development and tests) |
-//! | `VOCAB_DATA_DIR` | `/data` | the SQLite file set |
-//! | `VOCAB_CACHE_DIR` | `/cache` | audio files |
+//! | `VOCAB_DATA_DIR` | `/data` | the SQLite file set (and the cache below it) |
+//! | `VOCAB_CACHE_DIR` | `<data dir>/cache` | audio files |
 //!
-//! Any other `VOCAB_*` variable (a typo, a removed setting) and any invalid
-//! value is a startup error naming the variable. Secrets
-//! (`VOCAB_PASSWORD_HASH_B64`, `VOCAB_IMPORT_TOKEN`) are read by `auth`.
+//! Any other `VOCAB_*` variable (a typo, a removed setting such as the M5
+//! secrets) and any invalid value is a startup error naming the variable.
+//! There are no secrets in the environment: the password and the connector
+//! token are set up in the app and stored in the database (`auth`).
 
 use std::ffi::OsString;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::auth;
 use crate::clock::{ClockError, DayRule};
 
 const DEFAULT_DATA_DIR: &str = "/data";
-const DEFAULT_CACHE_DIR: &str = "/cache";
+/// The cache directory inside the data directory, unless `VOCAB_CACHE_DIR`.
+const CACHE_SUBDIR: &str = "cache";
+/// Prefix of the file written and removed again at start to prove a
+/// directory is writable (a random suffix follows).
+const WRITE_PROBE: &str = ".vocab-write-check-";
 const DEFAULT_TIMEZONE: &str = "Europe/Prague";
 const DEFAULT_ROLLOVER_HOUR: u8 = 4;
 const DEFAULT_LISTEN: &str = "0.0.0.0:8080";
@@ -38,8 +42,8 @@ const LISTEN_ENV: &str = "VOCAB_LISTEN";
 const DATA_DIR_ENV: &str = "VOCAB_DATA_DIR";
 const CACHE_DIR_ENV: &str = "VOCAB_CACHE_DIR";
 
-/// Every `VOCAB_*` variable the app reads (here or in `auth`).
-const KNOWN: [&str; 9] = [
+/// Every `VOCAB_*` variable the app reads.
+const KNOWN: [&str; 7] = [
     PUBLIC_ORIGIN_ENV,
     TIMEZONE_ENV,
     ROLLOVER_ENV,
@@ -47,8 +51,6 @@ const KNOWN: [&str; 9] = [
     LISTEN_ENV,
     DATA_DIR_ENV,
     CACHE_DIR_ENV,
-    auth::PASSWORD_HASH_ENV,
-    auth::IMPORT_TOKEN_ENV,
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -138,6 +140,57 @@ pub struct Paths {
     pub cache_dir: PathBuf,
 }
 
+/// A directory the app cannot use.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "cannot {action} the {what} directory {}: {source}; the user the app runs as \
+     must be able to create and write it (deploy/README.md: storage)",
+    .path.display()
+)]
+pub struct PathError {
+    what: &'static str,
+    path: PathBuf,
+    action: &'static str,
+    source: std::io::Error,
+}
+
+impl Paths {
+    /// Create the data and cache directories when missing (mode 0700) and
+    /// check that both are writable, so a wrong mount or owner is a clear
+    /// startup error.
+    pub fn prepare(&self) -> Result<(), PathError> {
+        prepare_dir("data", &self.data_dir)?;
+        prepare_dir("cache", &self.cache_dir)
+    }
+}
+
+fn prepare_dir(what: &'static str, path: &Path) -> Result<(), PathError> {
+    let fail = |action, source| PathError {
+        what,
+        path: path.to_owned(),
+        action,
+        source,
+    };
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(path).map_err(|err| fail("create", err))?;
+    let mut suffix = [0u8; 8];
+    getrandom::fill(&mut suffix).map_err(|err| fail("write to", std::io::Error::other(err)))?;
+    let probe = path.join(format!("{WRITE_PROBE}{}", hex::encode(suffix)));
+    // A new file only (never an existing one, never through a symlink).
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(
+        &mut options,
+        rustix::fs::OFlags::NOFOLLOW.bits().cast_signed(),
+    );
+    options.open(&probe).map_err(|err| fail("write to", err))?;
+    std::fs::remove_file(&probe).map_err(|err| fail("write to", err))
+}
+
 impl Config {
     /// Load the configuration from the process environment.
     pub fn load() -> Result<Self, ConfigError> {
@@ -196,11 +249,11 @@ impl Config {
                     "must be an IP:port address such as 0.0.0.0:8080",
                 )
             })?;
-        let dir = |key: &'static str, default: &str| -> Result<PathBuf, ConfigError> {
-            Ok(text(key)?
-                .filter(|v| !v.is_empty())
-                .map_or_else(|| PathBuf::from(default), PathBuf::from))
+        let dir = |key: &'static str| -> Result<Option<PathBuf>, ConfigError> {
+            Ok(text(key)?.filter(|v| !v.is_empty()).map(PathBuf::from))
         };
+        let data_dir = dir(DATA_DIR_ENV)?.unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIR));
+        let cache_dir = dir(CACHE_DIR_ENV)?.unwrap_or_else(|| data_dir.join(CACHE_SUBDIR));
         Ok(Self {
             public_origin,
             day_rule,
@@ -209,8 +262,8 @@ impl Config {
             session_days: SESSION_DAYS,
             limits: Limits::default(),
             paths: Paths {
-                data_dir: dir(DATA_DIR_ENV, DEFAULT_DATA_DIR)?,
-                cache_dir: dir(CACHE_DIR_ENV, DEFAULT_CACHE_DIR)?,
+                data_dir,
+                cache_dir,
             },
         })
     }
@@ -295,7 +348,9 @@ mod tests {
         assert_eq!(config.limits.body_bytes, 64 * 1024);
         assert_eq!(config.limits.import_body_bytes, 5 * 1024 * 1024);
         assert_eq!(config.paths.data_dir, PathBuf::from("/data"));
-        assert_eq!(config.paths.cache_dir, PathBuf::from("/cache"));
+        assert_eq!(config.paths.cache_dir, PathBuf::from("/data/cache"));
+        let config = load(&[ORIGIN, (DATA_DIR_ENV, "/srv/vocab")]).expect("valid");
+        assert_eq!(config.paths.cache_dir, PathBuf::from("/srv/vocab/cache"));
         let err = load(&[]).expect_err("missing");
         assert!(err.contains("VOCAB_PUBLIC_ORIGIN is not set"), "{err}");
         let err = load(&[(PUBLIC_ORIGIN_ENV, "")]).expect_err("empty");
@@ -312,8 +367,6 @@ mod tests {
             (LISTEN_ENV, "127.0.0.1:9000"),
             (DATA_DIR_ENV, "/srv/data"),
             (CACHE_DIR_ENV, "/srv/cache"),
-            (auth::PASSWORD_HASH_ENV, "x"),
-            (auth::IMPORT_TOKEN_ENV, "y"),
             ("PATH", "/usr/bin"),
         ])
         .expect("valid");
@@ -336,7 +389,14 @@ mod tests {
             let err = load(&[ORIGIN, (var, value)]).expect_err(value);
             assert!(err.contains(var), "{var}={value}: {err}");
         }
-        for unknown in ["VOCAB_CONFIG", "VOCAB_TIMEZON", "VOCAB_TTS_URL"] {
+        for unknown in [
+            "VOCAB_CONFIG",
+            "VOCAB_TIMEZON",
+            "VOCAB_TTS_URL",
+            // The M5 secrets: no secrets in the environment any more.
+            "VOCAB_PASSWORD_HASH_B64",
+            "VOCAB_IMPORT_TOKEN",
+        ] {
             let err = load(&[ORIGIN, (unknown, "x")]).expect_err(unknown);
             assert!(err.contains(&format!("unknown setting {unknown}")), "{err}");
         }
@@ -376,5 +436,43 @@ mod tests {
                 "{good} should be accepted"
             );
         }
+    }
+
+    #[test]
+    fn r85_missing_directories_are_created_private_and_checked_writable() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let paths = Paths {
+            data_dir: root.path().join("dataset"),
+            cache_dir: root.path().join("dataset").join(CACHE_SUBDIR),
+        };
+        paths.prepare().expect("created");
+        assert!(paths.cache_dir.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for dir in [&paths.data_dir, &paths.cache_dir] {
+                let mode = std::fs::metadata(dir).expect("meta").permissions().mode();
+                assert_eq!(mode & 0o777, 0o700, "{}", dir.display());
+            }
+        }
+        // Existing directories are fine; nothing is left behind.
+        paths.prepare().expect("again");
+        let names: Vec<_> = std::fs::read_dir(&paths.data_dir)
+            .expect("list")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        assert_eq!(names, [std::ffi::OsString::from(CACHE_SUBDIR)]);
+        // A path below a regular file can never be created.
+        let file = root.path().join("file");
+        std::fs::write(&file, b"x").expect("file");
+        let bad = Paths {
+            data_dir: file.join("data"),
+            cache_dir: file.join("cache"),
+        };
+        let err = bad.prepare().expect_err("not creatable").to_string();
+        assert!(
+            err.starts_with("cannot create the data directory "),
+            "{err}"
+        );
     }
 }

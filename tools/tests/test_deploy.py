@@ -50,29 +50,27 @@ class Compose(unittest.TestCase):
         ):
             self.assertRegex(COMPOSE, required)
 
-    def test_r85_data_and_cache_volumes_config_and_secrets_from_the_environment(self):
+    def test_r85_one_dataset_mount_config_from_the_environment_and_no_secrets(self):
         base = "/mnt/tank/services/vocabulary"
-        self.assertIn(f"{base}/data:/data\n", COMPOSE)
-        self.assertIn(f"{base}/cache:/cache\n", COMPOSE)
+        volumes = re.findall(r"(?m)^\s*- (/mnt/\S+:\S+)$", COMPOSE)
+        self.assertEqual(volumes, [f"{base}:/data"])
+        self.assertNotRegex(COMPOSE, r":/cache\b")
         self.assertNotIn("/config", COMPOSE)
         self.assertFalse((REPO / "deploy" / "config.example.json").exists())
         self.assertIn("- VOCAB_PUBLIC_ORIGIN=https://vocab.example.home\n", COMPOSE)
-        for key in ("VOCAB_PASSWORD_HASH_B64", "VOCAB_IMPORT_TOKEN"):
-            self.assertIn(f"{key}=${{{key}:?", COMPOSE)
-        env_example = (REPO / "deploy" / ".env.example").read_text()
-        keys = []
-        for line in env_example.splitlines():
-            if line and not line.startswith("#"):
-                key, _, value = line.partition("=")
-                keys.append(key)
-                self.assertEqual(value.strip(), "", f"{key} must be empty in .env.example")
-        self.assertEqual(keys, ["VOCAB_PASSWORD_HASH_B64", "VOCAB_IMPORT_TOKEN"])
+        # No secrets in the environment, no .env at all (R-82: set in the app).
+        for secret in ("VOCAB_PASSWORD_HASH_B64", "VOCAB_IMPORT_TOKEN", "${"):
+            self.assertNotIn(secret, COMPOSE)
+        self.assertFalse((REPO / "deploy" / ".env.example").exists())
 
-    def test_r85_readme_sets_up_data_and_cache_for_uid_3101(self):
+    def test_r85_readme_uses_the_dataset_root_setup_code_and_reset(self):
         readme = (REPO / "deploy" / "README.md").read_text()
-        self.assertIn("mkdir -p /mnt/tank/services/vocabulary/{data,cache}", readme)
-        self.assertIn("chown 3101:3101 /mnt/tank/services/vocabulary/data /mnt/tank/services/vocabulary/cache", readme)
-        self.assertIn("chmod 600 .env", readme)
+        self.assertNotIn("mkdir -p /mnt/tank/services/vocabulary", readme)
+        self.assertIn("owner user\n**3101**", readme)
+        self.assertIn("docker logs vocabulary 2>&1 | grep 'Setup required'", readme)
+        self.assertIn("docker compose run --rm vocabulary reset-password", readme)
+        self.assertIn("*Create token*", readme)
+        self.assertNotIn("hash-password", readme)
 
 
 class Dockerfile(unittest.TestCase):
@@ -84,6 +82,7 @@ class Dockerfile(unittest.TestCase):
         self.assertRegex(stage, r"^gcr\.io/distroless/static-debian13:nonroot@sha256:[0-9a-f]{64}\n")
         self.assertRegex(stage, r"(?m)^USER 65532:65532$")
         self.assertNotIn("/config", stage)
+        self.assertNotRegex(stage, r"(?m)^COPY .* /cache$")
         self.assertRegex(stage, r'(?m)^ENTRYPOINT \["/vocab-server"\]$')
         # Nothing runs in the runtime stage: there is no shell to run it.
         self.assertNotRegex(stage, r"(?m)^(RUN|SHELL)\b")

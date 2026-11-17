@@ -1,24 +1,49 @@
 // @ts-check
 /**
- * Login screen (design §9.1, R-82): one password field. After a successful
- * login the app returns to the screen that asked for it.
+ * Login screen (design §9.1, R-82): one password field. While the app has
+ * no password yet it shows the first-run setup instead: the setup code from
+ * the server log plus the new password, twice. After a successful login or
+ * setup the app returns to the screen that asked for it.
  */
 
-import { login, takeReturn } from '../auth.js';
+import { login, newPasswordProblem, setUp, setupStatus, takeReturn } from '../auth.js';
 import { h, mount } from '../dom.js';
 import { reloadSettings } from '../settings.js';
+
+/**
+ * @param {Record<string, string | boolean>} attrs
+ */
+function passwordInput(attrs) {
+  return h('input', { type: 'password', required: true, ...attrs });
+}
+
+/** Back to the screen that asked for the login. */
+function done() {
+  void reloadSettings();
+  window.location.hash = takeReturn();
+}
 
 /**
  * @param {HTMLElement} root
  * @param {import('../router.js').IsCurrent} isCurrent
  */
 export function renderLogin(root, isCurrent) {
-  const password = h('input', {
-    type: 'password',
+  drawLogin(root, isCurrent);
+  void (async () => {
+    const answer = await setupStatus();
+    if (isCurrent() && answer.ok && answer.data.required) drawSetup(root, isCurrent);
+  })();
+}
+
+/**
+ * @param {HTMLElement} root
+ * @param {import('../router.js').IsCurrent} isCurrent
+ */
+function drawLogin(root, isCurrent) {
+  const password = passwordInput({
     id: 'password',
     name: 'password',
     autocomplete: 'current-password',
-    required: true,
     autofocus: true,
     'aria-describedby': 'login-status',
   });
@@ -42,8 +67,11 @@ export function renderLogin(root, isCurrent) {
     if (answer.ok) {
       password.value = '';
       status.textContent = '';
-      void reloadSettings();
-      window.location.hash = takeReturn();
+      done();
+      return;
+    }
+    if (answer.code === 'setup_required') {
+      drawSetup(root, isCurrent);
       return;
     }
     status.textContent = answer.code === 'invalid_password' ? 'Wrong password. Try again.' : answer.message;
@@ -61,4 +89,90 @@ export function renderLogin(root, isCurrent) {
   );
   mount(root, h('h1', {}, 'Vocabulary'), h('p', { class: 'muted' }, 'Log in to practise.'), form);
   password.focus();
+}
+
+/**
+ * First run: setup code (from `docker logs`) and the new password.
+ *
+ * @param {HTMLElement} root
+ * @param {import('../router.js').IsCurrent} isCurrent
+ */
+function drawSetup(root, isCurrent) {
+  const code = h('input', {
+    type: 'text',
+    id: 'setup-code',
+    name: 'setup-code',
+    autocomplete: 'one-time-code',
+    autocapitalize: 'characters',
+    spellcheck: 'false',
+    required: true,
+    placeholder: 'XXXX-XXXX-XX',
+  });
+  const password = passwordInput({ id: 'new-password', name: 'new-password', autocomplete: 'new-password' });
+  const repeated = passwordInput({ id: 'repeat-password', name: 'repeat-password', autocomplete: 'new-password' });
+  const submit = h('button', { type: 'submit', class: 'primary big' }, 'Set up');
+  const status = h('p', { class: 'status', role: 'status', 'data-testid': 'setup-status' });
+
+  /** @param {string} message */
+  const fail = (message) => {
+    status.textContent = message;
+    status.classList.add('error');
+  };
+
+  /** @param {Event} event */
+  const onSubmit = async (event) => {
+    event.preventDefault();
+    status.classList.remove('error');
+    if (code.value.trim() === '') {
+      fail('Enter the setup code from the server log.');
+      code.focus();
+      return;
+    }
+    const problem = newPasswordProblem(password.value, repeated.value);
+    if (problem) {
+      fail(problem);
+      password.focus();
+      return;
+    }
+    submit.disabled = true;
+    status.textContent = 'Setting up…';
+    const answer = await setUp(code.value.trim(), password.value);
+    if (!isCurrent()) return;
+    submit.disabled = false;
+    if (answer.ok) {
+      status.textContent = '';
+      done();
+      return;
+    }
+    if (answer.code === 'already_set_up') {
+      drawLogin(root, isCurrent);
+      return;
+    }
+    fail(answer.code === 'invalid_setup_code' ? 'Wrong setup code. Check the server log and try again.' : answer.message);
+    if (answer.code === 'invalid_setup_code') code.select();
+  };
+
+  const form = h(
+    'form',
+    { class: 'login', onsubmit: (/** @type {Event} */ e) => void onSubmit(e), novalidate: true },
+    h('label', { for: 'setup-code' }, 'Setup code'),
+    code,
+    h('label', { for: 'new-password' }, 'New password'),
+    password,
+    h('label', { for: 'repeat-password' }, 'Repeat the new password'),
+    repeated,
+    submit,
+    status,
+  );
+  mount(
+    root,
+    h('h1', {}, 'Set up'),
+    h(
+      'p',
+      { class: 'muted' },
+      'Enter the setup code from the server log (docker logs vocabulary) and choose a password of at least 12 characters.',
+    ),
+    form,
+  );
+  code.focus();
 }

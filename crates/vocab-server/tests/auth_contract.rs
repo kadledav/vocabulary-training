@@ -1,9 +1,9 @@
 //! Contract tests for authentication and request protection, written from
 //! the requirements (R-82, R-83; design §9) and not from the implementation:
 //! every route's protection, the session cookie, sliding renewal, logout,
-//! password rotation, the login throttle, the CSRF guard, the import token,
-//! rate and body limits, security headers and the start-up refusals.
-//! Secrets are synthetic (`test-…`).
+//! password change, the login throttle, the CSRF guard, the connector
+//! token, rate and body limits and security headers. Secrets are synthetic
+//! (`test-…`) or made by the app itself.
 
 mod common;
 
@@ -14,7 +14,7 @@ use axum::http::{Method, Request, StatusCode, header};
 use axum::response::Response;
 use serde_json::{Value, json};
 use tower::ServiceExt;
-use vocab_server::auth::{Auth, Credentials, hash_password};
+use vocab_server::auth::{Auth, SetupCode};
 use vocab_server::clock::{Clock, ManualClock};
 use vocab_server::config::Limits;
 use vocab_server::db::Db;
@@ -31,7 +31,7 @@ struct App {
     router: axum::Router,
 }
 
-fn app_with(dir: tempfile::TempDir, auth: Auth) -> App {
+fn app_with(dir: tempfile::TempDir, (auth, code): (Arc<Auth>, SetupCode)) -> App {
     let db = Db::open(dir.path()).expect("db");
     let clock = Arc::new(ManualClock::new(common::ts(common::START)));
     let state = AppState::with_clock(
@@ -40,15 +40,30 @@ fn app_with(dir: tempfile::TempDir, auth: Auth) -> App {
         common::prague(),
         auth,
     );
-    App {
+    let app = App {
         dir,
         clock,
         router: http::app(state, &Limits::default()),
-    }
+    };
+    drop(code);
+    app
 }
 
-fn app() -> App {
-    app_with(tempfile::tempdir().expect("tempdir"), common::auth())
+/// A set-up app (password [`common::PASSWORD`]) without any session.
+async fn app() -> App {
+    let (auth, code) = common::auth();
+    let app = app_with(tempfile::tempdir().expect("tempdir"), (auth, code.clone()));
+    let cookie = common::login(&app.router, &code).await;
+    let response = app
+        .send(page(
+            &Method::POST,
+            "/api/auth/logout",
+            "{}",
+            &[("cookie", &cookie)],
+        ))
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    app
 }
 
 /// A request with exactly `headers`.
@@ -88,6 +103,12 @@ impl App {
         let body = json!({ "password": password }).to_string();
         self.send(page(&Method::POST, "/api/auth/login", &body, &[]))
             .await
+    }
+
+    /// Log in and create a connector token; returns it.
+    async fn connector_token(&self) -> String {
+        let cookie = self.login().await;
+        common::connector_token(&self.router, &cookie).await
     }
 
     /// Log in with the right password; returns the `name=value` pair.
@@ -179,7 +200,7 @@ fn state_changing_routes() -> Vec<RouteInfo> {
 
 #[tokio::test]
 async fn r82_every_non_public_route_refuses_requests_without_credentials() {
-    let app = app();
+    let app = app().await;
     let stale = format!("{COOKIE_NAME}={}", "cd".repeat(32));
     let mut session_routes = 0;
     for route in http::routes() {
@@ -225,7 +246,7 @@ async fn r82_every_non_public_route_refuses_requests_without_credentials() {
 
 #[tokio::test]
 async fn r82_a_valid_session_passes_the_gate_of_every_session_route() {
-    let app = app();
+    let app = app().await;
     let cookie = app.login().await;
     for route in with_access(Access::Session) {
         if route.path == "/api/auth/logout" {
@@ -249,13 +270,13 @@ async fn r82_only_the_login_and_what_it_needs_are_public() {
     for route in with_access(Access::Public) {
         let api = route.path.starts_with("/api/");
         assert!(
-            !api || route.path == "/api/auth/login",
+            !api || route.path == "/api/auth/login" || route.path == "/api/auth/setup",
             "{} {} must not be public",
             route.method,
             route.path
         );
     }
-    let app = app();
+    let app = app().await;
     for uri in ["/healthz", "/"] {
         let response = app.send(req(&Method::GET, uri, "", &[])).await;
         assert_eq!(response.status(), StatusCode::OK, "{uri}");
@@ -266,7 +287,7 @@ async fn r82_only_the_login_and_what_it_needs_are_public() {
 
 #[tokio::test]
 async fn r82_login_with_the_right_password_opens_a_session() {
-    let app = app();
+    let app = app().await;
     let response = app.login_with(common::PASSWORD).await;
     assert_eq!(response.status(), StatusCode::OK);
     let cookie = cookie_pair(&response).expect("cookie");
@@ -278,7 +299,7 @@ async fn r82_login_with_the_right_password_opens_a_session() {
 
 #[tokio::test]
 async fn r82_the_session_cookie_is_host_prefixed_with_the_hardened_attributes() {
-    let app = app();
+    let app = app().await;
     let response = app.login_with(common::PASSWORD).await;
     let cookie = set_cookie(&response).expect("Set-Cookie");
     let mut parts = cookie.split("; ");
@@ -305,7 +326,7 @@ async fn r82_the_session_cookie_is_host_prefixed_with_the_hardened_attributes() 
 
 #[tokio::test]
 async fn r82_wrong_passwords_are_refused_without_a_cookie() {
-    let app = app();
+    let app = app().await;
     for password in [
         "test-password-wrong",
         "",
@@ -321,7 +342,7 @@ async fn r82_wrong_passwords_are_refused_without_a_cookie() {
 
 #[tokio::test]
 async fn r82_the_session_slides_when_older_than_7_days_and_ends_after_180() {
-    let app = app();
+    let app = app().await;
     let cookie = app.login().await;
     app.advance(days(6));
     let response = app.get("/api/today", &cookie).await;
@@ -352,7 +373,7 @@ async fn r82_the_session_slides_when_older_than_7_days_and_ends_after_180() {
 
 #[tokio::test]
 async fn r82_logout_revokes_only_its_own_session() {
-    let app = app();
+    let app = app().await;
     let first = app.login().await;
     let second = app.login().await;
     let response = app
@@ -382,37 +403,33 @@ async fn r82_logout_revokes_only_its_own_session() {
 }
 
 #[tokio::test]
-async fn r82_changing_the_configured_password_hash_invalidates_existing_sessions() {
-    let first = app();
-    let cookie = first.login().await;
-    // Same password, new salt: a different hash string is a rotation too.
-    let rehash = hash_password(common::PASSWORD).expect("hash");
-    assert_ne!(
-        rehash,
-        common::password_hash_b64(),
-        "salted hashes differ per call"
-    );
-    let rotated = Auth::new(
-        Credentials::new(&rehash, common::IMPORT_TOKEN).expect("credentials"),
-        common::ORIGIN,
-        180,
-    );
-    let second = app_with(first.dir, rotated);
+async fn r82_a_new_password_invalidates_every_other_session() {
+    let first = app().await;
+    let old = first.login().await;
+    let current = first.login().await;
+    let body = json!({
+        "current_password": common::PASSWORD,
+        "new_password": "test-password-changed-in-settings",
+    })
+    .to_string();
+    let response = first
+        .send(page(
+            &Method::POST,
+            "/api/auth/password",
+            &body,
+            &[("cookie", &current)],
+        ))
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
-        second.get("/api/today", &cookie).await.status(),
+        first.get("/api/today", &old).await.status(),
         StatusCode::UNAUTHORIZED
     );
-    // A restart with the unchanged hash keeps sessions.
-    let fresh = second.login().await;
-    let third = app_with(second.dir, {
-        Auth::new(
-            Credentials::new(&rehash, common::IMPORT_TOKEN).expect("credentials"),
-            common::ORIGIN,
-            180,
-        )
-    });
+    assert_eq!(first.sessions_in_db(), 1);
+    // A restart keeps the remaining session.
+    let second = app_with(first.dir, common::auth());
     assert_eq!(
-        third.get("/api/today", &fresh).await.status(),
+        second.get("/api/today", &current).await.status(),
         StatusCode::OK
     );
 }
@@ -421,7 +438,7 @@ async fn r82_changing_the_configured_password_hash_invalidates_existing_sessions
 
 #[tokio::test]
 async fn r82_the_fifth_failure_within_15_minutes_locks_logins() {
-    let app = app();
+    let app = app().await;
     assert_eq!(
         app.fail_logins(4).await.status(),
         StatusCode::UNAUTHORIZED,
@@ -443,7 +460,7 @@ async fn r82_the_fifth_failure_within_15_minutes_locks_logins() {
 
 #[tokio::test]
 async fn r82_failures_older_than_15_minutes_do_not_count() {
-    let app = app();
+    let app = app().await;
     for _ in 0..4 {
         assert_eq!(app.fail_logins(1).await.status(), StatusCode::UNAUTHORIZED);
         app.advance(minutes(5));
@@ -453,7 +470,7 @@ async fn r82_failures_older_than_15_minutes_do_not_count() {
 
 #[tokio::test]
 async fn r82_lockouts_double_from_15_minutes_up_to_24_hours_while_attempts_continue() {
-    let app = app();
+    let app = app().await;
     let expected_minutes: [i64; 10] = [15, 30, 60, 120, 240, 480, 960, 1440, 1440, 1440];
     for expected in expected_minutes {
         let response = app.fail_logins(5).await;
@@ -477,7 +494,7 @@ async fn r82_lockouts_double_from_15_minutes_up_to_24_hours_while_attempts_conti
 
 #[tokio::test]
 async fn r82_a_day_without_failed_logins_resets_the_lockout_to_15_minutes() {
-    let app = app();
+    let app = app().await;
     for expected in [15, 30, 60] {
         let response = app.fail_logins(5).await;
         assert_eq!(retry_after(&response), expected * 60);
@@ -490,7 +507,7 @@ async fn r82_a_day_without_failed_logins_resets_the_lockout_to_15_minutes() {
 
 #[tokio::test]
 async fn r82_a_successful_login_resets_the_throttle_and_sessions_survive_lockouts() {
-    let app = app();
+    let app = app().await;
     let existing = app.login().await;
     for _ in 0..2 {
         assert_eq!(
@@ -524,7 +541,7 @@ async fn r82_a_successful_login_resets_the_throttle_and_sessions_survive_lockout
 
 #[tokio::test]
 async fn r82_every_state_changing_request_needs_the_exact_public_origin() {
-    let app = app();
+    let app = app().await;
     let cookie = app.login().await;
     let routes = state_changing_routes();
     assert!(routes.iter().any(|r| r.path == "/api/auth/login"));
@@ -589,7 +606,7 @@ async fn r82_every_state_changing_request_needs_the_exact_public_origin() {
 
 #[tokio::test]
 async fn r82_reading_does_not_need_an_origin() {
-    let app = app();
+    let app = app().await;
     let cookie = app.login().await;
     assert_eq!(
         app.get("/api/today", &cookie).await.status(),
@@ -599,7 +616,7 @@ async fn r82_reading_does_not_need_an_origin() {
 
 #[tokio::test]
 async fn r82_state_changing_requests_need_a_json_content_type() {
-    let app = app();
+    let app = app().await;
     let cookie = app.login().await;
     for route in state_changing_routes() {
         let uri = concrete(route.path);
@@ -624,12 +641,12 @@ async fn r82_state_changing_requests_need_a_json_content_type() {
     }
 }
 
-// ── import token ───────────────────────────────────────────────────────────
+// ── connector token ────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn r82_the_import_token_opens_connector_routes_and_nothing_else() {
-    let app = app();
-    let bearer = format!("Bearer {}", common::IMPORT_TOKEN);
+async fn r82_the_connector_token_opens_connector_routes_and_nothing_else() {
+    let app = app().await;
+    let bearer = format!("Bearer {}", app.connector_token().await);
     let connector = with_access(Access::ImportToken);
     assert!(!connector.is_empty());
     for route in &connector {
@@ -674,7 +691,7 @@ async fn r82_the_import_token_opens_connector_routes_and_nothing_else() {
 
 #[tokio::test]
 async fn r82_connector_routes_do_not_accept_a_session_cookie() {
-    let app = app();
+    let app = app().await;
     let cookie = app.login().await;
     for route in with_access(Access::ImportToken) {
         let uri = concrete(route.path);
@@ -691,19 +708,20 @@ async fn r82_connector_routes_do_not_accept_a_session_cookie() {
 }
 
 #[tokio::test]
-async fn r82_wrong_or_short_import_tokens_are_refused() {
-    let app = app();
-    let short = &common::IMPORT_TOKEN[..31];
-    let longer = format!("{}x", common::IMPORT_TOKEN);
-    let upper = common::IMPORT_TOKEN.to_uppercase();
+async fn r82_wrong_or_short_connector_tokens_are_refused() {
+    let app = app().await;
+    let token = app.connector_token().await;
+    let short = &token[..31];
+    let longer = format!("{token}x");
+    let upper = token.to_uppercase();
     let values = [
         format!("Bearer {short}"),
         format!("Bearer {longer}"),
         format!("Bearer {upper}"),
         "Bearer ".to_owned(),
         "Bearer".to_owned(),
-        format!("Basic {}", common::IMPORT_TOKEN),
-        common::IMPORT_TOKEN.to_owned(),
+        format!("Basic {token}"),
+        token.clone(),
     ];
     for value in &values {
         let response = app
@@ -717,39 +735,16 @@ async fn r82_wrong_or_short_import_tokens_are_refused() {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{value:?}");
     }
     // Nor does the token in the query string or in a cookie.
-    let uri = format!("/api/connector/v1/sources?token={}", common::IMPORT_TOKEN);
+    let uri = format!("/api/connector/v1/sources?token={token}");
     let response = app.send(req(&Method::GET, &uri, "", &[])).await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-}
-
-#[test]
-fn r82_the_app_does_not_start_without_a_password_hash_or_with_a_short_import_token() {
-    let token = common::IMPORT_TOKEN;
-    let hash = common::password_hash_b64();
-    assert!(Credentials::new(hash, token).is_ok());
-    // A 32-character token is the minimum.
-    let exactly_32 = "t".repeat(32);
-    assert_eq!(exactly_32.len(), 32);
-    assert!(Credentials::new(hash, &exactly_32).is_ok());
-    for short in ["", "t", &"t".repeat(31)] {
-        assert!(
-            Credentials::new(hash, short).is_err(),
-            "{} chars",
-            short.len()
-        );
-    }
-    for bad_hash in ["", "   ", "dGVzdC1ub3QtYS1oYXNo", "not base64 at all!"] {
-        assert!(Credentials::new(bad_hash, token).is_err(), "{bad_hash:?}");
-    }
-    // A plaintext password is no hash.
-    assert!(Credentials::new(common::PASSWORD, token).is_err());
 }
 
 // ── rate limits ────────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn r83_paste_import_allows_30_requests_per_10_minutes() {
-    let app = app();
+    let app = app().await;
     let cookie = app.login().await;
     let body = json!({ "text": "not a pack" }).to_string();
     let send =
@@ -778,8 +773,8 @@ async fn r83_paste_import_allows_30_requests_per_10_minutes() {
 
 #[tokio::test]
 async fn r83_connector_allows_30_requests_per_10_minutes() {
-    let app = app();
-    let bearer = format!("Bearer {}", common::IMPORT_TOKEN);
+    let app = app().await;
+    let bearer = format!("Bearer {}", app.connector_token().await);
     let send = || {
         app.send(req(
             &Method::GET,
@@ -808,7 +803,7 @@ fn json_of_size(key: &str, total: usize) -> String {
 
 #[tokio::test]
 async fn r83_login_bodies_are_limited_to_2_kib() {
-    let app = app();
+    let app = app().await;
     let fits = json_of_size("password", 2 * KIB);
     let response = app
         .send(page(&Method::POST, "/api/auth/login", &fits, &[]))
@@ -823,7 +818,7 @@ async fn r83_login_bodies_are_limited_to_2_kib() {
 
 #[tokio::test]
 async fn r83_other_bodies_are_limited_to_64_kib() {
-    let app = app();
+    let app = app().await;
     let cookie = app.login().await;
     let padded = |total: usize| format!("{{}}{}", " ".repeat(total - 2));
     let response = app
@@ -849,7 +844,7 @@ async fn r83_other_bodies_are_limited_to_64_kib() {
 
 #[tokio::test]
 async fn r83_import_accepts_a_2_mib_paste_and_refuses_much_more() {
-    let app = app();
+    let app = app().await;
     let cookie = app.login().await;
     // 2 MiB of text is read (and then rejected as not being a pack).
     let fits = json_of_size("text", 2 * MIB);
@@ -928,9 +923,9 @@ fn assert_security_headers(response: &Response, what: &str) {
 
 #[tokio::test]
 async fn r83_security_headers_are_on_every_kind_of_response() {
-    let app = app();
+    let app = app().await;
     let cookie = app.login().await;
-    let bearer = format!("Bearer {}", common::IMPORT_TOKEN);
+    let bearer = format!("Bearer {}", app.connector_token().await);
     let cases: Vec<(&str, Request<Body>, StatusCode)> = vec![
         ("shell", req(&Method::GET, "/", "", &[]), StatusCode::OK),
         (
@@ -1023,11 +1018,11 @@ async fn r83_security_headers_are_on_every_kind_of_response() {
 
 #[tokio::test]
 async fn r83_security_headers_are_on_rate_limit_and_lockout_refusals() {
-    let app = app();
+    let app = app().await;
+    let bearer = format!("Bearer {}", app.connector_token().await);
     let response = app.fail_logins(5).await;
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_security_headers(&response, "lockout 429");
-    let bearer = format!("Bearer {}", common::IMPORT_TOKEN);
     let mut last = None;
     for _ in 0..31 {
         last = Some(

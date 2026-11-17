@@ -33,13 +33,9 @@ fn app() -> TestApp {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = Db::open(dir.path()).expect("db");
     let clock = Arc::new(ManualClock::new(ts("2026-11-20T09:00:00Z")));
-    let state = AppState::with_clock(
-        db,
-        Arc::clone(&clock) as Arc<dyn Clock>,
-        prague(),
-        common::long_auth(),
-    );
-    let router = common::logged_in(http::app(state, &Limits::default()));
+    let (auth, code) = common::long_auth();
+    let state = AppState::with_clock(db, Arc::clone(&clock) as Arc<dyn Clock>, prague(), auth);
+    let router = common::logged_in(http::app(state, &Limits::default()), code);
     TestApp { dir, clock, router }
 }
 
@@ -118,9 +114,9 @@ impl TestApp {
     fn dump(&self) -> String {
         let conn = self.sql();
         let tables: Vec<String> = conn
-            // The test client's login session is not part of what an import may touch.
+            // The test client's setup and login (auth_*) are not part of what an import may touch.
             .prepare(
-                "SELECT name FROM sqlite_schema WHERE type = 'table' AND name <> 'auth_session' \
+                "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'auth\\_%' ESCAPE '\\' \
                  ORDER BY name",
             )
             .expect("tables")
@@ -1714,10 +1710,11 @@ async fn r11_a_timed_out_commit_still_imports_every_pack() {
         import_commit_timeout_secs: 1,
         ..Limits::default()
     };
-    let router = common::logged_in(http::app(
-        AppState::new(db.clone(), prague(), common::long_auth()),
-        &limits,
-    ));
+    let (auth, code) = common::long_auth();
+    let router = common::logged_in(
+        http::app(AppState::new(db.clone(), prague(), auth), &limits),
+        code,
+    );
     // Log in (and check the session once) before the database gets busy.
     let warm_up = router
         .clone()

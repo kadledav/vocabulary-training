@@ -21,7 +21,7 @@ The owner does not review this design; he wants a working app quickly and will g
 | TTS | **Kokoro-82M v1.0** (Apache-2.0 weights) run by **sherpa-onnx 2.0.1** inside a separate hardened `vocab-tts` container with no network except an internal-only Docker network. MP3 (LAME), loudness-normalised to −16 LUFS. Default voice `af_heart` (US), `bf_emma` (UK) for R-42. |
 | Images | App: static musl binary on `gcr.io/distroless/static-debian13:nonroot` (pinned digest). TTS: `gcr.io/distroless/cc-debian13:nonroot` (pinned digest). Both default to UID/GID **65532:65532** (deployed as 3101:3101), read-only rootfs, `cap_drop: ALL`, `no-new-privileges`, limits. |
 | Network | Traefik `home` entrypoint only, host `vocab.example.home`; no `websecure` router, no published ports, no mesh VPN. TTS container only on an `internal: true` network. |
-| Auth | Single password (argon2id hash in `.env`) → 180-day `__Host-` session cookie (SameSite=Strict, HttpOnly, Secure). Separate bearer **import token** for the connector, scoped to 2 endpoints. Origin check on every state-changing request. Global login throttling. |
+| Auth | Single password (argon2id hash in the DB, set on first start with a logged one-time setup code) → 180-day `__Host-` session cookie (SameSite=Strict, HttpOnly, Secure). Separate bearer **connector token** (made in Settings, stored as SHA-256) for the connector, scoped to the connector endpoints. Origin check on every state-changing request. Global login throttling. |
 | Backup | None in the app (R-85): ZFS dataset `tank/services/vocabulary`, replicated daily by the existing job. App keeps all DB files in `/data` and runs `quick_check` at start. |
 | MCP connector | **Node.js Claude Desktop extension (`.mcpb`), zero runtime dependencies**, hand-written minimal MCP stdio server; token stored by Claude Desktop as a `sensitive` user-config value. Tools: `add_words`, `list_sources`. |
 | Dependency hygiene | Every version pinned exactly (Cargo `=x.y.z` + `Cargo.lock`, `package-lock.json`, image digests, Action SHAs). Renovate with `minimumReleaseAge: "14 days"`. A CI gate (`tools/dep-age.py`) fails the build if **any** locked crate or npm package (incl. transitive) was published < 14 days ago. |
@@ -64,7 +64,7 @@ The owner does not review this design; he wants a working app quickly and will g
                               ┌────────────────────────────┐
  Claude Desktop (Mac)         │ vocabulary  (vocab-server) │   /data  (rw)  SQLite + WAL
   └ vocab connector .mcpb ───►│  :8080  HTTP API + SPA     │   (config: environment)
-    (bearer import token,     │  background: audio queue,  │   /cache (rw)  audio/*.mp3
+    (bearer import token,     │  background: audio queue,  │   /data/cache  audio/*.mp3
      over LAN/VPN,      │  daily maintenance         │
      HTTPS via Traefik)       └──────────────┬─────────────┘
                                              │ network vocab-internal (internal: true, no egress)
@@ -100,7 +100,7 @@ Pure format logic, shared by the server and by tests (and reusable later by a CL
 
 ### 3.2 Crate `vocab-server` (binary)
 
-Subcommands: `serve` (default), `healthcheck` (GET `http://127.0.0.1:8080/healthz`, exit code; used by the Compose healthcheck because the image has no shell/curl), `hash-password` (reads a password from the terminal, prints the base64 of an argon2id PHC string for `.env`), `check` (open DB, run migrations + `quick_check`, exit).
+Subcommands: `serve` (default), `healthcheck` (GET `http://127.0.0.1:8080/healthz`, exit code; used by the Compose healthcheck because the image has no shell/curl), `reset-password` (with the stack stopped: clear the password and every session, §9.1), `check` (open DB, run migrations + `quick_check`, exit).
 
 | Module | Responsibility | Owned state | Public interface (function level) |
 |---|---|---|---|
@@ -111,8 +111,8 @@ Subcommands: `serve` (default), `healthcheck` (GET `http://127.0.0.1:8080/health
 | `importer` | Preview/commit of packs, idempotency log. Orchestrates `vocab-pack`, `catalog`, `scheduler`, `audio` inside one transaction per pack. | table `pack_import` | `preview(db, text, Via) -> Vec<PackReport>`; `commit(db, text, Via) -> Vec<PackReport>`; `recent(conn) -> Vec<ImportLogRow>`. |
 | `scheduler` | Cards, FSRS memory state, review log, leeches, card creation/unlock, FSRS parameters and fitting. | tables `card`, `review_log`, `fsrs_params` | `ensure_cards(tx, &WordTraits, day)`; `on_word_changed(tx, &WordTraits, day)`; `due_cards(conn, day, &Scope) -> Vec<DueCard>`; `new_cards(conn, &Scope) -> Vec<NewCard>`; `introduced_on(conn, day) -> u32`; `reviewed_words_on(conn, day) -> HashSet<WordId>`; `record_review(tx, ReviewInput) -> ReviewOutcome`; `undo_review(tx, ReviewId) -> UndoOutcome`; `sentence_last_shown(conn, WordId) -> HashMap<SentenceId, StudyDay>`; `leech_action(tx, WordId, LeechAction)` (its own part: acknowledge/suspend card); `reset_card(tx, CardId)`; `card_states(conn) -> Vec<CardState>`; `history(conn, WordId) -> Vec<ReviewRow>`; `review_stats(conn, range) -> ReviewStats`; `forecast(conn, day, days) -> Vec<u32>`; `fit_parameters_if_due(db, day) -> Option<FitResult>`; `export_all(conn)`. |
 | `session` | Practice blocks: build, persist queue, requeue repeats, resume, undo, summary. | tables `practice_session`, `session_item` | `start_block(tx, day, Scope, &Settings, StartKind) -> SessionView`; `current(conn, day) -> Option<SessionView>`; `rate(tx, SessionId, RateInput) -> RateResult`; `undo_last(tx, SessionId) -> SessionView`; `finish(tx, SessionId) -> BlockSummary`. Calls `scheduler` and `catalog` read functions; never writes their tables. |
-| `audio` | Clip index, generation queue + worker, TTS client, file store, garbage collection, file serving. | table `audio_clip`; directory `/cache/audio` | `clip_ref(conn, &SpeakText, Voice) -> ClipRef { url, ready }`; `request(tx, &[SpeakText], Voice)`; `spawn_worker(db, TtsClient, CacheDir, Notify)`; `open_clip(hash) -> Option<File>`; `status(conn) -> AudioStatus`; `retry_failed(tx)`; `gc(db, keep: HashSet<ClipHash>)`; `reconcile_files(db)`. |
-| `auth` | Password check, sessions, import token, login throttling, Origin (CSRF) guard. | table `auth_session`; in-memory throttle | `login(db, password, ua) -> Result<SessionCookie>`; `logout(db, cookie)`; axum extractors `RequireSession`, `RequireImportToken`; middleware `origin_guard`. |
+| `audio` | Clip index, generation queue + worker, TTS client, file store, garbage collection, file serving. | table `audio_clip`; directory `<cache dir>/audio` (default `/data/cache/audio`) | `clip_ref(conn, &SpeakText, Voice) -> ClipRef { url, ready }`; `request(tx, &[SpeakText], Voice)`; `spawn_worker(db, TtsClient, CacheDir, Notify)`; `open_clip(hash) -> Option<File>`; `status(conn) -> AudioStatus`; `retry_failed(tx)`; `gc(db, keep: HashSet<ClipHash>)`; `reconcile_files(db)`. |
+| `auth` | First-run setup, password check and change, sessions, connector token, login throttling, Origin (CSRF) guard. | tables `auth_owner`, `auth_session`; in-memory throttle and setup code | `login(db, password, ua) -> Result<SessionCookie>`; `logout(db, cookie)`; axum extractors `RequireSession`, `RequireImportToken`; middleware `origin_guard`. |
 | `settings` | Owner preferences (new/day, block size, voice, autoplay, speed, theme, legend). | table `setting` | `get(conn) -> Settings`; `update(tx, SettingsPatch) -> Settings`. |
 | `stats` | Read-only aggregations for Today/Progress/Stats. | — | `today(conn, day) -> TodayView`; `progress(conn, day) -> ProgressView`; `word_status(&CardState) -> WordStatus`. Uses `catalog` + `scheduler` read functions. |
 | `exports` | R-57 feedback export, R-86 full export. | — | `feedback(conn, day) -> FeedbackExport`; `full(conn) -> FullExport`. |
@@ -605,13 +605,16 @@ Practice item payload (everything needed to render offline later): `{item_id, ca
 
 ### 9.1 Password and session
 
-- `.env`: `VOCAB_PASSWORD_HASH_B64` = base64 of an argon2id PHC string (base64 avoids `$` interpolation problems in `.env`/Compose/Portainer). Generated with `docker run --rm -it <image> hash-password` (reads one line from the terminal; the input is visible while typing, so run it in a private shell). Parameters: m = 19 MiB, t = 2, p = 1 (OWASP minimum for argon2id).
-- Login success → 32 random bytes (`getrandom`) → cookie `__Host-vocab_session=<hex>; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=15552000` (180 days, sliding: renewed when older than 7 days). DB stores only `sha256(token)` plus the fingerprint of the configured password hash, so rotating the password in `.env` invalidates every session.
-- Verification runs on `spawn_blocking` behind a semaphore of 1.
+- No secrets in the environment (M5.1). The password is an argon2id PHC string (m = 19 MiB, t = 2, p = 1, OWASP minimum) in the one-row table `auth_owner` (migration 0004); NULL = **setup state**.
+- Setup state: every start makes a one-time **setup code** (10 Crockford-base32 characters, shown `XXXX-XXXX-XX`), keeps only its SHA-256 in memory and logs it once at WARN (`Setup required: open the app and enter setup code …`). Public `GET /api/auth/setup` → `{required}`; `POST /api/auth/setup {code, password}` (≥ 12 characters) stores the hash (conditional `UPDATE … WHERE password_phc IS NULL`, so of two concurrent setups exactly one wins), ends all sessions and logs the owner in. Wrong codes count as failed logins (§9.4). Once a password exists, setup answers `409` for good; login answers `409 setup_required` while there is none.
+- `POST /api/auth/password {current_password, new_password}` (session): checks the current password (throttled), stores the new hash, deletes every other session and rebinds the current one to the new fingerprint.
+- Recovery: `vocab-server reset-password` with the stack stopped clears the password, every session and the connector token; the next start is in setup state. `serve` holds an exclusive `flock` on `vocabulary.lock` in the data dir for its lifetime; `reset-password` and `check` take it without waiting and refuse ("stop the stack first") while it is held, and refuse when there is no database (only `serve` creates one). The process umask is 077: everything the app creates is owner-only; existing directories are not changed.
+- Login success → 32 random bytes (`getrandom`) → cookie `__Host-vocab_session=<hex>; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=15552000` (180 days, sliding: renewed when older than 7 days). DB stores only `sha256(token)` plus the fingerprint (`sha256` of the PHC string) of the password at login, so a new password invalidates the sessions of the old one.
+- Hashing, verification and setup-code checks run on `spawn_blocking` behind a semaphore of 1; every change of the stored credentials runs in that same slot.
 
-### 9.2 Import token
+### 9.2 Connector token
 
-- `.env`: `VOCAB_IMPORT_TOKEN` (≥ 32 random bytes, hex/base64url; the app refuses to start if shorter than 32 characters). Sent as `Authorization: Bearer …`, compared in constant time (`subtle`) on SHA-256 digests.
+- Created in the app: Settings → *Create token* (`POST /api/auth/connector-token {current_password}`, session + CSRF guard; the password is checked like a login, so a stolen cookie alone cannot mint a token) makes 32 random bytes (64 hex), shows them once and replaces any old token; `auth_owner` keeps only the SHA-256 (`GET` tells whether one exists and when it was made). No token → the connector routes answer `401`. Sent as `Authorization: Bearer …`, compared in constant time (`subtle`) on SHA-256 digests.
 - Accepted **only** by `/api/connector/v1/*`; session cookies are not accepted there and the token is not accepted anywhere else. The connector therefore cannot read progress, edit or delete (R-12).
 
 ### 9.3 CSRF
@@ -657,7 +660,7 @@ Practice item payload (everything needed to render offline later): `{item_id, ca
 1. **What is spoken:** per word `speak ?? headword`; per sentence the English text with markers removed and a leading/trailing `…`/`...` trimmed. Czech is never spoken (Kokoro has no Czech voice; the app is EN→CS).
 2. **Clip identity:** `hash = hex(sha256("v1|kokoro-multi-lang-v1_0|" + voice + "|1.0|" + text))[0..32]`. Identical text → one clip shared across words. Changing the text (owner edit, pack conflict applied) yields a new hash; the old clip becomes garbage.
 3. **Queue:** `audio::request` inserts `pending` rows (ignore if the hash exists). Triggers: import commit, word/sentence edits, voice change in settings (enqueues the whole set for the new voice in the background; until a clip exists the client falls back to the other voice's clip, then to browser speech).
-4. **Worker:** one tokio task; wakes on a `Notify` (new work) or every 30 s; picks the oldest due `pending` clip (`kind = 'word'` first); calls the TTS service (timeout 60 s); writes `/cache/audio/<h0h1>/<hash>.mp3.tmp`, `fsync`, renames to `.mp3`; marks `ready` with size and duration.
+4. **Worker:** one tokio task; wakes on a `Notify` (new work) or every 30 s; picks the oldest due `pending` clip (`kind = 'word'` first); calls the TTS service (timeout 60 s); writes `<cache dir>/audio/<h0h1>/<hash>.mp3.tmp`, `fsync`, renames to `.mp3`; marks `ready` with size and duration.
 5. **Retries:** transport errors/5xx → `attempts + 1`, `next_attempt_at` = now + 30 s, 2 min, 10 min, 1 h, 6 h, 24 h; after 6 attempts `failed`. 4xx → `failed` immediately with the error code. Settings shows pending/failed counts and *Retry failed*. While the TTS service is unreachable the worker backs off instead of spinning.
 6. **Post-processing (in vocab-tts):** trim leading/trailing silence below −50 dBFS → EBU R128 integrated loudness (`ebur128`; for clips < 400 ms where integrated loudness is undefined, use maximum momentary loudness) → gain to **−16 LUFS** (clamped to ±20 dB) → true-peak limit to −1.5 dBTP by scaling → pad 60 ms silence before, 150 ms after (avoids clipped onsets on mobile browsers) → **MP3**, mono, 24 kHz, LAME VBR quality 5 (≈ 48–64 kbit/s; ~10 KB per word, ~30–40 KB per sentence). MP3 plays everywhere incl. iOS Safari; Opus is still only partially supported by desktop Safari.
 7. **Reconciliation & GC:** at start, `ready` rows whose file is missing go back to `pending` (the cache volume is regenerable, R-85). Weekly maintenance deletes clips not in the keep-set (current speak texts × voices in use) and orphan files.
@@ -688,25 +691,13 @@ Expected load: a 15-word pack ≈ 15 word clips + ~60 sentence clips; migrating 
 ### 12.1 Storage: ZFS dataset, UID/GID
 
 - Container UID/GID: the images default to **65532:65532** (distroless `nonroot`); the deployment runs them as the owner's TrueNAS user **3101:3101** (`user:` in Compose).
-- Owner, once (TrueNAS UI: Datasets → `tank/services` → Add dataset `vocabulary`, preset *Generic*; then in a shell):
+- Owner, once (TrueNAS UI): Datasets → `tank/services` → Add dataset `vocabulary`, preset *Generic*; Permissions: owner 3101:3101, `0700`. The dataset root is the only mount (`/data`); the app creates missing directories itself (data dir, cache dir `/data/cache`, mode 0700) and stops with `storage is not usable` if it cannot create or write them. `VOCAB_DATA_DIR` (default `/data`) and `VOCAB_CACHE_DIR` (default `<data dir>/cache`) can override the paths.
 
-```sh
-mkdir -p /mnt/tank/services/vocabulary/{data,cache}
-chown 3101:3101 /mnt/tank/services/vocabulary/data /mnt/tank/services/vocabulary/cache
-chmod 0700      /mnt/tank/services/vocabulary/data /mnt/tank/services/vocabulary/cache
-```
-
-- Backup: the existing recursive daily replication `tank/services` → `backup-tank/services` picks up the new child dataset automatically; check after the first run that `backup-tank/services/vocabulary` exists. ZFS snapshots are atomic across `data/vocabulary.sqlite`, `-wal` and `-shm`, and WAL mode is crash-safe, so every snapshot is a consistent DB. The app has no backup logic (R-85).
+- Backup: the existing recursive daily replication `tank/services` → `backup-tank/services` picks up the new child dataset automatically; check after the first run that `backup-tank/services/vocabulary` exists. ZFS snapshots are atomic across `vocabulary.sqlite`, `-wal` and `-shm`, and WAL mode is crash-safe, so every snapshot is a consistent DB. The app has no backup logic (R-85).
 
 Configuration is environment only (no config file): `VOCAB_PUBLIC_ORIGIN` (required, e.g. `https://vocab.example.home`), `VOCAB_TIMEZONE` (default `Europe/Prague`), `VOCAB_DAY_ROLLOVER_HOUR` (default 4), `VOCAB_LOG_LEVEL` (default `info`); unknown `VOCAB_*` variables or invalid values stop the app with a message naming the variable.
 
-`.env` (in `home/docker/vocabulary/`, never committed; an `.env.example` with empty values is committed):
-
-```sh
-VOCAB_PASSWORD_HASH_B64=   # docker run --rm -it ghcr.io/kadledav/vocabulary-training:<tag> hash-password
-VOCAB_IMPORT_TOKEN=        # openssl rand -hex 32   (also entered in the Claude Desktop extension)
-VOCAB_TTS_TOKEN=           # openssl rand -hex 32
-```
+There is no `.env`: the password is set on first start with the logged setup code, the connector token in Settings (§9.1, §9.2). How the TTS service (M6) authenticates the app is decided in M6 under the same rule.
 
 ### 12.2 Compose draft (`home/docker/vocabulary/docker-compose.yml` — to be added to the home repo by the owner/guarantor, not by this design)
 
@@ -726,12 +717,8 @@ services:
       - /tmp:size=16m,mode=1777,noexec,nosuid,nodev
     environment:
       - VOCAB_PUBLIC_ORIGIN=https://vocab.example.home
-      - VOCAB_PASSWORD_HASH_B64=${VOCAB_PASSWORD_HASH_B64}
-      - VOCAB_IMPORT_TOKEN=${VOCAB_IMPORT_TOKEN}
-      - VOCAB_TTS_TOKEN=${VOCAB_TTS_TOKEN}
     volumes:
-      - /mnt/tank/services/vocabulary/data:/data
-      - /mnt/tank/services/vocabulary/cache:/cache
+      - /mnt/tank/services/vocabulary:/data
     mem_limit: 256m
     memswap_limit: 256m
     cpus: 1.0
@@ -845,7 +832,7 @@ Notes:
 |---|---|
 | R-83 minimal image, no shell, no package manager | App: `distroless/static-debian13:nonroot` + static binary. TTS: `distroless/cc-debian13:nonroot`. CI smoke test asserts `--entrypoint /bin/sh` fails. Healthchecks use the binaries themselves. |
 | R-83 fixed non-root UID/GID | `USER 65532:65532` in both images; Compose runs them as `user: "3101:3101"`; dataset ownership per §12.1. |
-| R-83 read-only rootfs; only data volume + small tmpfs writable | `read_only: true`; writable: `/data`, `/cache` (app only), `/tmp` tmpfs 16 MB `noexec`; SQLite `temp_store=MEMORY`. Config mounted `:ro`. |
+| R-83 read-only rootfs; only data volume + small tmpfs writable | `read_only: true`; writable: `/data` (database + `/data/cache`), `/tmp` tmpfs 16 MB `noexec`; SQLite `temp_store=MEMORY`. No config mount. |
 | R-83 cap_drop ALL, no-new-privileges, no socket, no host network, no published ports | Compose §12.2; app listens on 8080 (> 1024, no capability needed). |
 | R-83 memory, CPU, PID limits | App 256 MB / 1 CPU / 128 PIDs; TTS 1.5 GB / 2 CPU / 64 PIDs; swap disabled via `memswap_limit`. |
 | R-83 body size limits and rate limiting on login and import | §9.4. |
@@ -854,7 +841,7 @@ Notes:
 | R-84 schema validation | `vocab-pack::validate` (§5.2) + schema conformance tests. |
 | R-84 size limits | Paste ≤ 2 MiB, pack ≤ 1 MiB, ≤ 100 words/pack, per-field maxima; control characters rejected. |
 | R-84 everything rendered escaped | DOM via `h()`/`textContent` only; marked spans arrive pre-split (`pre/target/post`) so the client never parses or injects markup; CSP without `unsafe-inline`; CI forbids HTML-injection APIs in `web/`. |
-| R-82 secrets from `.env` | Password hash, import token, TTS token only via env; `Debug` of secrets prints `***`; config file has no secrets. |
+| R-82 no secrets in the environment | Password hash and connector-token digest in the DB (`auth_owner`); setup code only in memory and one WARN log line; `Debug` of secrets prints `***`. |
 
 ---
 

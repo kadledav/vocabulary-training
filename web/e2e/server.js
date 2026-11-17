@@ -6,13 +6,14 @@
  * HTTPS. The proxy uses a throw-away self-signed certificate (the browsers
  * run with `ignoreHTTPSErrors`); `VOCAB_PUBLIC_ORIGIN` is the proxy's origin.
  *
- * Secrets are synthetic and made per test run: a `test-` password hashed
- * by the binary's own `hash-password`, and a random import token.
+ * Every server starts in setup state with an empty data directory (the
+ * server creates it and its cache directory); `setupCode` is the one-time
+ * code the server logged. The password is synthetic and made per test run.
  */
 
 import { execFileSync, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
 import { tmpdir } from 'node:os';
@@ -23,12 +24,9 @@ const here = path.dirname(new URL(import.meta.url).pathname);
 /** The server binary: `$VOCAB_SERVER_BIN`, else the workspace's debug build. */
 export const SERVER_BIN = process.env.VOCAB_SERVER_BIN ?? path.resolve(here, '../../target/debug/vocab-server');
 
-/** The password of every test server (synthetic, per test run). */
+/** The password the tests set up (synthetic, per test run). */
 export const PASSWORD = `test-password-${randomBytes(8).toString('hex')}`;
-const token = `test-import-token-${randomBytes(16).toString('hex')}`;
 
-/** @type {string | null} */
-let passwordHash = null;
 /** @type {{ key: Buffer, cert: Buffer } | null} */
 let tls = null;
 
@@ -37,16 +35,6 @@ function binary() {
     throw new Error(`vocab-server binary not found at ${SERVER_BIN}: run "cargo build -p vocab-server" first`);
   }
   return SERVER_BIN;
-}
-
-/** `VOCAB_PASSWORD_HASH_B64` of {@link PASSWORD}, from `vocab-server hash-password`. */
-function hashOnce() {
-  if (passwordHash === null) {
-    passwordHash = execFileSync(binary(), ['hash-password'], { input: `${PASSWORD}\n`, env: {} })
-      .toString()
-      .trim();
-  }
-  return passwordHash;
 }
 
 /** A self-signed certificate for 127.0.0.1, made once per worker with openssl. */
@@ -106,21 +94,18 @@ async function startProxy() {
 }
 
 /**
- * @typedef {{ url: string, serverUrl: string, dbPath: string, stop: () => Promise<void> }} RunningServer
+ * @typedef {{ url: string, serverUrl: string, dbPath: string, setupCode: string, log: () => string, stop: () => Promise<void> }} RunningServer
  * `url` is the HTTPS origin the browser uses (= `public_origin`); `serverUrl`
- * is the plain HTTP listener for direct API calls from the tests.
+ * is the plain HTTP listener for direct API calls from the tests;
+ * `setupCode` comes from the server's "Setup required" log line.
  */
 
 /** @returns {Promise<RunningServer>} */
 export async function startServer() {
   const bin = binary();
-  const hash = hashOnce();
   const proxy = await startProxy();
   const dir = mkdtempSync(path.join(tmpdir(), 'vocab-e2e-'));
   const data = path.join(dir, 'data');
-  const cache = path.join(dir, 'cache');
-  mkdirSync(data);
-  mkdirSync(cache);
   // The test runner's own VOCAB_* variables (e.g. VOCAB_SERVER_BIN) are not
   // settings of the server, which refuses unknown ones.
   const inherited = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('VOCAB_')));
@@ -130,9 +115,6 @@ export async function startServer() {
       VOCAB_PUBLIC_ORIGIN: proxy.origin,
       VOCAB_LISTEN: '127.0.0.1:0',
       VOCAB_DATA_DIR: data,
-      VOCAB_CACHE_DIR: cache,
-      VOCAB_PASSWORD_HASH_B64: hash,
-      VOCAB_IMPORT_TOKEN: token,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -158,10 +140,14 @@ export async function startServer() {
     });
   });
   proxy.setTarget(new URL(serverUrl));
+  const code = /Setup required: open the app and enter setup code (\S+)/.exec(log);
+  if (!code) throw new Error(`no setup code in the server log:\n${log}`);
   return {
     url: proxy.origin,
     serverUrl,
     dbPath: path.join(data, 'vocabulary.sqlite'),
+    setupCode: code[1],
+    log: () => log,
     stop: async () => {
       await proxy.close();
       child.kill('SIGTERM');
