@@ -1,0 +1,14 @@
+{
+  "name": "vocab-web",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Frontend of the vocabulary training app: plain ES modules, no build step, no runtime dependencies.",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p ."
+  },
+  "devDependencies": {
+    "typescript": "7.0.2"
+  }
+}

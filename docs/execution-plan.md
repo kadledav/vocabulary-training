@@ -77,3 +77,7 @@ Estimate: design 0.2–0.4 M tokens · implementation 3–6 M · testing 0.5–1
 | When | Step | Weekly usage after | Note |
 |---|---|---|---|
 | 2026-11-17 | Plan started, cap 18 % | 6 % | Design agent running |
+| 2026-11-17 | Design done (316k tokens), guarantor review: accepted; domain scrubbed; P-1/3/4/5/6 applied, P-2 rejected | 7 % | committed 3078bd1 |
+| 2026-11-17 | M1 implementation agent started | 7 % | |
+| 2026-11-17 | M1 implemented (243k tokens); guarantor gates green (fmt, clippy ×2, 32 tests, dep-age 129 items, repo-guard, typecheck); testing agent skipped for M1 (foundations/tooling, starts at M2) | 8 % | |
+| 2026-11-17 | M1 bug-finding review started | 8 % | |

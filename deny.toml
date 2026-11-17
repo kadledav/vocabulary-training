@@ -1,0 +1,44 @@
+# cargo-deny (pinned 0.20.2 in CI): advisories, licences, bans, sources.
+# Licence exceptions for the GPL/LGPL parts of `vocab-tts` (espeak-ng via
+# sherpa-onnx, LAME) are added with that crate in M6, scoped to it only.
+
+[graph]
+all-features = true
+# Only platforms we build for: the musl release binary, CI, the owner's Mac.
+targets = [
+    "x86_64-unknown-linux-musl",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+]
+
+[advisories]
+# Advisories are reported, but updates still respect the 14-day rule (R-90):
+# a fix only lands once its release is old enough.
+yanked = "deny"
+ignore = []
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.93
+
+[licenses.private]
+# The workspace crates themselves are MIT (see LICENSE) and never published.
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

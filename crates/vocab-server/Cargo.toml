@@ -1,0 +1,40 @@
+[package]
+name = "vocab-server"
+description = "Vocabulary training app: HTTP API, single-page frontend and SQLite store."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "vocab-server"
+path = "src/main.rs"
+
+[dependencies]
+axum.workspace = true
+hex.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+include_dir.workspace = true
+jiff.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+# io-util: AsyncRead/AsyncWrite helpers for raw-socket connection tests.
+tokio = { workspace = true, features = ["io-util"] }
+tower.workspace = true
+
+[lints]
+workspace = true

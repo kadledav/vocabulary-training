@@ -1,2 +1,18 @@
 .DS_Store
 .idea/
+
+# Build output
+/target/
+node_modules/
+__pycache__/
+
+# Never commit data or secrets (R-24, R-82, R-95)
+*.sqlite*
+/dev-data/
+.env
+.env.*
+!.env.example
+*.mcpb
+# Root-level only: testdata/packs/ (synthetic fixtures) must stay tracked.
+/packs/
+/exports/

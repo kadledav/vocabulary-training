@@ -1,0 +1,87 @@
+# CI (design §14.2). Every action is pinned by commit SHA with its release tag
+# in a trailing comment; tools/dep-age.py checks that each tag points to the
+# pinned SHA and that its release is at least 14 days old (R-90).
+name: CI
+
+on:
+  push:
+    branches: [main, phase-1]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  guards:
+    name: guards (dep-age, repo-guard, cargo-deny)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Self-tests of the guard tools
+        run: python3 -m unittest discover -s tools/tests -v
+      - name: Dependency age gate (R-90)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 tools/dep-age.py
+      - name: Repository guard (R-24, R-84, R-92, R-95)
+        run: python3 tools/repo-guard.py
+      - name: Install Rust toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - name: Install cargo-deny
+        # --locked: build with cargo-deny's own published lock file, whose
+        # crates are all older than the cargo-deny release itself.
+        run: cargo install --locked cargo-deny --version 0.20.2
+      - name: cargo deny (advisories, licences, bans, sources)
+        run: cargo deny --locked check
+
+  rust:
+    name: rust (fmt, clippy, test)
+    # Nothing is built or run before the age gate and guards have passed.
+    needs: guards
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain from rust-toolchain.toml
+        run: rustup toolchain install && rustc --version && cargo clippy --version
+      - name: cargo fmt
+        run: cargo fmt --all --check
+      - name: cargo clippy (all features)
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: cargo clippy (default features)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: cargo test
+        run: cargo test --workspace --locked
+
+  web:
+    name: web (typecheck)
+    needs: guards
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.22.2
+      - name: Install dev dependencies from the lock file (no lifecycle scripts)
+        run: npm ci --ignore-scripts
+      - name: Type-check the frontend (tsc --noEmit, checkJs)
+        run: npm run typecheck

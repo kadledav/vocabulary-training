@@ -1,0 +1,52 @@
+[workspace]
+resolver = "3"
+members = ["crates/vocab-pack", "crates/vocab-server"]
+# `vocab-tts` (M6) will be a member but not a default member, so that a plain
+# `cargo build` on the Mac does not need the sherpa-onnx archive (design §14.1).
+default-members = ["crates/vocab-pack", "crates/vocab-server"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+publish = false
+
+# Every version is an exact pin (R-90). Renovate bumps them (rangeStrategy
+# "bump") only after the 14-day minimum release age; `tools/dep-age.py`
+# checks the whole Cargo.lock, transitive crates included.
+[workspace.dependencies]
+axum = { version = "=0.8.9", default-features = false, features = ["http1", "json", "matched-path"] }
+hex = "=0.4.3"
+# The server loop uses hyper directly for connection-level limits (header read
+# timeout, connection cap) that `axum::serve` does not expose.
+hyper = { version = "=1.12.0", features = ["http1", "server"] }
+hyper-util = { version = "=0.1.21", features = ["http1", "server", "server-graceful", "service", "tokio"] }
+include_dir = "=0.7.4"
+jiff = { version = "=0.2.39", default-features = false, features = ["std", "tzdb-bundle-always"] }
+rusqlite = { version = "=0.41.1", features = ["bundled"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+sha2 = "=0.11.1"
+thiserror = "=2.0.21"
+tokio = { version = "=1.54.1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "std"] }
+# dev-dependencies
+tempfile = "=3.27.0"
+tower = { version = "=0.5.3", default-features = false, features = ["util"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unwrap_used = "warn"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

@@ -1,0 +1,6 @@
+[toolchain]
+# Exact pin (R-90): 1.99.0 was released 2026-10-01. Renovate bumps it
+# (custom regex manager in renovate.json) after the 14-day minimum age.
+channel = "1.99.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
