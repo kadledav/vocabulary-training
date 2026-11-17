@@ -86,3 +86,7 @@ Estimate: design 0.2–0.4 M tokens · implementation 3–6 M · testing 0.5–1
 | 2026-11-17 | M2 implemented (376k tokens); gates green (122 tests, dep-age 192); guarantor smoke import of the owner's real export: 70 Bobiverse words/223 sentences OK, re-import no-op; general pack rejected (missing source.title → format gap, fix: optional title + instruction line) | 9 % | |
 | 2026-11-17 | M2 testing agent (Sonnet) + bug-finding agent started in parallel | 9 % | |
 | 2026-11-17 | M2 review: 10 findings (paste memory DoS, spelling fill, seq, preview≠commit, timeout drops packs, tag wipe, invisible chars, body limit, UI race, R-92) + testing agent 83 tests / 2 bugs (same as review); fix round F1–F12 sent incl. optional source.title | ~10 % | |
+| 2026-11-17 | M2 fix round done (222 tests); real-export smoke: 74 words/223 sentences, both sources, preview = commit; M2 committed db93df9 | 10 % | owner push pending |
+| 2026-11-17 | M3 implementation agent started | 10 % | |
+| 2026-11-17 | M3 implemented (345k tokens); gates green (286 tests, dep-age 210, cargo-deny ok); accepted deviations incl. backlog counts only served kinds (risk: Produce cards unlocked before M8 all due at once — handle in M8); M3 testing + bug-finding agents started | 11 % | |
+| 2026-11-17 | M3 testing agent: 35 contract tests, 1 low defect (UUID); bug review: 9 findings (undo vs import-unlocked cards, first-review format, scoped sentences, leech same-day, resume drops add-anyway, empty scope, expired block state, duplicated filters); fix round G1–G10 sent | ~12 % | |

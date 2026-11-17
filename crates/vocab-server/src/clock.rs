@@ -141,9 +141,52 @@ impl StudyDay {
     }
 }
 
+/// One instant together with the study day it belongs to: what every
+/// time-dependent write (reviews, sessions, card unlocks) needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Moment {
+    pub at: Timestamp,
+    pub day: StudyDay,
+}
+
+impl Moment {
+    pub fn of(at: Timestamp, rule: &DayRule) -> Self {
+        Self {
+            at,
+            day: StudyDay::of(at, rule),
+        }
+    }
+
+    /// `at` in the stored form (see [`format_timestamp`]).
+    pub fn stamp(&self) -> String {
+        format_timestamp(self.at)
+    }
+}
+
 impl fmt::Display for StudyDay {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+/// Stored as `YYYY-MM-DD` text (design §4).
+impl rusqlite::types::ToSql for StudyDay {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        Ok(rusqlite::types::ToSqlOutput::from(self.to_string()))
+    }
+}
+
+impl rusqlite::types::FromSql for StudyDay {
+    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        let text = value.as_str()?;
+        text.parse()
+            .map_err(|err: ClockError| rusqlite::types::FromSqlError::Other(Box::new(err)))
+    }
+}
+
+impl serde::Serialize for StudyDay {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
     }
 }
 
@@ -221,6 +264,55 @@ mod tests {
             StudyDay::of(ts("2025-12-31T23:59:59Z"), &rule),
             day("2025-12-31")
         );
+    }
+
+    #[test]
+    fn r54_rollover_on_the_spring_daylight_saving_change() {
+        // 2026-03-29: clocks jump 02:00 CET -> 03:00 CEST. 04:00 CEST = 02:00Z.
+        let rule = prague();
+        assert_eq!(
+            StudyDay::of(ts("2026-03-29T01:59:59Z"), &rule),
+            day("2026-03-28")
+        );
+        assert_eq!(
+            StudyDay::of(ts("2026-03-29T02:00:00Z"), &rule),
+            day("2026-03-29")
+        );
+        // The previous evening is still CET: 04:00 CET = 03:00Z.
+        assert_eq!(
+            StudyDay::of(ts("2026-03-28T02:59:59Z"), &rule),
+            day("2026-03-27")
+        );
+    }
+
+    #[test]
+    fn r54_rollover_on_the_autumn_daylight_saving_change() {
+        // 2026-10-25: clocks fall back 03:00 CEST -> 02:00 CET. 04:00 CET = 03:00Z.
+        let rule = prague();
+        assert_eq!(
+            StudyDay::of(ts("2026-10-25T02:59:59Z"), &rule),
+            day("2026-10-24")
+        );
+        assert_eq!(
+            StudyDay::of(ts("2026-10-25T03:00:00Z"), &rule),
+            day("2026-10-25")
+        );
+        // Both 02:xx local hours (CEST and then CET) are still the 24th.
+        assert_eq!(
+            StudyDay::of(ts("2026-10-25T00:30:00Z"), &rule),
+            day("2026-10-24")
+        );
+        assert_eq!(
+            StudyDay::of(ts("2026-10-25T01:30:00Z"), &rule),
+            day("2026-10-24")
+        );
+    }
+
+    #[test]
+    fn r54_moment_carries_its_study_day() {
+        let moment = Moment::of(ts("2026-11-17T02:30:00Z"), &prague());
+        assert_eq!(moment.day, day("2026-11-16"));
+        assert_eq!(moment.stamp(), "2026-11-17T02:30:00Z");
     }
 
     #[test]

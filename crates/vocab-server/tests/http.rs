@@ -20,7 +20,7 @@ struct TestApp {
 fn app() -> TestApp {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = Db::open(dir.path()).expect("db");
-    let router = http::app(AppState::new(db), &Limits::default());
+    let router = http::app(AppState::new(db, prague()), &Limits::default());
     TestApp { _dir: dir, router }
 }
 
@@ -207,7 +207,7 @@ mod served {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("addr");
             let (stop, stopped) = oneshot::channel::<()>();
-            let app = http::app(AppState::new(db), &limits);
+            let app = http::app(AppState::new(db, super::prague()), &limits);
             let task = tokio::spawn(async move {
                 http::serve(listener, app, &limits, async {
                     let _ = stopped.await;
@@ -339,4 +339,8 @@ mod served {
         );
         server.stop().await;
     }
+}
+
+fn prague() -> vocab_server::clock::DayRule {
+    vocab_server::clock::DayRule::new("Europe/Prague", 4).expect("bundled tzdb")
 }

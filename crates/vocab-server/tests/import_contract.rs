@@ -32,7 +32,7 @@ fn app() -> TestApp {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = Db::open(dir.path()).expect("db");
     let clock = Arc::new(ManualClock::new(ts("2026-11-20T09:00:00Z")));
-    let state = AppState::with_clock(db, Arc::clone(&clock) as Arc<dyn Clock>);
+    let state = AppState::with_clock(db, Arc::clone(&clock) as Arc<dyn Clock>, prague());
     let router = http::app(state, &Limits::default());
     TestApp { dir, clock, router }
 }
@@ -1500,4 +1500,8 @@ async fn r24_reports_of_invalid_sentences_do_not_quote_them_and_nothing_stored_h
     assert!(!report_json.contains(secret), "{report_json}");
     // The sentence itself is, of course, in the owner's catalog.
     assert_eq!(app.int("SELECT COUNT(*) FROM sentence"), 1);
+}
+
+fn prague() -> vocab_server::clock::DayRule {
+    vocab_server::clock::DayRule::new("Europe/Prague", 4).expect("bundled tzdb")
 }

@@ -31,7 +31,7 @@ fn app() -> TestApp {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = Db::open(dir.path()).expect("db");
     let clock = Arc::new(ManualClock::new(ts("2026-11-20T09:00:00Z")));
-    let state = AppState::with_clock(db, Arc::clone(&clock) as Arc<dyn Clock>);
+    let state = AppState::with_clock(db, Arc::clone(&clock) as Arc<dyn Clock>, prague());
     let router = http::app(state, &Limits::default());
     TestApp { dir, clock, router }
 }
@@ -725,26 +725,29 @@ async fn r22_update_the_sentences_reexport_merges_and_keeps_learning_state() {
     .await;
     let hum_id = app.word_id("hum").await;
 
-    // Learning state that a merge must never touch (owned by the scheduler
-    // from M3; seeded directly here).
+    // Learning state that a merge must never touch (the import created
+    // the Understand card; its state is seeded directly here).
     let conn = app.sql();
-    conn.execute(
-        "INSERT INTO card (word_id, kind, state, stability, difficulty, due_day, reps, lapses, created_at) \
-         VALUES (?1, 'understand', 'review', 12.5, 5.1, '2026-12-01', 4, 1, '2026-11-17T10:00:00Z')",
-        [hum_id],
-    )
-    .expect("card");
+    let changed = conn
+        .execute(
+            "UPDATE card SET state = 'review', stability = 12.5, difficulty = 5.1, \
+             due_day = '2026-12-01', reps = 4, lapses = 1 WHERE word_id = ?1 AND kind = 'understand'",
+            [hum_id],
+        )
+        .expect("card");
+    assert_eq!(changed, 1, "import creates the Understand card");
     conn.execute(
         "INSERT INTO review_log (client_review_id, card_id, reviewed_at, review_day, raw_grade, fsrs_rating, \
-         format, elapsed_days, before_json) VALUES ('test-review-1', 1, '2026-11-18T08:00:00Z', '2026-11-18', \
-         2, 3, 'sentence', 1, '{}')",
-        [],
+         format, elapsed_days, before_json) SELECT 'test-review-1', id, '2026-11-18T08:00:00Z', '2026-11-18', \
+         2, 3, 'sentence', 1, '{}' FROM card WHERE word_id = ?1 AND kind = 'understand'",
+        [hum_id],
     )
     .expect("review");
     let learning = |app: &TestApp| {
         app.sql()
             .query_row(
-                "SELECT state, stability, difficulty, due_day, reps, lapses FROM card WHERE word_id = ?1",
+                "SELECT state, stability, difficulty, due_day, reps, lapses FROM card \
+                 WHERE word_id = ?1 AND kind = 'understand'",
                 [hum_id],
                 |r| {
                     Ok(format!(
@@ -1700,7 +1703,7 @@ async fn r11_a_timed_out_commit_still_imports_every_pack() {
         import_commit_timeout_secs: 1,
         ..Limits::default()
     };
-    let router = http::app(AppState::new(db.clone()), &limits);
+    let router = http::app(AppState::new(db.clone(), prague()), &limits);
     let blocker = {
         let db = db.clone();
         tokio::spawn(async move {
@@ -2041,4 +2044,8 @@ async fn r02_a_source_without_title_gets_a_default_title() {
             .as_deref(),
         Some("test-untitled")
     );
+}
+
+fn prague() -> vocab_server::clock::DayRule {
+    vocab_server::clock::DayRule::new("Europe/Prague", 4).expect("bundled tzdb")
 }

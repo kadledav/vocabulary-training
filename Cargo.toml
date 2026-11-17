@@ -18,6 +18,11 @@ publish = false
 [workspace.dependencies]
 # `query`: query-string parameters of the read endpoints (design §8).
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "json", "matched-path", "query"] }
+# FSRS-6 scheduler (design §6.1). Default features off: the optimiser is
+# part of the default build already; `experimental_cost_adr` is not used.
+fsrs = { version = "=6.6.2", default-features = false }
+# Random practice-session ids (design §4.2 `practice_session.id`).
+getrandom = "=0.4.3"
 hex = "=0.4.3"
 # Reading request bodies frame by frame (import body limit with draining).
 http-body-util = "=0.1.5"

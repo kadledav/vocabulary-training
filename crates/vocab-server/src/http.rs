@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::extract::rejection::{PathRejection, QueryRejection};
+use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, MatchedPath, Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
@@ -38,11 +38,15 @@ use serde::Deserialize;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 
-use crate::catalog::{self, WordId, WordQuery};
-use crate::clock::{Clock, SystemClock};
+use crate::catalog::{self, SourceId, WordId, WordQuery};
+use crate::clock::{Clock, DayRule, Moment, SystemClock};
 use crate::config::Limits;
 use crate::db::{Db, DbError};
 use crate::importer::Via;
+use crate::scheduler::{AnswerMatch, RawGrade};
+use crate::session::{self, RateInput, SessionError, SessionId, StartKind, StartRequest};
+use crate::settings::{self, SettingsError, SettingsPatch};
+use crate::stats::{self, StatsError};
 use crate::web_assets;
 use crate::workflows::{self, WorkflowError};
 
@@ -89,22 +93,30 @@ const RECENT_IMPORTS: u32 = 20;
 pub struct AppState {
     db: Db,
     clock: Arc<dyn Clock>,
+    /// Where study days begin (config `timezone`, `day_rollover_hour`).
+    day_rule: DayRule,
     /// Body limit of the import routes (set by [`app`] from the limits).
     import_body_bytes: usize,
 }
 
 impl AppState {
-    pub fn new(db: Db) -> Self {
-        Self::with_clock(db, Arc::new(SystemClock))
+    pub fn new(db: Db, day_rule: DayRule) -> Self {
+        Self::with_clock(db, Arc::new(SystemClock), day_rule)
     }
 
     /// With a controllable clock (tests).
-    pub fn with_clock(db: Db, clock: Arc<dyn Clock>) -> Self {
+    pub fn with_clock(db: Db, clock: Arc<dyn Clock>, day_rule: DayRule) -> Self {
         Self {
             db,
             clock,
+            day_rule,
             import_body_bytes: Limits::default().import_body_bytes,
         }
+    }
+
+    /// Now, with its study day.
+    fn moment(&self) -> Moment {
+        Moment::of(self.clock.now(), &self.day_rule)
     }
 }
 
@@ -124,6 +136,13 @@ pub fn app(state: AppState, limits: &Limits) -> Router {
         .route("/api/sources", get(list_sources))
         .route("/api/words", get(list_words))
         .route("/api/words/{id}", get(show_word))
+        .route("/api/today", get(today))
+        .route("/api/sessions", post(start_session))
+        .route("/api/sessions/current", get(current_session))
+        .route("/api/sessions/{id}/reviews", post(rate_item))
+        .route("/api/sessions/{id}/undo", post(undo_rating))
+        .route("/api/sessions/{id}/finish", post(finish_session))
+        .route("/api/settings", get(get_settings).patch(patch_settings))
         .with_state(state.clone())
         .merge(web_assets::router());
     let preview = Router::new()
@@ -307,7 +326,7 @@ async fn import_preview(State(state): State<AppState>, headers: HeaderMap, body:
         Ok(request) => request,
         Err(response) => return *response,
     };
-    match workflows::preview_import(&state.db, &request.text, state.clock.now()).await {
+    match workflows::preview_import(&state.db, &request.text, state.moment()).await {
         Ok(report) => Json(report).into_response(),
         Err(err) => workflow_error(&err),
     }
@@ -318,7 +337,7 @@ async fn import_commit(State(state): State<AppState>, headers: HeaderMap, body: 
         Ok(request) => request,
         Err(response) => return *response,
     };
-    match workflows::commit_import(&state.db, &request.text, Via::Paste, state.clock.now()).await {
+    match workflows::commit_import(&state.db, &request.text, Via::Paste, state.moment()).await {
         Ok(report) => Json(report).into_response(),
         Err(err) => workflow_error(&err),
     }
@@ -342,9 +361,22 @@ async fn list_sources(State(state): State<AppState>) -> Response {
     }
 }
 
+/// An optional numeric query parameter: absent or empty (`?scope=`) means
+/// "not given"; anything else must be an integer (G7).
+fn optional_number<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<i64>, D::Error> {
+    let text: Option<String> = Option::deserialize(deserializer)?;
+    match text.as_deref().map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(number) => number.parse().map(Some).map_err(serde::de::Error::custom),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct WordsParams {
     q: Option<String>,
+    #[serde(default, deserialize_with = "optional_number")]
     source: Option<i64>,
 }
 
@@ -389,6 +421,268 @@ async fn show_word(
         Ok(None) => not_found().await,
         Err(err) => internal_error(&err),
     }
+}
+
+// ── practice API (design §8) ───────────────────────────────────────────────
+
+/// Errors of the practice and settings endpoints.
+#[derive(Debug, thiserror::Error)]
+enum ApiError {
+    #[error(transparent)]
+    Db(#[from] DbError),
+    #[error(transparent)]
+    Session(#[from] SessionError),
+    #[error(transparent)]
+    Settings(#[from] SettingsError),
+    #[error(transparent)]
+    Stats(#[from] StatsError),
+}
+
+impl From<rusqlite::Error> for ApiError {
+    fn from(err: rusqlite::Error) -> Self {
+        Self::Db(DbError::from(err))
+    }
+}
+
+fn bad_request(message: &str) -> Response {
+    error_response(StatusCode::BAD_REQUEST, "bad_request", message)
+}
+
+fn api_error(err: &ApiError) -> Response {
+    let conflict = |code: &str| error_response(StatusCode::CONFLICT, code, &err.to_string());
+    match err {
+        ApiError::Session(e) => match e {
+            SessionError::NotFound | SessionError::ItemNotFound => {
+                error_response(StatusCode::NOT_FOUND, "not_found", &e.to_string())
+            }
+            SessionError::UnknownSource => error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "unknown_source",
+                &e.to_string(),
+            ),
+            SessionError::Invalid(message) => {
+                error_response(StatusCode::UNPROCESSABLE_ENTITY, "invalid", message)
+            }
+            SessionError::Expired => conflict("session_expired"),
+            SessionError::NotActive(_) => conflict("session_finished"),
+            SessionError::AlreadyAnswered => conflict("already_answered"),
+            SessionError::NotNextItem => conflict("not_next_item"),
+            SessionError::ReviewIdReused => conflict("review_id_reused"),
+            SessionError::ReviewUndone => conflict("review_undone"),
+            SessionError::NothingToUndo => conflict("nothing_to_undo"),
+            SessionError::Random(_) | SessionError::Scheduler(_) | SessionError::Sqlite(_) => {
+                internal_error(err)
+            }
+        },
+        ApiError::Settings(SettingsError::Invalid(message)) => {
+            error_response(StatusCode::UNPROCESSABLE_ENTITY, "invalid", message)
+        }
+        ApiError::Stats(StatsError::UnknownSource) => error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unknown_source",
+            &err.to_string(),
+        ),
+        ApiError::Db(_) | ApiError::Settings(_) | ApiError::Stats(_) => internal_error(err),
+    }
+}
+
+fn respond<T: serde::Serialize>(result: Result<T, ApiError>) -> Response {
+    match result {
+        Ok(value) => Json(value).into_response(),
+        Err(err) => api_error(&err),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TodayParams {
+    #[serde(default, deserialize_with = "optional_number")]
+    scope: Option<i64>,
+}
+
+async fn today(
+    State(state): State<AppState>,
+    params: Result<Query<TodayParams>, QueryRejection>,
+) -> Response {
+    let Ok(Query(params)) = params else {
+        return bad_request("Invalid query parameters.");
+    };
+    let day = state.moment().day;
+    let scope = params.scope.map(SourceId::new);
+    respond(
+        state
+            .db
+            .read(move |conn| Ok::<_, ApiError>(stats::today(conn, day, scope)?))
+            .await,
+    )
+}
+
+/// Body of `POST /api/sessions`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StartBody {
+    scope_source_id: Option<i64>,
+    kind: StartKind,
+    #[serde(default)]
+    add_new_anyway: bool,
+}
+
+async fn start_session(
+    State(state): State<AppState>,
+    body: Result<Json<StartBody>, JsonRejection>,
+) -> Response {
+    let Ok(Json(body)) = body else {
+        return bad_request(
+            "The body must be JSON {\"kind\": \"start\"|\"continue\", \"scope_source_id\"?, \"add_new_anyway\"?}.",
+        );
+    };
+    let request = StartRequest {
+        scope: body.scope_source_id.map(SourceId::new),
+        kind: body.kind,
+        add_new_anyway: body.add_new_anyway,
+    };
+    let now = state.moment();
+    respond(
+        state
+            .db
+            .write(move |tx| Ok::<_, ApiError>(session::start_block(tx, &now, &request)?))
+            .await,
+    )
+}
+
+async fn current_session(State(state): State<AppState>) -> Response {
+    let day = state.moment().day;
+    match state
+        .db
+        .read(move |conn| Ok::<_, ApiError>(session::current(conn, day)?))
+        .await
+    {
+        Ok(Some(view)) => Json(view).into_response(),
+        Ok(None) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => api_error(&err),
+    }
+}
+
+/// Body of `POST /api/sessions/{id}/reviews` (design §8).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewBody {
+    client_review_id: String,
+    item_id: i64,
+    raw_grade: u8,
+    suggested_grade: Option<u8>,
+    typed_answer: Option<String>,
+    answer_match: Option<AnswerMatch>,
+    #[serde(default)]
+    hint_used: bool,
+    duration_ms: Option<u32>,
+    client_ts: Option<String>,
+}
+
+impl ReviewBody {
+    fn into_input(self) -> Result<RateInput, &'static str> {
+        let raw_grade = RawGrade::new(self.raw_grade).ok_or("raw_grade must be 1-5")?;
+        let suggested_grade = match self.suggested_grade {
+            Some(g) => Some(RawGrade::new(g).ok_or("suggested_grade must be 1-5")?),
+            None => None,
+        };
+        Ok(RateInput {
+            client_review_id: self.client_review_id,
+            item_id: self.item_id,
+            raw_grade,
+            suggested_grade,
+            typed_answer: self.typed_answer,
+            answer_match: self.answer_match,
+            hint_used: self.hint_used,
+            duration_ms: self.duration_ms,
+            client_ts: self.client_ts,
+        })
+    }
+}
+
+fn session_id(id: Result<Path<String>, PathRejection>) -> Option<SessionId> {
+    id.ok().and_then(|Path(id)| SessionId::parse(&id))
+}
+
+async fn rate_item(
+    State(state): State<AppState>,
+    id: Result<Path<String>, PathRejection>,
+    body: Result<Json<ReviewBody>, JsonRejection>,
+) -> Response {
+    let Some(id) = session_id(id) else {
+        return not_found().await;
+    };
+    let Ok(Json(body)) = body else {
+        return bad_request("The body must be a JSON review object (design §8).");
+    };
+    let input = match body.into_input() {
+        Ok(input) => input,
+        Err(message) => {
+            return error_response(StatusCode::UNPROCESSABLE_ENTITY, "invalid", message);
+        }
+    };
+    let now = state.moment();
+    respond(
+        state
+            .db
+            .write(move |tx| Ok::<_, ApiError>(session::rate(tx, &id, &input, &now)?))
+            .await,
+    )
+}
+
+async fn undo_rating(
+    State(state): State<AppState>,
+    id: Result<Path<String>, PathRejection>,
+) -> Response {
+    let Some(id) = session_id(id) else {
+        return not_found().await;
+    };
+    let now = state.moment();
+    respond(
+        state
+            .db
+            .write(move |tx| Ok::<_, ApiError>(session::undo_last(tx, &id, &now)?))
+            .await,
+    )
+}
+
+async fn finish_session(
+    State(state): State<AppState>,
+    id: Result<Path<String>, PathRejection>,
+) -> Response {
+    let Some(id) = session_id(id) else {
+        return not_found().await;
+    };
+    let now = state.moment();
+    respond(
+        state
+            .db
+            .write(move |tx| Ok::<_, ApiError>(session::finish(tx, &id, &now)?))
+            .await,
+    )
+}
+
+async fn get_settings(State(state): State<AppState>) -> Response {
+    respond(
+        state
+            .db
+            .read(|conn| Ok::<_, ApiError>(settings::get(conn)?))
+            .await,
+    )
+}
+
+async fn patch_settings(
+    State(state): State<AppState>,
+    body: Result<Json<SettingsPatch>, JsonRejection>,
+) -> Response {
+    let Ok(Json(patch)) = body else {
+        return bad_request("The body must be a JSON object of known settings.");
+    };
+    respond(
+        state
+            .db
+            .write(move |tx| Ok::<_, ApiError>(settings::update(tx, &patch)?))
+            .await,
+    )
 }
 
 // ── middleware ──────────────────────────────────────────────────────────────

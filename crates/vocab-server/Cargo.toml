@@ -16,6 +16,8 @@ path = "src/main.rs"
 
 [dependencies]
 axum.workspace = true
+fsrs.workspace = true
+getrandom.workspace = true
 hex.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true

@@ -28,6 +28,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0002_word_spelling_nullable",
         include_str!("../migrations/0002_word_spelling_nullable.sql"),
     ),
+    (
+        "0003_session_item_format",
+        include_str!("../migrations/0003_session_item_format.sql"),
+    ),
 ];
 
 #[derive(Debug, thiserror::Error)]

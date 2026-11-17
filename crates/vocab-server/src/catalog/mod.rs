@@ -1,6 +1,10 @@
 //! Vocabulary: sources, words, list items, forms, sentences, owner
 //! overrides and pack conflicts (design §3.2, §4.2, §5.4).
 //!
+//! Practice reads ([`traits`], [`practice_words`], [`presentation`]) give
+//! the scheduler and the session builder what they need without touching
+//! catalog tables (design §3.2).
+//!
 //! Owned tables: `source`, `word`, `word_source`, `word_item`, `word_form`,
 //! `sentence`, `word_override`, `field_conflict`. All SQL touching them is in
 //! this module (R-92). Other modules use the functions re-exported here.
@@ -10,31 +14,40 @@
 //! transaction that is always rolled back (`workflows`).
 
 mod merge;
+mod practice;
 mod read;
 mod source;
 
 use serde::Serialize;
 
 pub use merge::{ConflictReport, ImportLink, ItemsAdded, MergeOutcome, WordMerge, merge_word};
+pub use practice::{
+    PracticeWord, WordTraits, all_traits, practice_words, source_exists, traits, word_traits,
+};
 pub use read::{
-    ConflictView, FormView, SentenceView, SourceLinkView, SourceSummary, TextParts, WordQuery,
-    WordRow, WordView, sources, word_view, words,
+    ConflictView, FormView, PresentedForm, PresentedSentence, PresentedTag, SentenceView,
+    SourceLinkView, SourceSummary, TextParts, WordPresentation, WordQuery, WordRow, WordView,
+    presentation, sources, word_view, words,
 };
 pub use source::{ReadingUpdate, SourceUpsert, source_titles, upsert_source};
 
 /// Id of a `source` row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct SourceId(i64);
 
 impl SourceId {
+    pub fn new(id: i64) -> Self {
+        Self(id)
+    }
+
     pub fn get(self) -> i64 {
         self.0
     }
 }
 
 /// Id of a `word` row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct WordId(i64);
 

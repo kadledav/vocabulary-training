@@ -9,9 +9,11 @@
 use std::process::ExitCode;
 use std::time::Duration;
 
+use vocab_server::clock::{Moment, Timestamp};
 use vocab_server::config::Config;
 use vocab_server::db::Db;
 use vocab_server::http::{self, AppState};
+use vocab_server::workflows;
 
 const USAGE: &str = "usage: vocab-server [serve | healthcheck | check]
 
@@ -137,7 +139,17 @@ async fn run_server(config: Config, db: Db) -> std::io::Result<()> {
         time_zone = config.day_rule.time_zone_name().unwrap_or("?"),
         "serving"
     );
-    let app = http::app(AppState::new(db), &config.limits);
+    let now = Moment::of(Timestamp::now(), &config.day_rule);
+    match workflows::ensure_all_cards(&db, now).await {
+        Ok(0) => {}
+        Ok(created) => tracing::info!(created, "created missing cards"),
+        Err(err) => {
+            return Err(std::io::Error::other(format!(
+                "card backfill failed: {err}"
+            )));
+        }
+    }
+    let app = http::app(AppState::new(db, config.day_rule.clone()), &config.limits);
     http::serve(listener, app, &config.limits, shutdown_signal()).await
 }
 

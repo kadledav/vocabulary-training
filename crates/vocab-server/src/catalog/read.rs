@@ -334,3 +334,157 @@ pub fn word_view(conn: &Connection, id: WordId) -> rusqlite::Result<Option<WordV
         .collect::<Result<_, _>>()?;
     Ok(Some(view))
 }
+
+// ── practice view (design §8 item payload) ─────────────────────────────────
+
+/// A visible sentence as practice shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PresentedSentence {
+    pub id: i64,
+    pub en: TextParts,
+    pub cs: TextParts,
+    pub origin: String,
+    pub location: Option<String>,
+    /// The pack source the sentence arrived with (scoped blocks prefer
+    /// their source's sentences, R-59).
+    pub source_id: Option<SourceId>,
+    pub source_title: Option<String>,
+    /// Order within the word (lowest first on ties, design §6.7 step 6).
+    #[serde(skip)]
+    pub position: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PresentedForm {
+    pub form: String,
+    pub common: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PresentedTag {
+    pub kind: String,
+    pub text: Option<String>,
+}
+
+/// Everything a practice item shows about its word (design §8 item payload).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WordPresentation {
+    pub id: WordId,
+    pub headword: String,
+    pub pronunciation: Option<String>,
+    pub grammar: Option<String>,
+    pub czech: Vec<String>,
+    pub meaning: String,
+    pub forms: Vec<PresentedForm>,
+    pub note: String,
+    pub hint: Option<String>,
+    pub icon: Option<String>,
+    pub spelling_note: Option<String>,
+    pub confusables: Vec<String>,
+    /// Tag of the most recently imported source link, if any.
+    pub tag: Option<PresentedTag>,
+    /// Pack `accepted` answers (Produce, design §6.8).
+    #[serde(skip)]
+    pub accepted: Vec<String>,
+    /// Owner-accepted answers (Produce, design §6.8).
+    #[serde(skip)]
+    pub owner_accepted: Vec<String>,
+    /// Visible sentences in order.
+    #[serde(skip)]
+    pub sentences: Vec<PresentedSentence>,
+}
+
+/// The practice view of one word (`None` if it does not exist).
+pub fn presentation(conn: &Connection, id: WordId) -> rusqlite::Result<Option<WordPresentation>> {
+    let base = conn
+        .query_row(
+            "SELECT headword, pronunciation, grammar, meaning, note, hint, icon, spelling, spelling_note \
+             FROM word WHERE id = ?1",
+            [id.0],
+            |row| {
+                let spelling = row.get::<_, Option<bool>>(7)?.unwrap_or(false);
+                Ok(WordPresentation {
+                    id,
+                    headword: row.get(0)?,
+                    pronunciation: row.get(1)?,
+                    grammar: row.get(2)?,
+                    meaning: row.get(3)?,
+                    note: row.get(4)?,
+                    hint: row.get(5)?,
+                    icon: row.get(6)?,
+                    spelling_note: if spelling { row.get(8)? } else { None },
+                    czech: Vec::new(),
+                    forms: Vec::new(),
+                    confusables: Vec::new(),
+                    tag: None,
+                    accepted: Vec::new(),
+                    owner_accepted: Vec::new(),
+                    sentences: Vec::new(),
+                })
+            },
+        )
+        .optional()?;
+    let Some(mut view) = base else {
+        return Ok(None);
+    };
+    let mut items = conn.prepare(
+        "SELECT value FROM word_item WHERE word_id = ?1 AND kind = ?2 AND removed = 0 ORDER BY position",
+    )?;
+    let mut list = |kind: &str| -> rusqlite::Result<Vec<String>> {
+        items
+            .query_map(params![id.0, kind], |row| row.get(0))?
+            .collect()
+    };
+    view.czech = list("czech")?;
+    view.confusables = list("confusable")?;
+    view.accepted = list("accepted")?;
+    view.owner_accepted = list("owner_accepted")?;
+
+    let mut stmt =
+        conn.prepare("SELECT form, common FROM word_form WHERE word_id = ?1 ORDER BY position")?;
+    view.forms = stmt
+        .query_map([id.0], |row| {
+            Ok(PresentedForm {
+                form: row.get(0)?,
+                common: row.get(1)?,
+            })
+        })?
+        .collect::<Result<_, _>>()?;
+
+    view.tag = conn
+        .query_row(
+            "SELECT tag_kind, tag_text FROM word_source WHERE word_id = ?1 AND tag_kind IS NOT NULL \
+             ORDER BY last_pack_import_id DESC, source_id DESC LIMIT 1",
+            [id.0],
+            |row| {
+                Ok(PresentedTag {
+                    kind: row.get(0)?,
+                    text: row.get(1)?,
+                })
+            },
+        )
+        .optional()?;
+
+    let mut stmt = conn.prepare(
+        "SELECT se.id, se.en_marked, se.cs_marked, se.origin, se.location, s.title, se.position, se.source_id \
+         FROM sentence se LEFT JOIN source s ON s.id = se.source_id \
+         WHERE se.word_id = ?1 AND se.hidden = 0 ORDER BY se.position, se.id",
+    )?;
+    view.sentences = stmt
+        .query_map([id.0], |row| {
+            let en: String = row.get(1)?;
+            let cs: String = row.get(2)?;
+            Ok(PresentedSentence {
+                id: row.get(0)?,
+                en: TextParts::of(&en),
+                cs: TextParts::of(&cs),
+                origin: row.get(3)?,
+                location: row.get(4)?,
+                source_title: row.get(5)?,
+                position: row.get(6)?,
+                source_id: row.get::<_, Option<i64>>(7)?.map(SourceId),
+            })
+        })?
+        .collect::<Result<_, _>>()?;
+    Ok(Some(view))
+}

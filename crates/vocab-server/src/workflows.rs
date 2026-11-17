@@ -14,18 +14,24 @@
 //! The preview runs exactly the same per-pack code in one transaction that
 //! is always rolled back, so it reports what the commit will do (including
 //! several packs of one paste touching the same word) and stores nothing.
+//!
+//! Every merged word gets its cards in the same transaction
+//! (`scheduler::ensure_cards`, design §5.1 step 4); [`ensure_all_cards`]
+//! does the same for every stored word at startup, so databases imported
+//! before cards existed are backfilled.
 
 use rusqlite::Transaction;
 use vocab_pack::paste::PasteError;
 use vocab_pack::types::WordResult;
 
 use crate::catalog::{self, ImportLink, ReadingUpdate};
-use crate::clock::{Timestamp, format_timestamp, utc_date};
+use crate::clock::{Moment, utc_date};
 use crate::db::{Db, DbError};
 use crate::importer::{
     self, ImportLogRow, ImportReport, Mode, PACK_ID_REUSED, PackReport, PackStatus, PreparedPack,
     Via,
 };
+use crate::scheduler;
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorkflowError {
@@ -45,6 +51,8 @@ pub enum WorkflowError {
 #[derive(Debug, Clone)]
 struct ImportContext {
     via: Via,
+    /// When the import happens (card creation uses its study day).
+    moment: Moment,
     /// RFC 3339 timestamp of the import.
     now: String,
     /// Import date; stands in for a missing `exported_at`.
@@ -52,11 +60,12 @@ struct ImportContext {
 }
 
 impl ImportContext {
-    fn new(via: Via, now: Timestamp) -> Self {
+    fn new(via: Via, moment: Moment) -> Self {
         Self {
             via,
-            now: format_timestamp(now),
-            today: utc_date(now),
+            moment,
+            now: moment.stamp(),
+            today: utc_date(moment.at),
         }
     }
 }
@@ -66,7 +75,7 @@ impl ImportContext {
 pub async fn preview_import(
     db: &Db,
     text: &str,
-    now: Timestamp,
+    now: Moment,
 ) -> Result<ImportReport, WorkflowError> {
     let packs = importer::prepare(text)?;
     let ctx = ImportContext::new(Via::Paste, now);
@@ -93,7 +102,7 @@ pub async fn commit_import(
     db: &Db,
     text: &str,
     via: Via,
-    now: Timestamp,
+    now: Moment,
 ) -> Result<ImportReport, WorkflowError> {
     let packs = importer::prepare(text)?;
     let db = db.clone();
@@ -173,8 +182,13 @@ fn import_pack(
     for word in &validation.words {
         if let WordResult::Valid(word) = word {
             let merge = catalog::merge_word(tx, &link, word)?;
-            // M3 adds `scheduler::ensure_cards` and M6 `audio::request` for
-            // the merged word here, in the same transaction (design §5.1 step 4).
+            // Cards for the merged word, in the same transaction (design
+            // §5.1 step 4); M6 adds `audio::request` here.
+            if let Some(id) = merge.word_id
+                && let Some(traits) = catalog::word_traits(tx, id)?
+            {
+                scheduler::ensure_cards(tx, &traits, &ctx.moment)?;
+            }
             report.record_merge(word.index, merge, None);
         }
     }
@@ -204,6 +218,20 @@ pub async fn recent_imports(db: &Db, limit: u32) -> Result<Vec<ImportLogRow>, Wo
             row.source_title = titles.get(&row.source_slug).cloned();
         }
         Ok(rows)
+    })
+    .await
+}
+
+/// Make every stored word's cards match its traits (idempotent; design
+/// §6.4). Run at startup: creates the Understand card of words imported
+/// before cards existed. Returns how many cards were created.
+pub async fn ensure_all_cards(db: &Db, now: Moment) -> Result<usize, WorkflowError> {
+    db.write(move |tx| {
+        let mut created = 0;
+        for traits in catalog::all_traits(tx)? {
+            created += scheduler::ensure_cards(tx, &traits, &now)?.len();
+        }
+        Ok::<_, WorkflowError>(created)
     })
     .await
 }

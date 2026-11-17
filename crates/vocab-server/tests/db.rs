@@ -67,7 +67,7 @@ fn r85_empty_database_migrates_to_v1_with_foreign_keys_and_integrity_ok() {
     let version: u32 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("user_version");
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
 
     let mut stmt = conn
         .prepare("SELECT name, strict FROM pragma_table_list WHERE schema = 'main' AND name NOT LIKE 'sqlite_%' ORDER BY name")
@@ -246,7 +246,7 @@ fn r85_reopening_is_idempotent() {
     let version: u32 = inspect(&data)
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("user_version");
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
 }
 
 #[test]
@@ -259,7 +259,7 @@ fn r85_newer_schema_is_refused() {
     match Db::open(&data) {
         Err(DbError::SchemaTooNew {
             found: 99,
-            known: 2,
+            known: 3,
         }) => {}
         other => panic!("expected SchemaTooNew, got {other:?}"),
     }
@@ -310,8 +310,8 @@ fn r85_writes_inside_a_read_fail_loudly() {
     .expect("write after read");
 }
 
-/// Migration 0002 on a database at version 1 holding the synthetic fixture:
-/// data kept, `word.spelling` nullable, constraints intact.
+/// Migrations 0002 and 0003 on a database at version 1 holding the synthetic
+/// fixture: data kept, `word.spelling` nullable, constraints intact.
 #[test]
 fn r85_v1_database_with_data_migrates_to_v2() {
     let (_root, data) = data_dir();
@@ -331,7 +331,7 @@ fn r85_v1_database_with_data_migrates_to_v2() {
     let version: u32 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("user_version");
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     let (headword, spelling): (String, Option<i64>) = conn
         .query_row(
             "SELECT headword, spelling FROM word WHERE id = 1",
@@ -357,6 +357,50 @@ fn r85_v1_database_with_data_migrates_to_v2() {
         conn.execute("UPDATE word SET spelling = 2 WHERE id = 1", [])
             .is_err(),
         "CHECK kept"
+    );
+    assert!(pragma_rows(&conn, "foreign_key_check").is_empty());
+    assert_eq!(pragma_rows(&conn, "integrity_check"), vec!["Text(\"ok\")"]);
+}
+
+/// Migration 0003 on a database at version 2 holding the synthetic fixture:
+/// practice items kept with `format` NULL, the new column's CHECK enforced.
+#[test]
+fn r85_v2_database_with_data_migrates_to_v3() {
+    let (_root, data) = data_dir();
+    {
+        let conn = Connection::open(data.join(DB_FILE)).expect("create");
+        conn.pragma_update(None, "foreign_keys", "ON").expect("fk");
+        conn.execute_batch(include_str!("../migrations/0001_initial.sql"))
+            .expect("v1 schema");
+        conn.execute_batch(FIXTURE).expect("fixture");
+        conn.execute_batch(include_str!(
+            "../migrations/0002_word_spelling_nullable.sql"
+        ))
+        .expect("v2 schema");
+        conn.pragma_update(None, "user_version", 2)
+            .expect("version");
+    }
+    drop(Db::open(&data).expect("migrates"));
+    let conn = inspect(&data);
+    let version: u32 = conn
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .expect("user_version");
+    assert_eq!(version, 3);
+    let (items, with_format): (i64, i64) = conn
+        .query_row(
+            "SELECT count(*), count(format) FROM session_item",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("items");
+    assert!(items >= 1);
+    assert_eq!(with_format, 0, "existing items have no stored format");
+    conn.execute("UPDATE session_item SET format = 'word_only'", [])
+        .expect("valid format");
+    assert!(
+        conn.execute("UPDATE session_item SET format = 'bogus'", [])
+            .is_err(),
+        "CHECK enforced"
     );
     assert!(pragma_rows(&conn, "foreign_key_check").is_empty());
     assert_eq!(pragma_rows(&conn, "integrity_check"), vec!["Text(\"ok\")"]);

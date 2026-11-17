@@ -31,6 +31,13 @@ allow = [
     "Zlib",
 ]
 confidence-threshold = 0.93
+# `priority-queue` (pulled in by `fsrs`, design §16.1) is dual-licensed
+# "LGPL-3.0-or-later OR MPL-2.0"; we take MPL-2.0. MPL is file-level
+# copyleft: it covers only that crate's own (public, unmodified) sources, not
+# the rest of the binary. Scoped to this one crate.
+exceptions = [
+    { allow = ["MPL-2.0"], crate = "priority-queue" },
+]
 
 [licenses.private]
 # The workspace crates themselves are MIT (see LICENSE) and never published.
