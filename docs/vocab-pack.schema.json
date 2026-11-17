@@ -1,0 +1,201 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/kadledav/vocabulary-training/docs/vocab-pack.schema.json",
+  "title": "Vocabulary pack, format_version 1",
+  "description": "Exchange format produced by Claude (see docs/claude-project-instructions.txt) and imported by the vocabulary training app. The app's importer (crate vocab-pack) is the authoritative validator; this schema states the same contract. Rules a JSON Schema cannot express, and how errors are scoped (pack / word / sentence), are listed in docs/design/architecture.md, section 'Import'. A pack valid against this schema is accepted in full by the importer, except for the few rules a schema cannot express (a headword repeated within one pack, control characters in text, a Czech translation without any letter; see architecture.md section 5.2). The importer is deliberately more lenient in one respect only: unknown properties are reported as warnings and ignored instead of rejecting the word.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format", "format_version", "pack_id", "source", "words"],
+  "properties": {
+    "format": {
+      "const": "vocab-pack"
+    },
+    "format_version": {
+      "description": "Version of the format itself. The app rejects versions it does not know.",
+      "const": 1
+    },
+    "pack_id": {
+      "description": "<source.id>--<YYYY-MM-DD>--<n>. Idempotency key together with the pack's content hash. The importer warns (does not reject) when the prefix differs from source.id.",
+      "type": "string",
+      "maxLength": 120,
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*--[0-9]{4}-[0-9]{2}-[0-9]{2}--[1-9][0-9]{0,3}$"
+    },
+    "exported_at": {
+      "description": "Export date (YYYY-MM-DD). Used to decide which pack's reading_position is the newest.",
+      "type": "string",
+      "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$"
+    },
+    "part": {
+      "description": "Position of this pack in a multi-pack export. Defaults to 1 of 1 when omitted.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["index", "total"],
+      "properties": {
+        "index": { "type": "integer", "minimum": 1, "maximum": 999 },
+        "total": { "type": "integer", "minimum": 1, "maximum": 999 }
+      }
+    },
+    "source": { "$ref": "#/$defs/source" },
+    "reading_position": {
+      "description": "Books only: how far the owner has read when the pack was exported (e.g. 'Chapter 14').",
+      "type": ["string", "null"],
+      "maxLength": 200
+    },
+    "words": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 100,
+      "items": { "$ref": "#/$defs/word" }
+    }
+  },
+  "$defs": {
+    "optionalText": {
+      "description": "Optional free text. null is treated as absent.",
+      "type": ["string", "null"]
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "type", "title"],
+      "properties": {
+        "id": {
+          "description": "Stable, lowercase-hyphenated id; the same book/film/article always has the same id. 'general' for general vocabulary.",
+          "type": "string",
+          "maxLength": 80,
+          "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"
+        },
+        "type": { "enum": ["book", "film", "series", "article", "general"] },
+        "title": { "type": "string", "minLength": 1, "maxLength": 300 },
+        "author": { "$ref": "#/$defs/optionalText", "maxLength": 300 },
+        "series": { "$ref": "#/$defs/optionalText", "maxLength": 300 },
+        "series_number": { "type": ["integer", "null"], "minimum": 1, "maximum": 9999 },
+        "url": { "$ref": "#/$defs/optionalText", "maxLength": 2000 }
+      }
+    },
+    "markedText": {
+      "description": "Text with EXACTLY ONE target span marked as [[...]]. The span is non-empty and does not start or end with whitespace. No other '[[' or ']]' may appear (no nesting, no second span). The pattern needs ECMA-262 lookahead/lookbehind; the importer implements the same rule with a hand-written scanner (first '[[', then the first ']]' after it, then no further '[[' or ']]' in the text).",
+      "type": "string",
+      "minLength": 5,
+      "maxLength": 600,
+      "pattern": "^(?:(?!\\[\\[|\\]\\])[\\s\\S])*\\[\\[(?![\\s\\]])(?:(?!\\[\\[|\\]\\])[\\s\\S])*?(?<!\\s)\\]\\](?:(?!\\[\\[|\\]\\])[\\s\\S])*$"
+    },
+    "sentence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["en", "cs", "origin"],
+      "properties": {
+        "en": {
+          "$ref": "#/$defs/markedText",
+          "description": "English sentence; the target word marked in the form it appears, e.g. 'Boots [[thudded]] down the corridor.'"
+        },
+        "cs": {
+          "$ref": "#/$defs/markedText",
+          "description": "Natural Czech translation of the whole sentence; the Czech words translating the target marked."
+        },
+        "origin": {
+          "description": "book = quoted verbatim from the book; source = quoted from an article/film; example = written by Claude.",
+          "enum": ["book", "source", "example"]
+        },
+        "location": {
+          "$ref": "#/$defs/optionalText",
+          "maxLength": 100,
+          "description": "Chapter or page for quoted sentences; omitted for examples."
+        }
+      }
+    },
+    "form": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["form", "common"],
+      "properties": {
+        "form": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "common": { "type": "boolean" }
+      }
+    },
+    "tag": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": { "enum": ["low-priority", "seen-before", "not-from-source"] },
+        "text": { "$ref": "#/$defs/optionalText", "maxLength": 300 }
+      }
+    },
+    "shortList": {
+      "type": "array",
+      "maxItems": 50,
+      "items": { "type": "string", "minLength": 1, "maxLength": 200 }
+    },
+    "word": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["headword", "meaning", "czech", "usefulness"],
+      "properties": {
+        "headword": {
+          "description": "Base form; may be a phrase ('pore over', 'carpet-bomb'). Identity key for merging (after normalisation: Unicode NFC, trimmed, inner whitespace collapsed, lowercased).",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100,
+          "pattern": "\\S"
+        },
+        "grammar": { "$ref": "#/$defs/optionalText", "maxLength": 200 },
+        "forms": {
+          "description": "Forms in THIS meaning; [] if not relevant.",
+          "type": "array",
+          "maxItems": 50,
+          "items": { "$ref": "#/$defs/form" }
+        },
+        "pronunciation": { "$ref": "#/$defs/optionalText", "maxLength": 200 },
+        "speak": {
+          "$ref": "#/$defs/optionalText",
+          "maxLength": 200,
+          "description": "Text for text-to-speech; defaults to the headword."
+        },
+        "meaning": { "type": "string", "minLength": 1, "maxLength": 1500 },
+        "czech": {
+          "description": "Czech equivalents, most common first, one per item.",
+          "$ref": "#/$defs/shortList",
+          "minItems": 1
+        },
+        "usefulness": { "type": "integer", "minimum": 1, "maximum": 10 },
+        "goal": {
+          "description": "Default when omitted: active for usefulness >= 6, otherwise recognise (R-15).",
+          "enum": ["recognise", "active"]
+        },
+        "accepted": {
+          "description": "English answers accepted in the Produce card (exact match after mechanical normalisation).",
+          "$ref": "#/$defs/shortList"
+        },
+        "confusables": {
+          "description": "English words the owner might mix this word up with.",
+          "$ref": "#/$defs/shortList"
+        },
+        "hint": {
+          "$ref": "#/$defs/optionalText",
+          "maxLength": 300,
+          "description": "Short memory hook shown for problem words (instructions ask for ~120 characters)."
+        },
+        "spelling": { "type": "boolean", "description": "Worth a separate Spelling card (R-58). Default false." },
+        "spelling_note": { "$ref": "#/$defs/optionalText", "maxLength": 200 },
+        "note": { "$ref": "#/$defs/optionalText", "maxLength": 6000 },
+        "tag": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/tag" }
+          ]
+        },
+        "icon": {
+          "$ref": "#/$defs/optionalText",
+          "maxLength": 40,
+          "description": "One emoji or a Lucide icon name."
+        },
+        "sentences": {
+          "description": "Practice sentences (target 3-5). Fewer than 3 visible sentences means the Understand card uses the word-only format.",
+          "type": "array",
+          "maxItems": 20,
+          "items": { "$ref": "#/$defs/sentence" }
+        }
+      }
+    }
+  }
+}

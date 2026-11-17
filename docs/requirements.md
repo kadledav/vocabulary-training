@@ -48,7 +48,7 @@ If a feature seems to need language judgement inside the app, the answer is to a
 | Headword | `w` | yes | e.g. `pore over`, `carpet-bomb` — may contain spaces/hyphens |
 | Czech translation(s) | `cz` | yes | free text, may list several meanings separated by `,` / `;` |
 | English meaning | `m` | no | |
-| Forms | `forms` | no | either free text, or a list of `[form, commonInThisMeaning]` |
+| Forms | `forms` | no | a list of `{form, common}` in the pack (old pages' free-text forms are converted by Claude) |
 | Pronunciation respelling | `s` | no | e.g. `STRAY-tum` |
 | Text to speak | `say` | no | defaults to the headword |
 | Example sentences | `u` | no | 0–n strings |
@@ -56,7 +56,7 @@ If a feature seems to need language judgement inside the app, the answer is to a
 | Usefulness | `ux` | yes | integer 1–10 |
 | Icon | `ic` / `em` | no | icon name or emoji — display is nice-to-have |
 | Tag | `tag` + `tagtext` | no | `skip` (low priority), `rep` (also in earlier source), `late` (not from this source) |
-| Order within source | `seq` | no | preserves the order words were added |
+| Order within source | `seq` | no | preserves the order words were added (optional pack field; old pages keep their `seq`) |
 
 **R-02 MUST** — Every word belongs to one or more **sources**. A source has a type (`book`, `film`, `article`, `general`), a title, and optionally author, series and number in series (Bobiverse book 2).
 

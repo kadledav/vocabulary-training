@@ -35,20 +35,26 @@ Rules passed to every agent:
 
 ## 2. Milestones
 
-> Tentative — replaced by the design agent's milestone plan after review.
+From the reviewed design (`docs/design/architecture.md` §17 — scope, "done when" and R-IDs are defined there).
 
-| # | Milestone | Covers (indicative) | Owner can try? |
-|---|---|---|---|
-| M1 | Skeleton, SQLite schema & migrations, pack import (validate, preview, merge, idempotency) | R-01..R-04, R-10, R-11, R-15, R-20..R-25, R-84 | — |
-| M2 | Understand card, 1–5 rating, FSRS scheduling, daily session, undo | R-50..R-54, R-60..R-62, R-70, R-71 | — |
-| M3 | Server-side TTS pipeline + browser fallback | R-40, R-41 | — |
-| M4 | Auth, hardened container, Compose stack draft for `home/docker/vocabulary/`, CI + Renovate | R-80..R-85, R-90..R-95 | **Yes — first usable version** |
-| M5 | Produce card | R-52, R-56 | yes |
-| M6 | Spelling card | R-58 | yes |
-| M7 | Progress view, browse/search, word editing, leeches, feedback export | R-55, R-57, R-72, R-73, R-04, R-86 | yes |
-| M8 | Local MCP connector for Claude Desktop | R-12 | yes |
+| # | Milestone | Owner can try? |
+|---|---|---|
+| M1 | Foundations: workspace, config/clock/db, full schema + migration, HTTP skeleton, CI guards (dep-age, repo-guard, cargo-deny), Renovate | — |
+| M2 | Pack format & import (incl. optional `seq`, P-1), Import page, minimal word list | — |
+| M3 | Scheduler & session engine (API) | — |
+| M4 | Practice UI: Understand card, rating bar, Today, Settings | — |
+| M5 | Auth, hardened image, deployment | **Yes — first usable version** (browser speech) |
+| M6 | Neural TTS (Kokoro + sherpa-onnx) | yes |
+| M7 | Words: browse, detail, edit | yes |
+| M8 | Produce card | yes |
+| M9 | Leeches, progress, exports | yes |
+| M10 | Spelling card | yes |
+| M11 | MCP connector (Claude Desktop extension) | yes |
+| M12 | FSRS personal parameters & polish | yes |
 
-After **M4** the plan pauses: the owner deploys and practises with real words, gives feedback; the guarantor turns feedback into changes before M5+.
+After **M5** the plan pauses: the owner deploys and practises with real words, gives feedback; the guarantor turns feedback into changes before M6+.
+
+Environment notes (checked 2026-11-17): local Rust 1.95 — the repo pins 1.99.0 via `rust-toolchain.toml`, rustup fetches it. **No Docker on the Mac** — container builds and image smoke tests run only in GitHub Actions, i.e. after the owner pushes; the guarantor verifies Rust/JS checks locally and asks the owner to push when a milestone needs CI evidence.
 
 ## 3. Budget guard
 
@@ -57,13 +63,13 @@ Estimate: design 0.2–0.4 M tokens · implementation 3–6 M · testing 0.5–1
 - Check plan usage after **every step** (each agent run and each guarantor check).
 - **Current run cap: 18 % weekly usage.** Before starting a step, estimate its cost (implementation step ≈ 2–4 %, testing/bug-finding ≈ 1–2 %, guarantor check < 1 %); don't start it if it would likely cross the cap. Running steps can't be cut exactly, so stop early rather than late.
 - Default cap for later runs (unless the owner sets another): **weekly usage ≥ 80 %** → finish the current step, don't start the next one, tell the owner.
-- **5-hour window ≥ 90 %** → pause until it resets.
+- The 5-hour window is not a stop criterion (owner's decision); if it runs out, work simply resumes when it resets.
 - Extra usage is capped (monthly limit reached) — work stops at the plan limit, no surprise cost.
 
 ## 4. Owner actions (cannot be done by agents)
 
 - At M4: create ZFS dataset `tank/services/vocabulary` with `data/`, `config/`, `cache/` and the ownership/ACL for the container UID/GID (from the design); create `.env` with secrets; deploy the stack (Portainer/TrueNAS); add the DNS name for the `home` entrypoint.
-- Approve any push to GitHub / GHCR image publishing when asked.
+- **Pushes to GitHub are done by the owner** (no GitHub credentials in the agent shell). The guarantor commits accepted milestones locally on `phase-1` and tells the owner when there is something to push.
 - Paste the export instructions into the claude.ai project and produce the first real packs (incl. converting the old Bobiverse pages).
 
 ## 5. Progress log
