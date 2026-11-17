@@ -94,6 +94,35 @@ class SessionCookie(unittest.TestCase):
         self.assertIsNone(smoke.session_cookie([("cookie", "__Host-vocab_session=abc")]))
 
 
+DISTROLESS = [
+    ("./", 0o755, False),
+    ("etc/dpkg/", 0o755, False),
+    ("etc/dpkg/origins/debian", 0o644, True),
+    ("etc/ssl/certs/ca-certificates.crt", 0o644, True),
+    ("var/lib/dpkg/status.d/base-files", 0o644, True),
+    ("var/lib/dpkg/status.d/tzdata.md5sums", 0o644, True),
+    ("usr/share/zoneinfo/UTC", 0o644, True),
+    ("vocab-server", 0o755, True),
+    ("data/", 0o700, False),
+]
+
+
+class ImagePrograms(unittest.TestCase):
+    def test_distroless_listing_with_dpkg_metadata_passes(self):
+        self.assertEqual(smoke.image_programs(DISTROLESS), [])
+
+    def test_shell_is_found_even_as_symlink(self):
+        self.assertEqual(smoke.image_programs([*DISTROLESS, ("bin/sh", 0o777, False)]), ["bin/sh"])
+        self.assertEqual(smoke.image_programs([*DISTROLESS, ("./usr/bin/dpkg", 0o755, True)]), ["usr/bin/dpkg"])
+
+    def test_any_other_executable_file_is_found(self):
+        self.assertEqual(smoke.image_programs([*DISTROLESS, ("usr/bin/foo", 0o755, True)]), ["usr/bin/foo"])
+        self.assertEqual(smoke.image_programs([*DISTROLESS, ("opt/x", 0o645, True)]), ["opt/x"])
+
+    def test_executable_directories_and_symlinks_are_not_programs(self):
+        self.assertEqual(smoke.image_programs([("usr/bin/", 0o755, False), ("lib/x", 0o777, False)]), [])
+
+
 class SmokeOutput(unittest.TestCase):
     def test_setup_line_of_the_server_log(self):
         log = (
@@ -108,7 +137,9 @@ class SmokeOutput(unittest.TestCase):
         def failing(_argv):
             smoke.check(True, "first")
             smoke.check(False, "[uid 3101] login works", "status 401, body b'{}'")
-            return 0
+            smoke.check(False, "second failure", "still reported")
+            smoke.skip(["dependent"], "login failed")
+            return 1
 
         out = io.StringIO()
         with tempfile.TemporaryDirectory() as tmp:
@@ -124,6 +155,9 @@ class SmokeOutput(unittest.TestCase):
         self.assertIn("::error title=image-smoke [uid 3101] login works::status 401, body b'{}'\n", out.getvalue())
         self.assertIn("| ✅ | first |", summary)
         self.assertIn("| ❌ | [uid 3101] login works | status 401, body b'{}' |", summary)
+        # Later checks still ran and are reported; a skipped one is marked so.
+        self.assertIn("::error title=image-smoke second failure::still reported\n", out.getvalue())
+        self.assertIn("| ⏭️ | dependent | skipped: login failed |", summary)
 
     def test_a_crash_is_annotated_too(self):
         def crashing(_argv):

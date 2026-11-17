@@ -37,14 +37,15 @@ def error(title: str, message: str) -> None:
     print(error_line(title, message), flush=True)
 
 
-def summary_table(heading: str, rows: list[tuple[str, bool, str]]) -> str:
-    """A markdown table of (check, passed, detail) rows."""
+def summary_table(heading: str, rows: list[tuple[str, bool | None, str]]) -> str:
+    """A markdown table of (check, passed, detail) rows; passed is None for
+    a skipped check."""
     def cell(text: str) -> str:
         text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
         return text.replace("|", "\\|").replace("\r", " ").replace("\n", " ")
 
     lines = [f"### {heading}", "", "| | check | detail |", "|---|---|---|"]
-    lines += [f"| {'✅' if ok else '❌'} | {cell(name)} | {cell(detail)} |" for name, ok, detail in rows]
+    lines += [f"| {'⏭️' if ok is None else '✅' if ok else '❌'} | {cell(name)} | {cell(detail)} |" for name, ok, detail in rows]
     return "\n".join(lines) + "\n"
 
 
