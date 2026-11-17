@@ -1,0 +1,96 @@
+# Exporting vocabulary for my training app
+
+When I ask you to export words "for the training app", produce vocabulary packs in the exact JSON format below. My app imports them and does no language processing of its own, so everything it needs must be in the pack and the JSON must be valid.
+
+## What to export
+- By default: the words we discussed in this conversation. If I say "everything" or name a book, export all words for that source that you know of.
+- If I say "update the sentences" for a book (e.g. "I'm now at chapter 20, update the sentences for Book 2"): re-export the words of that book that I already have, with sentences from the newly read part added. Keep each word's other fields as before; it is fine to repeat sentences you exported earlier — my app merges and skips duplicates.
+- If I attach one of my old vocabulary HTML pages (they contain `const words = [...]`), convert every word in it, keep all its information, and add sentences as described below.
+- Group words by source: one pack contains words from ONE source only.
+- Max 15 words per pack. If there are more, output several packs and set `part` (e.g. 1 of 3). Never cut a pack in the middle.
+
+## Output rules
+- Each pack in its own ```json code block. Nothing inside the code block except the JSON.
+- Strictly valid JSON: double-quoted keys and strings, no comments, no trailing commas, escape `"` and `\` inside strings. Typographic quotes (“ ” ’) inside text are fine.
+- After the code blocks, one short line: how many words, how many packs, and anything you were unsure about.
+
+## Pack format (format_version 1)
+
+{
+  "format": "vocab-pack",
+  "format_version": 1,
+  "pack_id": "<source.id>--<YYYY-MM-DD>--<n>",
+  "exported_at": "YYYY-MM-DD",
+  "part": { "index": 1, "total": 1 },
+  "source": {
+    "id": "bobiverse-2",
+    "type": "book",
+    "title": "For We Are Many",
+    "author": "Dennis E. Taylor",
+    "series": "Bobiverse",
+    "series_number": 2
+  },
+  "reading_position": "Chapter 14",
+  "words": [ <word>, ... ]
+}
+
+- `source.id`: lowercase-hyphenated, STABLE — always the same id for the same book/film/article (series + number if any, else a short title slug). Use `general` for my general vocabulary without a specific source.
+- `source.type`: "book" | "film" | "series" | "article" | "general". `author`, `series`, `series_number` only when they apply; add `"url"` for articles.
+- `reading_position`: books only — how far I have read (ask me if you don't know). Omit for other types.
+- `pack_id`: n = 1, 2, … for multiple packs exported the same day for the same source.
+
+## Word format
+
+{
+  "headword": "thud",
+  "grammar": "noun and verb",
+  "forms": [ { "form": "thud", "common": true }, { "form": "thudded", "common": true }, { "form": "thudding", "common": true } ],
+  "pronunciation": "THUD",
+  "speak": "thud",
+  "meaning": "A dull, heavy sound of something solid hitting a surface — no ring, no crash.",
+  "czech": ["žuchnutí", "tupá rána", "žuchnout"],
+  "usefulness": 7,
+  "goal": "active",
+  "accepted": ["thud", "thudded", "thudding"],
+  "confusables": ["thump", "bang"],
+  "hint": "Think of the sound a heavy book makes when dropped on a carpet.",
+  "spelling": false,
+  "note": "thud = dull and heavy; thump = punchier, often repeated; bang = loud and sharp; crash = with breaking.",
+  "tag": null,
+  "icon": "📦",
+  "sentences": [
+    { "en": "There was a loud [[thud]] from the corridor.", "cs": "Z chodby se ozvalo hlasité [[žuchnutí]].", "origin": "book", "location": "Chapter 12" },
+    { "en": "Heavy boots [[thudded]] on the wooden stairs.", "cs": "Po dřevěných schodech [[dusaly]] těžké boty.", "origin": "book", "location": "Chapter 13" },
+    { "en": "The book fell to the floor with a [[thud]].", "cs": "Kniha s [[žuchnutím]] dopadla na zem.", "origin": "example" }
+  ]
+}
+
+Field rules:
+- `headword`: the base form people actually use (may be a phrase: "pore over", "carpet-bomb"). Required.
+- `grammar`: part of speech and key grammar in a few words ("noun · plural: strata", "uncountable noun"). 
+- `forms`: forms of the word in THIS meaning; `common: false` for forms rarely used in this meaning. Use [] if not relevant.
+- `pronunciation`: simple English respelling with the stressed syllable in capitals ("ver-BAY-tim").
+- `speak`: text for text-to-speech, only if different from the headword; else same as headword.
+- `meaning`: clear English explanation of the meaning taught (1–3 sentences). Required.
+- `czech`: Czech equivalents, most common first, each array item one equivalent. Required, at least one.
+- `usefulness`: 1–10, how useful the word is in everyday English for me (advanced learner):
+  9–10 core everyday word · 7–8 common, worth using actively · 5–6 met regularly in books/news · 3–4 occasional, mostly just recognise · 1–2 rare, technical or literary.
+- `goal`: "active" if I should be able to USE the word (normally usefulness ≥ 6 and not low priority), otherwise "recognise" (I only need to understand it when reading).
+- `accepted`: every English answer that should count as correct when I must produce the word from its Czech meaning: the headword, its forms, valid spelling variants (US/UK), and near-synonyms ONLY if they are genuinely correct in all the sentences given.
+- `confusables`: English words I might mix it up with (similar sound, spelling or meaning — e.g. poultry/paltry). [] if none.
+- `hint`: one short memory hook (max ~120 characters), shown when I keep failing this word.
+- `spelling`: true if the spelling is worth practising separately — it does not follow from the sound, or has a common trap (desiccated, nuisance, verbatim, rhythm). false for words spelled as they sound (thud, limp). If true, add `"spelling_note"`: the trap in a few words ("one s, two c"; "ui is pronounced oo").
+- `note`: the longer usage note like in my vocabulary pages (synonyms, register, pitfalls, related words). May be "".
+- `tag`: null, or { "kind": "low-priority" | "seen-before" | "not-from-source", "text": "short reason" }.
+  low-priority = not worth much effort (e.g. too exotic, technical, learn another word instead); seen-before = also appeared in an earlier book/source; not-from-source = I asked about it while reading this source but it does not occur in it.
+- `icon`: optional — one emoji, or a Lucide icon name. Omit if nothing fits.
+
+## Sentences — the most important part
+- Every sentence marks the target word with [[double brackets]] — EXACTLY ONE marked span in `en` (the word in the form it appears, e.g. [[thudded]], [[poring over]]) and EXACTLY ONE in `cs` (the Czech words that translate it; if it is translated by a phrase, mark the whole phrase).
+- `cs` is a natural, fluent Czech translation of the whole sentence, not word-for-word.
+- Book words: 3–5 sentences QUOTED VERBATIM from the book in the project, with `"origin": "book"` and `location` (chapter, or page if there are no chapters).
+  - Only from the part I have already read (up to `reading_position`) — no spoilers.
+  - Only sentences where the word has the meaning being taught. If the book uses a book-specific or unusual sense, teach the sense used in the book, say so in `note`, and add 1 example with the everyday sense marked `"origin": "example"`.
+  - Prefer sentences that are understandable on their own (one sentence, 6–30 words, not too many other hard words). You may cut a very long sentence with "…" at the start or end, but never change words inside.
+  - If the book has fewer than 3 suitable sentences, add your own examples (`"origin": "example"`, no `location`) to reach 3.
+- Words from films, series, articles or general vocabulary: 3 example sentences written by you (`"origin": "example"`); for articles you may quote the article (`"origin": "source"`).
