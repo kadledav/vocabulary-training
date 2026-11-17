@@ -1,6 +1,6 @@
 # Execution Plan — phase 1
 
-Status: **RUNNING (started 2026-11-17) with a hard usage cap: stop at 18 % weekly usage (all models)** — owner's decision. When the cap is reached the guarantor records the stop point in §5 and waits for the owner to say "continue".
+Status: **PAUSED after M4 (2026-11-17)** — the night run of 2026-11-17 had a cap of 18 % weekly usage (owner's decision); M5 was not started because it would likely have crossed that cap. Resume with M5 when the owner says "continue".
 Guarantor: Claude (main session). The guarantor does not write application code; it briefs agents, runs verification commands, reviews, and decides.
 
 Inputs: `docs/requirements.md` (v1.0) · `docs/design/architecture.md` (after guarantor review) · `docs/research/training-ui.md` · `docs/claude-export-instructions.md` · `docs/vocab-pack.schema.json`
@@ -61,7 +61,7 @@ Environment notes (checked 2026-11-17): local Rust 1.95 — the repo pins 1.99.0
 Estimate: design 0.2–0.4 M tokens · implementation 3–6 M · testing 0.5–1.5 M · bug-finding 0.3–1 M · guarantor reviews 0.3–0.6 M → **≈ 5–10 M tokens for phase 1**. M1–M4 expected to fit in one weekly window.
 
 - Check plan usage after **every step** (each agent run and each guarantor check).
-- **Current run cap: 18 % weekly usage.** Before starting a step, estimate its cost (implementation step ≈ 2–4 %, testing/bug-finding ≈ 1–2 %, guarantor check < 1 %); don't start it if it would likely cross the cap. Running steps can't be cut exactly, so stop early rather than late.
+- **Cap for the night run of 2026-11-17: 18 % weekly usage.** Before starting a step, estimate its cost (implementation step ≈ 2–4 %, testing/bug-finding ≈ 1–2 %, guarantor check < 1 %); don't start it if it would likely cross the cap. Running steps can't be cut exactly, so stop early rather than late.
 - Default cap for later runs (unless the owner sets another): **weekly usage ≥ 80 %** → finish the current step, don't start the next one, tell the owner.
 - The 5-hour window is not a stop criterion (owner's decision); if it runs out, work simply resumes when it resets.
 - Extra usage is capped (monthly limit reached) — work stops at the plan limit, no surprise cost.
@@ -94,3 +94,10 @@ Estimate: design 0.2–0.4 M tokens · implementation 3–6 M · testing 0.5–1
 | 2026-11-17 | M4 implementation agent started (est. 3–4 % incl. reviews) | 12 % | |
 | 2026-11-17 | M4 implemented (343k tokens); gates green (339 Rust, 34 node, 18 Playwright webkit-phone+chromium-desktop, dep-age 216); guarantor visual check of screenshots OK (note: "More" content hidden under fixed rating bar); M4 testing + bug-finding agents started | 13 % | |
 | 2026-11-17 | M4 testing agent: 37 e2e contract tests, 4 defects; bug review: 10 findings (double-tap reveals next answer, lost-response rating mismatch, stalled request lock, dep-age YAML block bypass, Czech keyboard digits, …); fix round H1–H11, T1–T4, G sent | ~14 % | |
+| 2026-11-17 | M4 fix round done (339 Rust, 36 node, 111 Playwright ×2 repeat green); M4 committed 4c3fbe7 | | owner push pending |
+| 2026-11-17 | **PAUSED** before M5 — end of the night run (M5 incl. reviews would likely cross that night's 18 % cap) | | next: M5 auth + image + deploy |
+
+### Resume notes for M5
+- Docker is not installed on the Mac: image build and smoke tests run only in GitHub Actions → the owner pushes, guarantor reads CI results.
+- Carry-overs: Origin check + auth on all state-changing routes (M3/M4 endpoints are unauthenticated until M5); per-endpoint rate limits (login, import); dep-age must learn Dockerfile/compose image digests and Debian package pins before the first Dockerfile lands (it fails closed on them today).
+- Risk noted in M3: Produce cards unlocked before M8 all become due when Produce is enabled — spread them in M8.
