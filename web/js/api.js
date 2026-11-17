@@ -12,6 +12,19 @@
 /** A request that has not finished after this long is given up (`code: 'timeout'`). */
 export const REQUEST_TIMEOUT_MS = 15_000;
 
+/** @type {() => void} */
+let unauthenticated = () => {};
+
+/**
+ * Called whenever the server answers 401 because there is no live session
+ * (not for a wrong password at login): the app then shows the login screen.
+ *
+ * @param {() => void} handler
+ */
+export function onUnauthenticated(handler) {
+  unauthenticated = handler;
+}
+
 /**
  * @template T
  * @param {string} url
@@ -48,6 +61,7 @@ async function call(url, init, timeoutMs = REQUEST_TIMEOUT_MS) {
     return { ok: true, status: response.status, data: /** @type {T} */ (body) };
   }
   const error = body && typeof body === 'object' && body.error ? body.error : null;
+  if (response.status === 401 && error && error.code === 'unauthenticated') unauthenticated();
   return {
     ok: false,
     status: response.status,

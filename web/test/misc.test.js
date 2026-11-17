@@ -54,6 +54,7 @@ test('R-74 routes of the practice screens', () => {
   assert.deepEqual(parseRoute('#/settings'), { name: 'settings', params: {} });
   assert.deepEqual(parseRoute('#/words/12'), { name: 'word', params: { id: '12' } });
   assert.deepEqual(parseRoute('#/practice/x'), { name: 'not-found', params: {} });
+  assert.deepEqual(parseRoute('#/login'), { name: 'login', params: {} });
 });
 
 test('R-54 the forecast labels study days with their weekday', () => {

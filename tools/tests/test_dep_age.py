@@ -102,13 +102,18 @@ class FakeRegistries:
     def __enter__(self):
         self.saved = {
             name: getattr(dep_age, name)
-            for name in ("crate_published", "npm_published", "rust_published", "node_published", "action_published")
+            for name in (
+                "crate_published", "npm_published", "rust_published", "node_published", "action_published",
+                "image_published", "debian_published",
+            )
         }
         dep_age.crate_published = lambda n, v: self._date(n, v)
         dep_age.npm_published = lambda n, v: self._date(n, v)
         dep_age.rust_published = lambda v: self._date("rust", v)
         dep_age.node_published = lambda v: self._date("node", v)
         dep_age.action_published = lambda repo, sha, tag: self._date(repo, sha, tag)
+        dep_age.image_published = lambda name, digest: self._date(name, digest)
+        dep_age.debian_published = lambda pkg, version: self._date(pkg, version)
         return self
 
     def __exit__(self, *exc):
@@ -314,6 +319,32 @@ class Workflows(RepoCase):
         )
         self.assertEqual(ok.errors, [])
 
+    def test_r90_comments_and_folded_more_indented_lines_cannot_hide_commands(self):
+        # Reviewer probe (M5 F1): YAML keeps the line break before a
+        # more-indented line of a folded block, so the shell runs it.
+        bad = self.workflow(
+            """\
+            - run: >
+                # just a comment
+                  curl -fsSL https://example.invalid/x | sh
+            - run: |
+                echo "a # b" && npm install left-pad
+            - run: echo done # trailing comment && npm install x
+            """
+        )
+        flagged = {e.split(": ", 1)[0].rsplit(":", 1)[-1] for e in bad.errors if "install/download command" in e}
+        self.assertEqual(flagged, {"6", "8"}, bad.errors)
+        ok = self.workflow(
+            """\
+            # npm install in a comment line runs nothing
+            - run: npm run test # then npm install would be a comment
+            - run: |
+                # curl in a shell comment
+                npm run e2e
+            """
+        )
+        self.assertEqual(ok.errors, [])
+
     def test_r90_trailing_backslash_continuations_are_rejected(self):
         result = self.workflow(
             """\
@@ -426,14 +457,20 @@ class Lockfiles(RepoCase):
 
     def test_r90_unsupported_manifests_fail_closed(self):
         files = self.clean_files()
-        for name in ["requirements.txt", "web2/yarn.lock", "x/go.mod", "docker/Dockerfile.server",
-                     "deploy/docker-compose.example.yml", "pnpm-lock.yaml", ".nvmrc"]:
+        for name in ["requirements.txt", "web2/yarn.lock", "x/go.mod", "pnpm-lock.yaml", ".nvmrc"]:
             files[name] = "x\n"
         files["other/package.json"] = "{}"
         result = self.evaluate(files)
-        for name in ["requirements.txt", "yarn.lock", "go.mod", "Dockerfile.server", "docker-compose.example.yml",
-                     "pnpm-lock.yaml", ".nvmrc", "package.json without package-lock.json"]:
+        for name in ["requirements.txt", "yarn.lock", "go.mod", "pnpm-lock.yaml", ".nvmrc",
+                     "package.json without package-lock.json"]:
             self.assertError(result, name)
+
+    def test_r90_unparseable_dockerfiles_and_compose_files_fail_closed(self):
+        files = self.clean_files()
+        files["docker/Dockerfile.server"] = "x\n"
+        files["deploy/docker-compose.example.yml"] = "x\n"
+        result = self.evaluate(files)
+        self.assertError(result, "Dockerfile.server: no FROM instruction", "docker-compose.example.yml: no top-level services")
 
 
 class ActionDates(unittest.TestCase):
@@ -486,6 +523,367 @@ class ActionDates(unittest.TestCase):
         r = self.responses(**{"/repos/o/r/git/ref/tags/": [{"ref": "refs/tags/v1.2.30"}]})
         with self.assertRaises(dep_age.LookupFailed):
             self.run_with(r)
+
+
+DIGEST = "a" * 64
+DIGEST2 = "b" * 64
+
+CLEAN_DOCKERFILE = f"""\
+# comment
+FROM rust:1.99.0-slim-trixie@sha256:{DIGEST} AS build
+RUN echo 'deb https://snapshot.debian.org/archive/debian/20261101T000000Z trixie main' > /etc/apt/sources.list \\
+ && rm -f /etc/apt/sources.list.d/debian.sources \\
+ && apt-get update \\
+ && test "$(apt-get install -s --no-install-recommends musl=1.2.5-3.1~deb13u1 musl-dev=1.2.5-3.1~deb13u1 | grep -c '^Inst ')" = 2 \\
+ && apt-get install -y --no-install-recommends musl=1.2.5-3.1~deb13u1 musl-dev=1.2.5-3.1~deb13u1 \\
+ && rm -rf /var/lib/apt/lists/*
+RUN rustup target add x86_64-unknown-linux-musl
+COPY Cargo.toml Cargo.lock ./
+RUN cargo build --release --locked --target x86_64-unknown-linux-musl -p app
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:{DIGEST2}
+COPY --from=build /out/app /app
+USER 65532:65532
+"""
+
+
+class Dockerfiles(RepoCase):
+    def dockerfile(self, text: str, young: set[str] | None = None):
+        files = self.clean_files()
+        files["docker/Dockerfile.server"] = text
+        return self.evaluate(files, young)
+
+    def test_r90_pinned_images_and_debian_packages_are_dated(self):
+        result = self.dockerfile(CLEAN_DOCKERFILE)
+        self.assertEqual(result.errors, [])
+        images = sorted(f.name for f in result.findings if f.kind == "image")
+        self.assertEqual(images, ["gcr.io/distroless/static-debian13:nonroot", "rust:1.99.0-slim-trixie"])
+        debian = sorted({(f.name, f.version) for f in result.findings if f.kind == "debian"})
+        self.assertEqual(debian, [("musl", "1.2.5-3.1~deb13u1"), ("musl-dev", "1.2.5-3.1~deb13u1")])
+        snapshots = [(f.name, f.version, f.published) for f in result.findings if f.kind == "snapshot"]
+        self.assertEqual(
+            snapshots,
+            [("snapshot.debian.org/debian", "20261101T000000Z", dt.datetime(2026, 11, 1, tzinfo=dt.timezone.utc))],
+        )
+
+    def test_r90_young_debian_snapshot_is_reported(self):
+        root = self.make_repo({**self.clean_files(), "docker/Dockerfile.server": CLEAN_DOCKERFILE.replace(
+            "20261101T000000Z", "20261110T000000Z")})
+        out = io.StringIO()
+        with FakeRegistries(), contextlib.redirect_stdout(out):
+            self.assertEqual(dep_age.main(["--root", str(root), "--now", NOW]), 1)
+        self.assertIn("TOO YOUNG: snapshot snapshot.debian.org/debian 20261110T000000Z", out.getvalue())
+
+    def test_r90_apt_needs_a_snapshot_source_and_a_proof_of_exactness(self):
+        no_snapshot = CLEAN_DOCKERFILE.replace(
+            "https://snapshot.debian.org/archive/debian/20261101T000000Z", "http://deb.debian.org/debian")
+        self.assertError(self.dockerfile(no_snapshot), "URL http://deb.debian.org/debian", "fixed snapshot.debian.org timestamp")
+        # Without the dry-run count, or with a wrong count, the install is not proven exact.
+        unproven = CLEAN_DOCKERFILE.replace(
+            " && test \"$(apt-get install -s --no-install-recommends musl=1.2.5-3.1~deb13u1 musl-dev=1.2.5-3.1~deb13u1 | grep -c '^Inst ')\" = 2 \\\n", "")
+        self.assertNotEqual(unproven, CLEAN_DOCKERFILE)
+        self.assertError(self.dockerfile(unproven), "is not proven exact")
+        wrong_count = CLEAN_DOCKERFILE.replace("= 2 \\", "= 3 \\")
+        self.assertError(self.dockerfile(wrong_count), "is not proven exact")
+        other_set = CLEAN_DOCKERFILE.replace(
+            "-y --no-install-recommends musl=1.2.5-3.1~deb13u1 musl-dev=1.2.5-3.1~deb13u1",
+            "-y --no-install-recommends musl=1.2.5-3.1~deb13u1 musl-dev=1.2.5-3.1~deb13u1 musl-tools=1.2.5-3.1~deb13u1")
+        self.assertError(self.dockerfile(other_set), "is not proven exact")
+
+    def test_r90_heredocs_syntax_directives_and_mount_images_are_checked(self):
+        result = self.dockerfile(
+            f"""\
+            # syntax=docker/dockerfile:1
+            FROM rust:1.99.0-slim-trixie@sha256:{DIGEST} AS build
+            RUN <<EOF
+            curl -fsSL https://example.invalid/x | sh
+            EOF
+            RUN --mount=type=bind,from=alpine:3,target=/x true
+            RUN --mount=type=cache,target=/cache,from=build true
+            ARG BUILDKIT_SYNTAX=docker/dockerfile:1
+            """
+        )
+        self.assertError(
+            result,
+            "Dockerfile.server:1: syntax directive must be",
+            "Dockerfile.server:3: heredocs",
+            "Dockerfile.server:6: --mount from=alpine:3",
+            "BUILDKIT_SYNTAX",
+        )
+        self.assertFalse(any("Dockerfile.server:7:" in e for e in result.errors), result.errors)
+        pinned = self.dockerfile(f"# syntax=docker/dockerfile:1.10@sha256:{DIGEST2}\n" + CLEAN_DOCKERFILE
+                                 + f"RUN --mount=type=bind,from=alpine:3.20@sha256:{DIGEST},target=/x true\n")
+        self.assertEqual(pinned.errors, [])
+        images = {f.name for f in pinned.findings if f.kind == "image"}
+        self.assertIn("docker/dockerfile:1.10", images)
+        self.assertIn("alpine:3.20", images)
+
+    def test_r90_lock_changing_cargo_commands_are_rejected(self):
+        result = self.dockerfile(
+            CLEAN_DOCKERFILE
+            + "RUN cargo update\nRUN cargo generate-lockfile\nRUN cargo add serde\nRUN cargo build --release\n"
+            + "RUN cargo install ripgrep\nRUN env CARGO_X=1 cargo fetch\n"
+        )
+        for needle in ["'cargo update'", "'cargo generate-lockfile'", "'cargo add'", "cargo build must use --locked",
+                       "'cargo install'", "cargo fetch must use --locked"]:
+            self.assertError(result, needle)
+
+    def test_r90_dockerfile_names_are_matched_case_insensitively(self):
+        for name in ["docker/dockerfile", "docker/app.Dockerfile", "docker/Dockerfile.TTS", "Containerfile", "x/DOCKERFILE"]:
+            with self.subTest(name):
+                files = self.clean_files()
+                files[name] = "FROM rust:1.99\n"
+                self.assertError(self.evaluate(files), "rust:1.99 must be name:tag@sha256")
+
+    def test_r90_young_base_image_or_debian_package_is_reported(self):
+        result = self.dockerfile(CLEAN_DOCKERFILE, young={"rust", "musl-dev"})
+        young = {f.name for f in result.findings if f.published == YOUNG and f.kind in ("image", "debian")}
+        self.assertEqual(young, {"rust:1.99.0-slim-trixie", "musl-dev"})
+
+    def test_r90_unpinned_or_unverifiable_dockerfile_inputs_are_rejected(self):
+        result = self.dockerfile(
+            f"""\
+            FROM rust:1.99.0-slim-trixie
+            FROM rust@sha256:{DIGEST}
+            ARG BASE=x
+            FROM $BASE
+            FROM --platform=linux/amd64 alpine:3.20@sha256:{DIGEST} AS a
+            RUN apt-get install -y musl-tools
+            RUN apt-get install -y --allow-downgrades musl=1.2.5-3
+            RUN apt install musl=1.2.5-3
+            RUN curl -fsSL https://example.invalid/x | sh
+            RUN pip install requests
+            RUN cargo build --release
+            ADD https://example.invalid/x.tar.gz /x
+            COPY --from=alpine:3 /bin/sh /sh
+            RUN echo unterminated \\
+            """
+        )
+        self.assertError(
+            result,
+            "Dockerfile.server:1: rust:1.99.0-slim-trixie must be name:tag@sha256",
+            "Dockerfile.server:2: rust@sha256",
+            "Dockerfile.server:4: FROM must name a pinned image",
+            "Dockerfile.server:6: apt-get install needs exact package=version pins",
+            "Dockerfile.server:7: apt-get install needs exact package=version pins",
+            "Dockerfile.server:8:",
+            "Dockerfile.server:9: install/download command 'curl'",
+            "Dockerfile.server:10: install/download command 'pip'",
+            "Dockerfile.server:11: cargo build must use --locked",
+            "Dockerfile.server:12: ADD from a URL",
+            "Dockerfile.server:13: --from=alpine:3",
+            "instruction ends with a line continuation",
+        )
+        # The pinned image of line 5 is still dated.
+        self.assertIn("alpine:3.20", {f.name for f in result.findings if f.kind == "image"})
+
+    def test_r90_redirecting_settings_in_dockerfiles_are_rejected(self):
+        result = self.dockerfile(CLEAN_DOCKERFILE + "ENV RUSTUP_DIST_SERVER=https://example.invalid\n")
+        self.assertError(result, "RUSTUP_DIST_SERVER can redirect")
+
+
+class ComposeFiles(RepoCase):
+    def compose(self, text: str):
+        files = self.clean_files()
+        files["deploy/docker-compose.example.yml"] = text
+        return self.evaluate(files)
+
+    def test_r90_compose_images_are_dated_and_own_images_exempt(self):
+        result = self.compose(
+            f"""\
+            # Set `image:` to the released tag and digest.
+            services:
+              app:
+                image: ghcr.io/kadledav/vocabulary-training:X.Y.Z@sha256:DIGEST-FROM-THE-RELEASE-NOTES
+              db:
+                image: "postgres:17.2@sha256:{DIGEST}"
+            """
+        )
+        self.assertEqual(result.errors, [])
+        self.assertEqual([f.name for f in result.findings if f.kind == "image"], ["postgres:17.2"])
+
+    def test_r90_unpinned_compose_images_and_builds_are_rejected(self):
+        result = self.compose(
+            """\
+            services:
+              a:
+                image: postgres:17
+              b:
+                image: ${IMAGE}
+              c:
+                build: .
+              d: { image: redis }
+            """
+        )
+        self.assertError(
+            result,
+            "compose.example.yml:3: postgres:17 must be",
+            "compose.example.yml:5:",
+            "compose.example.yml:7: build:",
+            "compose.example.yml:8: unverifiable image line",
+        )
+
+
+class ComposeDiscovery(RepoCase):
+    def test_r90_any_yaml_with_top_level_services_is_a_compose_file(self):
+        files = self.clean_files()
+        files["stack/app.yaml"] = "services:\n  a:\n    image: postgres:17\n"
+        files["stack/other.yml"] = "x:\n  services:\n    image: postgres:17\n"
+        result = self.evaluate(files)
+        self.assertError(result, "app.yaml:3: postgres:17 must be")
+        self.assertFalse(any("other.yml" in e for e in result.errors), result.errors)
+
+    def test_r90_compose_include_and_extends_are_rejected(self):
+        files = self.clean_files()
+        files["compose.yml"] = (
+            f"include:\n  - other.yml\nservices:\n  a:\n    extends:\n      file: base.yml\n      service: b\n"
+            f"    image: postgres:17.2@sha256:{DIGEST}\n"
+        )
+        result = self.evaluate(files)
+        self.assertError(result, "compose.yml:1: include/extends", "compose.yml:5: include/extends")
+
+
+class WorkflowImages(RepoCase):
+    def workflow(self, body: str):
+        files = self.clean_files()
+        files[".github/workflows/x.yml"] = "jobs:\n  b:\n    steps:\n" + textwrap.indent(textwrap.dedent(body), "      ")
+        return self.evaluate(files)
+
+    def test_r90_buildkit_and_sbom_generator_images_are_dated(self):
+        result = self.workflow(
+            f"""\
+            # A comment that mentions Docker and curl runs nothing.
+            - uses: docker/setup-buildx-action@{SHA} # v4.4.1
+              with:
+                driver-opts: image=moby/buildkit:v0.34.1@sha256:{DIGEST}
+            - uses: docker/build-push-action@{SHA} # v7.4.0
+              with:
+                file: docker/Dockerfile.server
+                sbom: generator=docker/buildkit-syft-scanner:1.12.1@sha256:{DIGEST2}
+            - run: python3 tools/image-smoke.py vocab-server:ci
+            """
+        )
+        self.assertEqual(result.errors, [])
+        images = sorted(f.name for f in result.findings if f.kind == "image")
+        self.assertEqual(images, ["docker/buildkit-syft-scanner:1.12.1", "moby/buildkit:v0.34.1"])
+
+    def test_r90_unpinned_buildkit_or_generator_images_are_rejected(self):
+        result = self.workflow(
+            """\
+            - with:
+                driver-opts: image=moby/buildkit:latest
+                sbom: generator=docker/buildkit-syft-scanner:stable-1
+            - run: docker run --rm alpine true
+            """
+        )
+        self.assertError(result, "x.yml:5: image=/generator=", "x.yml:6: image=/generator=", "x.yml:7: install/download command 'docker'")
+
+
+class ImageDates(unittest.TestCase):
+    """image_published / debian_published against faked registries."""
+
+    def setUp(self):
+        dep_age._image_cache.clear()
+        self.saved = (dep_age.registry_get, dep_age.fetch_json)
+        self.addCleanup(self.restore)
+
+    def restore(self):
+        dep_age.registry_get, dep_age.fetch_json = self.saved
+
+    def serve(self, blobs: dict[str, object]):
+        import hashlib
+        import json
+
+        store = {}
+        for key, value in blobs.items():
+            body = value if isinstance(value, bytes) else json.dumps(value).encode()
+            store[key] = body
+
+        def fake(registry, repo, path, accept):
+            if path in store:
+                return store[path]
+            raise dep_age.LookupFailed(f"unexpected {path}")
+
+        dep_age.registry_get = fake
+        return lambda value: "sha256:" + hashlib.sha256(json.dumps(value).encode()).hexdigest()
+
+    def test_r90_image_split_follows_docker_hub_rules(self):
+        self.assertEqual(dep_age.split_image("rust"), ("registry-1.docker.io", "library/rust"))
+        self.assertEqual(dep_age.split_image("moby/buildkit"), ("registry-1.docker.io", "moby/buildkit"))
+        self.assertEqual(dep_age.split_image("gcr.io/distroless/static"), ("gcr.io", "distroless/static"))
+        self.assertEqual(dep_age.split_image("localhost:5000/x"), ("localhost:5000", "x"))
+
+    def test_r90_gcr_uses_the_upload_time(self):
+        digest = "sha256:" + DIGEST
+        listing = {"manifest": {digest: {"timeUploadedMs": "1761950220000", "timeCreatedMs": "0"}}}
+        self.serve({"tags/list": listing})
+        published = dep_age.image_published("gcr.io/distroless/static-debian13", digest)
+        self.assertEqual(published, dt.datetime.fromtimestamp(1761950220, dt.timezone.utc))
+        with self.assertRaises(dep_age.LookupFailed):
+            dep_age.image_published("gcr.io/distroless/static-debian13", "sha256:" + DIGEST2)
+
+    def test_r90_index_uses_the_newest_platform_config_and_skips_attestations(self):
+        configs = [{"created": "2026-10-01T00:00:00Z"}, {"created": "2026-10-06T04:00:00Z"}]
+        import hashlib
+        import json
+
+        def digest_of(value):
+            return "sha256:" + hashlib.sha256(json.dumps(value).encode()).hexdigest()
+
+        manifests = [{"config": {"digest": digest_of(c)}} for c in configs]
+        attestation = {"config": {"digest": "sha256:" + "c" * 64}}
+        index = {
+            "manifests": [
+                {"digest": digest_of(manifests[0]), "platform": {"os": "linux", "architecture": "amd64"}},
+                {"digest": digest_of(manifests[1]), "platform": {"os": "linux", "architecture": "arm64"}},
+                {"digest": digest_of(attestation), "platform": {"os": "unknown", "architecture": "unknown"}},
+            ]
+        }
+        blobs = {f"manifests/{digest_of(index)}": index}
+        for m, c in zip(manifests, configs):
+            blobs[f"manifests/{digest_of(m)}"] = m
+            blobs[f"blobs/{digest_of(c)}"] = c
+        self.serve(blobs)
+        published = dep_age.image_published("rust", digest_of(index))
+        self.assertEqual(published.isoformat(), "2026-10-06T04:00:00+00:00")
+
+    def test_r90_images_without_a_real_date_or_with_wrong_content_fail(self):
+        import hashlib
+        import json
+
+        def digest_of(value):
+            return "sha256:" + hashlib.sha256(json.dumps(value).encode()).hexdigest()
+
+        config = {"created": "1970-01-01T00:00:00Z"}
+        manifest = {"config": {"digest": digest_of(config)}}
+        self.serve({f"manifests/{digest_of(manifest)}": manifest, f"blobs/{digest_of(config)}": config})
+        with self.assertRaises(dep_age.LookupFailed):
+            dep_age.image_published("x/reproducible", digest_of(manifest))
+        # The registry answers with content that does not hash to the digest.
+        self.serve({f"manifests/sha256:{DIGEST}": manifest})
+        with self.assertRaises(dep_age.LookupFailed):
+            dep_age.image_published("x/tampered", f"sha256:{DIGEST}")
+
+    def test_r90_debian_date_is_the_first_amd64_appearance(self):
+        answer = {
+            "result": [
+                {"architecture": "arm64", "hash": "h1"},
+                {"architecture": "amd64", "hash": "h2"},
+            ],
+            "fileinfo": {
+                "h1": [{"archive_name": "debian", "first_seen": "20250101T000000Z"}],
+                "h2": [
+                    {"archive_name": "debian", "first_seen": "20260510T204219Z"},
+                    {"archive_name": "debian-ports", "first_seen": "20240101T000000Z"},
+                ],
+            },
+        }
+        dep_age.fetch_json = lambda url, **kw: answer
+        self.assertEqual(
+            dep_age.debian_published("musl-tools", "1.2.5-3.1~deb13u1").isoformat(), "2026-05-10T20:42:19+00:00"
+        )
+        dep_age.fetch_json = lambda url, **kw: {"result": [], "fileinfo": {}}
+        with self.assertRaises(dep_age.LookupFailed):
+            dep_age.debian_published("musl-tools", "9.9")
 
 
 if __name__ == "__main__":

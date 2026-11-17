@@ -196,8 +196,9 @@ class Rust(GuardCase):
 class Renovate(GuardCase):
     def test_r91_every_release_age_must_be_14_days(self):
         cfg = json.loads(json.dumps(RENOVATE_OK))
+        index = len(cfg["packageRules"])
         cfg["packageRules"].append({"matchPackageNames": ["*"], "minimumReleaseAge": "0 days"})
-        self.assertFlags(self.problems({}, cfg), "packageRules[3].minimumReleaseAge")
+        self.assertFlags(self.problems({}, cfg), f"packageRules[{index}].minimumReleaseAge")
 
     def test_r91_top_level_age_is_required_and_presets_are_reviewed(self):
         cfg = json.loads(json.dumps(RENOVATE_OK))
@@ -207,6 +208,27 @@ class Renovate(GuardCase):
 
     def test_r91_repository_config_passes(self):
         self.assertEqual(guard.check_renovate(REPO), [])
+
+
+
+class RustImages(GuardCase):
+    TOOLCHAIN = '[toolchain]\nchannel = "1.99.0"\n'
+
+    def test_r90_dockerfile_rust_image_matches_the_toolchain_file(self):
+        ok = self.problems(
+            {
+                "rust-toolchain.toml": self.TOOLCHAIN,
+                "docker/Dockerfile.server": "FROM rust:1.99.0-slim-trixie@sha256:" + "a" * 64 + " AS build\n",
+            }
+        )
+        self.assertEqual(ok, [])
+        bad = self.problems(
+            {
+                "rust-toolchain.toml": self.TOOLCHAIN,
+                "docker/Dockerfile.tts": "# x\nfrom --platform=linux/amd64 rust:1.98.0-slim AS b\n",
+            }
+        )
+        self.assertFlags(bad, "docker/Dockerfile.tts:2: rust:1.98.0 does not match")
 
 
 if __name__ == "__main__":

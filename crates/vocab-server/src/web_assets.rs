@@ -5,14 +5,15 @@
 //! hash of all embedded files, so they can be cached forever (`immutable`)
 //! and a new release never mixes old and new files. The shell itself is
 //! revalidated on every load.
+//!
+//! `http` mounts the two handlers at [`INDEX_PATH`] and [`ASSET_PATH`]; both
+//! are public, because the login screen is rendered from them.
 
 use std::sync::LazyLock;
 
-use axum::Router;
 use axum::extract::Path;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
 use include_dir::{Dir, include_dir};
 use sha2::{Digest, Sha256};
 
@@ -51,14 +52,13 @@ fn collect_files<'a>(dir: &'a Dir<'a>, out: &mut Vec<&'a include_dir::File<'a>>)
     }
 }
 
-/// Routes for the shell (`GET /`) and its assets.
-pub fn router() -> Router {
-    Router::new()
-        .route("/", get(index))
-        .route("/assets/{build}/{*path}", get(asset))
-}
+/// Path of the shell (`GET`).
+pub const INDEX_PATH: &str = "/";
+/// Path template of the assets (`GET`); `{build}` must be the current build id.
+pub const ASSET_PATH: &str = "/assets/{build}/{*path}";
 
-async fn index() -> Response {
+/// `GET /`: the shell. Public: the login screen is part of it.
+pub async fn index() -> Response {
     (
         [
             (
@@ -72,7 +72,8 @@ async fn index() -> Response {
         .into_response()
 }
 
-async fn asset(Path((build, path)): Path<(String, String)>) -> Response {
+/// `GET /assets/{build}/{*path}`: one embedded file.
+pub async fn asset(Path((build, path)): Path<(String, String)>) -> Response {
     let file = (build == *BUILD_ID)
         .then(|| {
             let (dir, rest) = path.split_once('/')?;

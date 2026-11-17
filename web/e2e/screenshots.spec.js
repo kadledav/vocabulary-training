@@ -53,5 +53,11 @@ for (const theme of /** @type {const} */ (['dark', 'light'])) {
     await page.goto(`${app.url}/#/settings`);
     await expect(page.getByLabel('New words per day')).toBeVisible();
     await shot('8-settings');
+    await page.getByTestId('logout').click();
+    await expect(page.getByLabel('Password')).toBeVisible();
+    await page.getByLabel('Password').fill('test-password-wrong');
+    await page.getByRole('button', { name: 'Log in' }).click();
+    await expect(page.getByTestId('login-status')).toHaveText('Wrong password. Try again.');
+    await shot('9-login');
   });
 }

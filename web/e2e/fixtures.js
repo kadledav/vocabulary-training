@@ -1,19 +1,45 @@
 // @ts-check
 /**
  * Shared e2e fixtures: a fresh server per test with the synthetic packs
- * imported, a stand-in for the Web Speech API that records what was
- * spoken, and a check that the page logged no errors (CSP violations
- * included).
+ * imported and the browser context logged in (R-82), a stand-in for the
+ * Web Speech API that records what was spoken, and a check that the page
+ * logged no errors (CSP violations included).
  */
 
 import { test as base, expect } from '@playwright/test';
 
 import { ARTICLE_PACK, BOOK_PACK } from './pack.js';
-import { startServer } from './server.js';
+import { PASSWORD, startServer } from './server.js';
+
+export { PASSWORD };
+
+/** Name of the session cookie (design §9.1). */
+export const SESSION_COOKIE = '__Host-vocab_session';
 
 /**
- * @typedef {{ url: string, dbPath: string, api: (method: string, path: string, body?: unknown) => Promise<any> }} App
+ * `url`: the app's HTTPS origin for the browser. `api`: a logged-in API
+ * call from the test itself (same session as the browser context).
+ *
+ * @typedef {{ url: string, dbPath: string, cookie: string, api: (method: string, path: string, body?: unknown) => Promise<any> }} App
  */
+
+/**
+ * Log in through the API; returns the session cookie's value.
+ *
+ * @param {string} serverUrl
+ * @param {string} origin
+ */
+async function loginByApi(serverUrl, origin) {
+  const response = await fetch(`${serverUrl}/api/auth/login`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', origin },
+    body: JSON.stringify({ password: PASSWORD }),
+  });
+  if (!response.ok) throw new Error(`login failed: ${response.status} ${await response.text()}`);
+  const header = response.headers.getSetCookie().find((c) => c.startsWith(`${SESSION_COOKIE}=`));
+  if (!header) throw new Error('login set no session cookie');
+  return header.slice(SESSION_COOKIE.length + 1).split(';')[0];
+}
 
 /** Records `speechSynthesis.speak` calls in `window.spoken` (R-41 fallback). */
 function installFakeSpeech() {
@@ -44,14 +70,23 @@ function installFakeSpeech() {
 
 export const test = base.extend(
   /** @type {import('@playwright/test').Fixtures<{ app: App, pageErrors: string[] }, {}, import('@playwright/test').PlaywrightTestArgs & import('@playwright/test').PlaywrightTestOptions>} */ ({
-    app: async ({}, use) => {
+    app: async ({ context }, use) => {
       const server = await startServer();
+      const cookie = await loginByApi(server.serverUrl, server.url);
+      await context.addCookies([
+        { name: SESSION_COOKIE, value: cookie, url: server.url, secure: true, httpOnly: true, sameSite: 'Strict' },
+      ]);
       /** @type {App['api']} */
       const api = async (method, path, body) => {
-        const response = await fetch(`${server.url}${path}`, {
+        const response = await fetch(`${server.serverUrl}${path}`, {
           method,
-          headers: body === undefined ? {} : { 'content-type': 'application/json' },
-          body: body === undefined ? undefined : JSON.stringify(body),
+          // As the page sends it: same origin, JSON (also for empty bodies).
+          headers: {
+            cookie: `${SESSION_COOKIE}=${cookie}`,
+            origin: server.url,
+            ...(method === 'GET' ? {} : { 'content-type': 'application/json' }),
+          },
+          body: method === 'GET' ? undefined : JSON.stringify(body ?? {}),
         });
         const text = await response.text();
         if (!response.ok) throw new Error(`${method} ${path}: ${response.status} ${text}`);
@@ -63,7 +98,7 @@ export const test = base.extend(
       }
       // Four new words per block: exactly the book's words in a book-scoped block.
       await api('PATCH', '/api/settings', { new_per_day: 4, block_size: 10 });
-      await use({ url: server.url, dbPath: server.dbPath, api });
+      await use({ url: server.url, dbPath: server.dbPath, cookie, api });
       await server.stop();
     },
     pageErrors: async ({ page }, use) => {

@@ -1,45 +1,65 @@
-//! Non-secret configuration (design §3.2, §12.1, R-85).
+//! Non-secret configuration from the environment (design §3.2, §12; R-85).
 //!
-//! Sources:
-//! * `config.json` at `$VOCAB_CONFIG` (default `/config/config.json`, mounted
-//!   read-only). Unknown keys are a startup error; every key except
-//!   `public_origin` has a default.
-//! * Directories from the environment: `$VOCAB_DATA_DIR` (default `/data`,
-//!   the SQLite file set) and `$VOCAB_CACHE_DIR` (default `/cache`, audio).
+//! | Variable | Default | |
+//! |---|---|---|
+//! | `VOCAB_PUBLIC_ORIGIN` | — (required) | origin the app is served from, e.g. `https://vocab.example.home` |
+//! | `VOCAB_TIMEZONE` | `Europe/Prague` | IANA time zone of the study day |
+//! | `VOCAB_DAY_ROLLOVER_HOUR` | `4` | local hour (0-23) a study day starts |
+//! | `VOCAB_LOG_LEVEL` | `info` | `error`, `warn`, `info`, `debug`, `trace` |
+//! | `VOCAB_LISTEN` | `0.0.0.0:8080` | listen address (development and tests) |
+//! | `VOCAB_DATA_DIR` | `/data` | the SQLite file set |
+//! | `VOCAB_CACHE_DIR` | `/cache` | audio files |
 //!
-//! Secrets (password hash, import token, TTS token) never live in this file;
-//! they come from the environment and are added with the modules that use
-//! them (M5 `auth`, M6 `audio`).
+//! Any other `VOCAB_*` variable (a typo, a removed setting) and any invalid
+//! value is a startup error naming the variable. Secrets
+//! (`VOCAB_PASSWORD_HASH_B64`, `VOCAB_IMPORT_TOKEN`) are read by `auth`.
 
+use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use serde::Deserialize;
-
+use crate::auth;
 use crate::clock::{ClockError, DayRule};
 
-const DEFAULT_CONFIG_PATH: &str = "/config/config.json";
 const DEFAULT_DATA_DIR: &str = "/data";
 const DEFAULT_CACHE_DIR: &str = "/cache";
+const DEFAULT_TIMEZONE: &str = "Europe/Prague";
+const DEFAULT_ROLLOVER_HOUR: u8 = 4;
+const DEFAULT_LISTEN: &str = "0.0.0.0:8080";
+/// Session lifetime (design §9.1).
+const SESSION_DAYS: u32 = 180;
+
+pub const PUBLIC_ORIGIN_ENV: &str = "VOCAB_PUBLIC_ORIGIN";
+const TIMEZONE_ENV: &str = "VOCAB_TIMEZONE";
+const ROLLOVER_ENV: &str = "VOCAB_DAY_ROLLOVER_HOUR";
+const LOG_LEVEL_ENV: &str = "VOCAB_LOG_LEVEL";
+const LISTEN_ENV: &str = "VOCAB_LISTEN";
+const DATA_DIR_ENV: &str = "VOCAB_DATA_DIR";
+const CACHE_DIR_ENV: &str = "VOCAB_CACHE_DIR";
+
+/// Every `VOCAB_*` variable the app reads (here or in `auth`).
+const KNOWN: [&str; 9] = [
+    PUBLIC_ORIGIN_ENV,
+    TIMEZONE_ENV,
+    ROLLOVER_ENV,
+    LOG_LEVEL_ENV,
+    LISTEN_ENV,
+    DATA_DIR_ENV,
+    CACHE_DIR_ENV,
+    auth::PASSWORD_HASH_ENV,
+    auth::IMPORT_TOKEN_ENV,
+];
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("cannot read config file {path}: {source}")]
-    Read {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    #[error("invalid config file {path}: {source}")]
-    Parse {
-        path: PathBuf,
-        source: serde_json::Error,
-    },
-    #[error("config file {path} not found; it must at least set \"public_origin\"")]
-    Missing { path: PathBuf },
-    #[error("invalid config value {key}: {message}")]
+    #[error("{0} is not set; it is required (e.g. https://vocab.example.home)")]
+    Missing(&'static str),
+    #[error("invalid {key}: {message}")]
     Invalid { key: &'static str, message: String },
-    #[error("invalid config value timezone/day_rollover_hour: {0}")]
+    #[error("unknown setting {0}: the app reads only {known}", known = KNOWN.join(", "))]
+    Unknown(String),
+    #[error("invalid {TIMEZONE_ENV}/{ROLLOVER_ENV}: {0}")]
     DayRule(#[from] ClockError),
 }
 
@@ -47,12 +67,12 @@ pub enum ConfigError {
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Exact origin the app is served from, e.g. `https://vocab.example.home`
-    /// (no path, no trailing slash). Used by the Origin check (§9.3).
+    /// (no path, no trailing slash, no default port). Used by the Origin
+    /// check (§9.3).
     pub public_origin: String,
-    /// Study-day definition built from `timezone` and `day_rollover_hour`.
+    /// Study-day definition built from the time zone and rollover hour.
     pub day_rule: DayRule,
     pub listen: SocketAddr,
-    pub tts_url: String,
     pub log_level: tracing::Level,
     pub session_days: u32,
     pub limits: Limits,
@@ -61,8 +81,7 @@ pub struct Config {
 
 /// Request limits (§9.4). The import routes have their own body limit and
 /// commit timeout; the connector and login limits arrive with M11/M5.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     /// Default maximum request body size in bytes.
     pub body_bytes: usize,
@@ -119,132 +138,81 @@ pub struct Paths {
     pub cache_dir: PathBuf,
 }
 
-/// The JSON file as written by the owner.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FileConfig {
-    public_origin: Option<String>,
-    #[serde(default = "default_timezone")]
-    timezone: String,
-    #[serde(default = "default_rollover")]
-    day_rollover_hour: u8,
-    #[serde(default = "default_listen")]
-    listen: String,
-    #[serde(default = "default_tts_url")]
-    tts_url: String,
-    #[serde(default = "default_log_level")]
-    log_level: String,
-    #[serde(default = "default_session_days")]
-    session_days: u32,
-    #[serde(default)]
-    limits: Limits,
-}
-
-fn default_timezone() -> String {
-    "Europe/Prague".to_owned()
-}
-fn default_rollover() -> u8 {
-    4
-}
-fn default_listen() -> String {
-    "0.0.0.0:8080".to_owned()
-}
-fn default_tts_url() -> String {
-    "http://vocabulary-tts:8090".to_owned()
-}
-fn default_log_level() -> String {
-    "info".to_owned()
-}
-fn default_session_days() -> u32 {
-    180
-}
-
 impl Config {
-    /// Load the configuration from the process environment and the config file.
+    /// Load the configuration from the process environment.
     pub fn load() -> Result<Self, ConfigError> {
-        Self::load_with(|key| std::env::var_os(key).map(PathBuf::from))
+        let names: Vec<OsString> = std::env::vars_os().map(|(name, _)| name).collect();
+        Self::from_env(&names, |key| std::env::var_os(key))
     }
 
-    fn load_with(env: impl Fn(&str) -> Option<PathBuf>) -> Result<Self, ConfigError> {
-        let path = env("VOCAB_CONFIG").unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH));
-        let paths = Paths {
-            data_dir: env("VOCAB_DATA_DIR").unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIR)),
-            cache_dir: env("VOCAB_CACHE_DIR").unwrap_or_else(|| PathBuf::from(DEFAULT_CACHE_DIR)),
-        };
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Err(ConfigError::Missing { path });
+    fn from_env(
+        names: &[OsString],
+        env: impl Fn(&str) -> Option<OsString>,
+    ) -> Result<Self, ConfigError> {
+        for name in names {
+            let name = name.to_string_lossy();
+            if name.starts_with("VOCAB_") && !KNOWN.contains(&name.as_ref()) {
+                return Err(ConfigError::Unknown(name.into_owned()));
             }
-            Err(source) => return Err(ConfigError::Read { path, source }),
+        }
+        let text = |key: &'static str| -> Result<Option<String>, ConfigError> {
+            match env(key) {
+                None => Ok(None),
+                Some(value) => value
+                    .into_string()
+                    .map(Some)
+                    .map_err(|_| invalid(key, "is not valid UTF-8")),
+            }
         };
-        Self::from_json(&text, paths).map_err(|err| match err {
-            ParseError::Json(source) => ConfigError::Parse { path, source },
-            ParseError::Config(err) => err,
-        })
-    }
-
-    fn from_json(text: &str, paths: Paths) -> Result<Self, ParseError> {
-        let file: FileConfig = serde_json::from_str(text).map_err(ParseError::Json)?;
-        let public_origin = file
-            .public_origin
-            .ok_or_else(|| invalid("public_origin", "missing (required)"))?;
+        let public_origin = text(PUBLIC_ORIGIN_ENV)?
+            .filter(|v| !v.is_empty())
+            .ok_or(ConfigError::Missing(PUBLIC_ORIGIN_ENV))?;
         validate_origin(&public_origin)?;
-        let day_rule = DayRule::new(&file.timezone, file.day_rollover_hour)?;
-        let listen = file
-            .listen
+        let timezone = text(TIMEZONE_ENV)?.unwrap_or_else(|| DEFAULT_TIMEZONE.to_owned());
+        let rollover = match text(ROLLOVER_ENV)? {
+            None => DEFAULT_ROLLOVER_HOUR,
+            Some(v) => v
+                .parse::<u8>()
+                .ok()
+                .filter(|h| *h <= 23)
+                .ok_or_else(|| invalid(ROLLOVER_ENV, "must be a whole hour 0-23"))?,
+        };
+        let day_rule = DayRule::new(&timezone, rollover)?;
+        let log_level = match text(LOG_LEVEL_ENV)? {
+            None => tracing::Level::INFO,
+            Some(v) => v.parse().map_err(|_| {
+                invalid(
+                    LOG_LEVEL_ENV,
+                    "must be one of error, warn, info, debug, trace",
+                )
+            })?,
+        };
+        let listen = text(LISTEN_ENV)?
+            .unwrap_or_else(|| DEFAULT_LISTEN.to_owned())
             .parse()
-            .map_err(|_| invalid("listen", "must be an IP:port address such as 0.0.0.0:8080"))?;
-        let log_level = file.log_level.parse().map_err(|_| {
-            invalid(
-                "log_level",
-                "must be one of error, warn, info, debug, trace",
-            )
-        })?;
-        if !(file.tts_url.starts_with("http://") || file.tts_url.starts_with("https://")) {
-            return Err(invalid("tts_url", "must be an http(s) URL").into());
-        }
-        if file.session_days == 0 {
-            return Err(invalid("session_days", "must be at least 1").into());
-        }
-        let limits = file.limits;
-        if limits.body_bytes == 0
-            || limits.request_timeout_secs == 0
-            || limits.max_concurrent_requests == 0
-            || limits.header_read_timeout_secs == 0
-            || limits.max_connections == 0
-            || limits.import_body_bytes == 0
-            || limits.import_commit_timeout_secs == 0
-        {
-            return Err(invalid("limits", "every limit must be greater than zero").into());
-        }
+            .map_err(|_| {
+                invalid(
+                    LISTEN_ENV,
+                    "must be an IP:port address such as 0.0.0.0:8080",
+                )
+            })?;
+        let dir = |key: &'static str, default: &str| -> Result<PathBuf, ConfigError> {
+            Ok(text(key)?
+                .filter(|v| !v.is_empty())
+                .map_or_else(|| PathBuf::from(default), PathBuf::from))
+        };
         Ok(Self {
             public_origin,
             day_rule,
             listen,
-            tts_url: file.tts_url,
             log_level,
-            session_days: file.session_days,
-            limits,
-            paths,
+            session_days: SESSION_DAYS,
+            limits: Limits::default(),
+            paths: Paths {
+                data_dir: dir(DATA_DIR_ENV, DEFAULT_DATA_DIR)?,
+                cache_dir: dir(CACHE_DIR_ENV, DEFAULT_CACHE_DIR)?,
+            },
         })
-    }
-}
-
-enum ParseError {
-    Json(serde_json::Error),
-    Config(ConfigError),
-}
-
-impl From<ConfigError> for ParseError {
-    fn from(err: ConfigError) -> Self {
-        Self::Config(err)
-    }
-}
-
-impl From<ClockError> for ParseError {
-    fn from(err: ClockError) -> Self {
-        Self::Config(err.into())
     }
 }
 
@@ -256,26 +224,44 @@ fn invalid(key: &'static str, message: &str) -> ConfigError {
 }
 
 /// An origin as browsers send it in the `Origin` header: lowercase
-/// `scheme://host[:port]`, nothing else.
+/// `scheme://host[:port]`, nothing else. A default port (`:443` for https,
+/// `:80` for http) is refused: browsers never send it, so the Origin check
+/// could never match.
 fn validate_origin(origin: &str) -> Result<(), ConfigError> {
-    let rest = origin
-        .strip_prefix("https://")
-        .or_else(|| origin.strip_prefix("http://"))
-        .ok_or_else(|| invalid("public_origin", "must start with https:// or http://"))?;
+    let (rest, default_port) = if let Some(rest) = origin.strip_prefix("https://") {
+        (rest, "443")
+    } else if let Some(rest) = origin.strip_prefix("http://") {
+        (rest, "80")
+    } else {
+        return Err(invalid(
+            PUBLIC_ORIGIN_ENV,
+            "must start with https:// or http://",
+        ));
+    };
     let (host, port) = match rest.rsplit_once(':') {
         Some((host, port)) => (host, Some(port)),
         None => (rest, None),
     };
+    if port == Some(default_port) {
+        return Err(invalid(
+            PUBLIC_ORIGIN_ENV,
+            &format!("leave out the default port :{default_port}"),
+        ));
+    }
     let host_ok = !host.is_empty()
         && host
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-');
-    let port_ok = port.is_none_or(|p| p.parse::<u16>().is_ok_and(|n| n > 0));
+    let port_ok = port.is_none_or(|p| {
+        !p.starts_with('0')
+            && p.bytes().all(|b| b.is_ascii_digit())
+            && p.parse::<u16>().is_ok_and(|n| n > 0)
+    });
     if host_ok && port_ok {
         Ok(())
     } else {
         Err(invalid(
-            "public_origin",
+            PUBLIC_ORIGIN_ENV,
             "must be scheme://host[:port] in lowercase, without path or trailing slash",
         ))
     }
@@ -285,124 +271,110 @@ fn validate_origin(origin: &str) -> Result<(), ConfigError> {
 mod tests {
     use super::*;
 
-    fn paths() -> Paths {
-        Paths {
-            data_dir: PathBuf::from("/data"),
-            cache_dir: PathBuf::from("/cache"),
-        }
+    fn load(vars: &[(&str, &str)]) -> Result<Config, String> {
+        let names: Vec<OsString> = vars.iter().map(|(k, _)| OsString::from(k)).collect();
+        Config::from_env(&names, |key| {
+            vars.iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| OsString::from(v))
+        })
+        .map_err(|err| err.to_string())
     }
 
-    fn parse(text: &str) -> Result<Config, String> {
-        Config::from_json(text, paths()).map_err(|err| match err {
-            ParseError::Json(e) => format!("json: {e}"),
-            ParseError::Config(e) => format!("config: {e}"),
-        })
-    }
+    const ORIGIN: (&str, &str) = (PUBLIC_ORIGIN_ENV, "https://vocab.example.home");
 
     #[test]
-    fn r85_minimal_config_gets_documented_defaults() {
-        let config = parse(r#"{"public_origin": "https://vocab.example.home"}"#).expect("valid");
+    fn r85_only_the_origin_is_required_and_the_rest_has_documented_defaults() {
+        let config = load(&[ORIGIN]).expect("valid");
         assert_eq!(config.public_origin, "https://vocab.example.home");
         assert_eq!(config.listen, "0.0.0.0:8080".parse().expect("addr"));
         assert_eq!(config.day_rule.time_zone_name(), Some("Europe/Prague"));
-        assert_eq!(config.tts_url, "http://vocabulary-tts:8090");
         assert_eq!(config.log_level, tracing::Level::INFO);
         assert_eq!(config.session_days, 180);
         assert_eq!(config.limits, Limits::default());
         assert_eq!(config.limits.body_bytes, 64 * 1024);
         assert_eq!(config.limits.import_body_bytes, 5 * 1024 * 1024);
-        assert_eq!(config.limits.import_commit_timeout_secs, 120);
-        assert_eq!(config.paths, paths());
+        assert_eq!(config.paths.data_dir, PathBuf::from("/data"));
+        assert_eq!(config.paths.cache_dir, PathBuf::from("/cache"));
+        let err = load(&[]).expect_err("missing");
+        assert!(err.contains("VOCAB_PUBLIC_ORIGIN is not set"), "{err}");
+        let err = load(&[(PUBLIC_ORIGIN_ENV, "")]).expect_err("empty");
+        assert!(err.contains("VOCAB_PUBLIC_ORIGIN is not set"), "{err}");
     }
 
     #[test]
-    fn r85_design_example_config_is_accepted() {
-        let config = parse(
-            r#"{
-              "public_origin": "https://vocab.example.home",
-              "timezone": "Europe/Prague",
-              "day_rollover_hour": 4,
-              "tts_url": "http://vocabulary-tts:8090",
-              "log_level": "info"
-            }"#,
-        );
-        assert!(config.is_ok(), "{config:?}");
+    fn r85_every_setting_comes_from_its_variable() {
+        let config = load(&[
+            ORIGIN,
+            (TIMEZONE_ENV, "Europe/London"),
+            (ROLLOVER_ENV, "0"),
+            (LOG_LEVEL_ENV, "warn"),
+            (LISTEN_ENV, "127.0.0.1:9000"),
+            (DATA_DIR_ENV, "/srv/data"),
+            (CACHE_DIR_ENV, "/srv/cache"),
+            (auth::PASSWORD_HASH_ENV, "x"),
+            (auth::IMPORT_TOKEN_ENV, "y"),
+            ("PATH", "/usr/bin"),
+        ])
+        .expect("valid");
+        assert_eq!(config.day_rule.time_zone_name(), Some("Europe/London"));
+        assert_eq!(config.log_level, tracing::Level::WARN);
+        assert_eq!(config.listen, "127.0.0.1:9000".parse().expect("addr"));
+        assert_eq!(config.paths.data_dir, PathBuf::from("/srv/data"));
+        assert_eq!(config.paths.cache_dir, PathBuf::from("/srv/cache"));
     }
 
     #[test]
-    fn r85_unknown_keys_are_a_startup_error() {
-        let err = parse(r#"{"public_origin": "https://a.example", "password": "x"}"#)
-            .expect_err("unknown key");
-        assert!(err.contains("unknown field"), "{err}");
-        let err = parse(r#"{"public_origin": "https://a.example", "limits": {"body": 1}}"#)
-            .expect_err("unknown key");
-        assert!(err.contains("unknown field"), "{err}");
+    fn r85_invalid_values_and_unknown_variables_name_the_variable() {
+        for (var, value) in [
+            (TIMEZONE_ENV, "Nowhere/City"),
+            (ROLLOVER_ENV, "24"),
+            (ROLLOVER_ENV, "four"),
+            (LOG_LEVEL_ENV, "loud"),
+            (LISTEN_ENV, "8080"),
+        ] {
+            let err = load(&[ORIGIN, (var, value)]).expect_err(value);
+            assert!(err.contains(var), "{var}={value}: {err}");
+        }
+        for unknown in ["VOCAB_CONFIG", "VOCAB_TIMEZON", "VOCAB_TTS_URL"] {
+            let err = load(&[ORIGIN, (unknown, "x")]).expect_err(unknown);
+            assert!(err.contains(&format!("unknown setting {unknown}")), "{err}");
+        }
     }
 
     #[test]
-    fn r85_public_origin_is_required_and_must_be_an_origin() {
-        assert!(parse("{}").expect_err("missing").contains("public_origin"));
+    fn r85_public_origin_must_be_exactly_what_browsers_send() {
         for bad in [
             "vocab.example.home",
             "https://vocab.example.home/",
             "https://vocab.example.home/app",
             "https://Vocab.example.home",
             "https://vocab.example.home:0",
+            "https://vocab.example.home:099",
             "https://vocab.example.home:99999",
+            "https://vocab.example.home:+8443",
             "https://user@vocab.example.home",
             "ftp://vocab.example.home",
+            // Default ports: browsers leave them out of the Origin header.
+            "https://vocab.example.home:443",
+            "http://localhost:80",
         ] {
-            let json = format!(r#"{{"public_origin": "{bad}"}}"#);
-            assert!(parse(&json).is_err(), "{bad} should be rejected");
+            assert!(
+                load(&[(PUBLIC_ORIGIN_ENV, bad)]).is_err(),
+                "{bad} should be rejected"
+            );
         }
         for good in [
             "https://vocab.example.home",
+            "https://vocab.example.home:8443",
             "http://localhost:8080",
             "http://127.0.0.1:8080",
+            "http://vocab.example.home:443",
         ] {
-            let json = format!(r#"{{"public_origin": "{good}"}}"#);
-            assert!(parse(&json).is_ok(), "{good} should be accepted");
+            assert!(
+                load(&[(PUBLIC_ORIGIN_ENV, good)]).is_ok(),
+                "{good} should be accepted"
+            );
         }
-    }
-
-    #[test]
-    fn r85_invalid_values_are_rejected() {
-        for bad in [
-            r#""timezone": "Nowhere/City""#,
-            r#""day_rollover_hour": 24"#,
-            r#""listen": "8080""#,
-            r#""log_level": "loud""#,
-            r#""tts_url": "vocabulary-tts:8090""#,
-            r#""session_days": 0"#,
-            r#""limits": {"body_bytes": 0}"#,
-            r#""limits": {"header_read_timeout_secs": 0}"#,
-            r#""limits": {"max_connections": 0}"#,
-            r#""limits": {"import_body_bytes": 0}"#,
-            r#""limits": {"import_commit_timeout_secs": 0}"#,
-        ] {
-            let json = format!(r#"{{"public_origin": "https://a.example", {bad}}}"#);
-            assert!(parse(&json).is_err(), "{bad} should be rejected");
-        }
-    }
-
-    #[test]
-    fn r85_paths_and_config_file_come_from_the_environment() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let file = dir.path().join("config.json");
-        std::fs::write(&file, r#"{"public_origin": "http://localhost:8080"}"#).expect("write");
-        let env = |key: &str| match key {
-            "VOCAB_CONFIG" => Some(file.clone()),
-            "VOCAB_DATA_DIR" => Some(dir.path().join("data")),
-            _ => None,
-        };
-        let config = Config::load_with(env).expect("loads");
-        assert_eq!(config.paths.data_dir, dir.path().join("data"));
-        assert_eq!(config.paths.cache_dir, PathBuf::from("/cache"));
-
-        let missing = |key: &str| (key == "VOCAB_CONFIG").then(|| dir.path().join("nope.json"));
-        assert!(matches!(
-            Config::load_with(missing),
-            Err(ConfigError::Missing { .. })
-        ));
     }
 }

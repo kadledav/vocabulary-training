@@ -1,45 +1,112 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["config:recommended", "helpers:pinGitHubActionDigests", "docker:pinDigests"],
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigests",
+    "docker:pinDigests"
+  ],
   "minimumReleaseAge": "14 days",
   "internalChecksFilter": "strict",
   "prCreation": "not-pending",
   "rangeStrategy": "pin",
-  "vulnerabilityAlerts": { "enabled": true, "minimumReleaseAge": "14 days" },
-  "lockFileMaintenance": { "enabled": true, "schedule": ["before 6am on the first day of the month"] },
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "minimumReleaseAge": "14 days"
+  },
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": [
+      "before 6am on the first day of the month"
+    ]
+  },
   "packageRules": [
-    { "matchManagers": ["cargo"], "rangeStrategy": "bump" },
-    { "matchUpdateTypes": ["major"], "dependencyDashboardApproval": true },
-    { "matchPackageNames": ["fsrs"], "dependencyDashboardApproval": true }
+    {
+      "matchManagers": [
+        "cargo"
+      ],
+      "rangeStrategy": "bump"
+    },
+    {
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "dependencyDashboardApproval": true
+    },
+    {
+      "matchPackageNames": [
+        "fsrs"
+      ],
+      "dependencyDashboardApproval": true
+    },
+    {
+      "matchDatasources": [
+        "docker"
+      ],
+      "minimumReleaseAge": "14 days",
+      "pinDigests": true
+    },
+    {
+      "matchPackageNames": [
+        "ghcr.io/kadledav/vocabulary-training",
+        "ghcr.io/kadledav/vocabulary-training-tts"
+      ],
+      "enabled": false
+    }
   ],
   "customManagers": [
     {
       "customType": "regex",
-      "managerFilePatterns": ["/^rust-toolchain\\.toml$/"],
-      "matchStrings": ["channel = \"(?<currentValue>[0-9.]+)\""],
+      "managerFilePatterns": [
+        "/^rust-toolchain\\.toml$/"
+      ],
+      "matchStrings": [
+        "channel = \"(?<currentValue>[0-9.]+)\""
+      ],
       "datasourceTemplate": "github-releases",
       "depNameTemplate": "rust-lang/rust"
     },
     {
       "customType": "regex",
-      "managerFilePatterns": ["/^\\.github/workflows/.+\\.ya?ml$/"],
-      "matchStrings": ["node-version: (?<currentValue>[0-9.]+)"],
+      "managerFilePatterns": [
+        "/^\\.github/workflows/.+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "node-version: (?<currentValue>[0-9.]+)"
+      ],
       "datasourceTemplate": "node-version",
       "depNameTemplate": "node"
     },
     {
       "customType": "regex",
-      "managerFilePatterns": ["/^\\.github/workflows/.+\\.ya?ml$/"],
-      "matchStrings": ["cargo install --locked (?<depName>[a-z0-9_-]+) --version (?<currentValue>[0-9.]+)"],
+      "managerFilePatterns": [
+        "/^\\.github/workflows/.+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "cargo install --locked (?<depName>[a-z0-9_-]+) --version (?<currentValue>[0-9.]+)"
+      ],
       "datasourceTemplate": "crate"
     },
     {
       "customType": "regex",
-      "managerFilePatterns": ["/^docker/Dockerfile\\.tts$/"],
-      "matchStrings": ["ARG SHERPA_ONNX_VERSION=(?<currentValue>[0-9.]+)"],
+      "managerFilePatterns": [
+        "/^docker/Dockerfile\\.tts$/"
+      ],
+      "matchStrings": [
+        "ARG SHERPA_ONNX_VERSION=(?<currentValue>[0-9.]+)"
+      ],
       "datasourceTemplate": "github-releases",
       "depNameTemplate": "k2-fsa/sherpa-onnx",
       "extractVersionTemplate": "^v(?<version>.+)$"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/.+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "(?:image|generator)=(?<depName>[a-z0-9./_-]+):(?<currentValue>[A-Za-z0-9_.-]+)@(?<currentDigest>sha256:[0-9a-f]{64})"
+      ],
+      "datasourceTemplate": "docker"
     }
   ]
 }

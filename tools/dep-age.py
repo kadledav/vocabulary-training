@@ -12,7 +12,27 @@ complete, and on anything it cannot verify (fail closed):
                         tarball URL must be registry.npmjs.org and name the
                         same package and version; `integrity` is required -> npm `time` map
 * rust-toolchain.toml   the pinned Rust release                      -> static.rust-lang.org
-* every file under .github/ (and local actions it references), line by line:
+* Dockerfiles (`Dockerfile*`, `*.dockerfile`, `Containerfile`):
+    - every `FROM` / `COPY --from` image must be `name:tag@sha256:<digest>`
+      (or an earlier stage, or `scratch`)                            -> registry
+    - `apt-get install` only with exact `package=version` pins       -> snapshot.debian.org
+      and, for a real install, a preceding dry-run proof
+      `test "$(apt-get install -s <same pins> | grep -c '^Inst ')" = N`;
+      apt sources only `https://snapshot.debian.org/archive/…/<timestamp>`
+      (required when apt installs anything; the timestamp is dated)
+    - `# syntax=` directives and `RUN --mount=…,from=` images like `FROM`;
+      heredocs, `BUILDKIT_*` arguments and `ONBUILD` are errors
+    - other install/download commands only in these forms: `apt-get update`,
+      `rustup target add <target>`; `ADD <url>`, other URLs and downloads
+      (curl, wget, pip, …) are errors
+* everywhere: `cargo update|generate-lockfile|add` are errors, and cargo
+  commands that resolve dependencies must use `--locked`
+* compose files (`compose*.yml`, `docker-compose*.yml`, any YAML file with
+  top-level `services:`; `include:`/`extends:` are errors): every `image:` must be
+  `name:tag@sha256:<digest>`                                         -> registry
+  (the project's own images, built from this repo, are exempt: OWN_IMAGES)
+* every file under .github/ (and local actions it references), line by line
+  (comments stripped per physical line, folded blocks split as YAML does):
     - every `uses` must be exactly `uses: owner/repo[/path]@<40-hex SHA> # vX.Y.Z`
       (tag must point to the SHA; age = later of release date and commit date)
       or `uses: ./local/path` (whose files are scanned the same way);
@@ -26,9 +46,16 @@ complete, and on anything it cannot verify (fail closed):
                                           lock file; --no-install never fetches another
                                           version; no --with-deps, i.e. no OS packages)
       anything else (pip, npx, yarn, curl, docker, `| sh`, …) is an error;
-    - container images, YAML escape sequences and explicit `? key` entries are errors.
+    - `name:tag@sha256:<digest>` image references (e.g. the BuildKit image in
+      `driver-opts: image=…`, the SBOM generator in `sbom: generator=…`) are
+      dated; `image=` / `generator=` without a digest are errors -> registry
+    - container/services keys, YAML escape sequences and explicit `? key` entries are errors.
 * dependency manifests the gate cannot check (requirements.txt, yarn.lock,
-  go.mod, Dockerfile, compose files, …) are errors until support is added.
+  go.mod, …) are errors until support is added.
+
+Image dates: gcr.io's upload time of the digest; elsewhere the newest
+`created` time of the image configs behind the digest (images without a real
+creation time, e.g. reproducible builds dated 1970, cannot be dated: error).
 
 Standard library only. Set GITHUB_TOKEN to raise the GitHub API rate limit
 (CI does this automatically). Self-tests: tools/tests/test_dep_age.py.
@@ -55,6 +82,9 @@ CRATES_IO = "registry+https://github.com/rust-lang/crates.io-index"
 NPM_REGISTRY = "https://registry.npmjs.org/"
 SKIP_DIRS = {".git", "node_modules", "target", ".idea", "dev-data"}
 SEMVER = r"\d+\.\d+\.\d+"
+# Images built from this repository (not third-party dependencies): compose
+# files may reference them with any tag/digest, e.g. a placeholder.
+OWN_IMAGES = {"ghcr.io/kadledav/vocabulary-training", "ghcr.io/kadledav/vocabulary-training-tts"}
 
 
 class LookupFailed(Exception):
@@ -335,7 +365,7 @@ ALLOWED_COMMANDS = [
     re.compile(rf"\bnpx --no-install playwright install(?: (?:chromium|webkit|firefox))+{END}"),
 ]
 COMMAND_TOKENS = re.compile(
-    r"\bcargo\s+(?:install|binstall|\+)|\bcargo-binstall\b|\brustup\b"
+    r"\bcargo\s+(?:install|binstall|update|generate-lockfile|add|\+)\b|\bcargo\s+\+|\bcargo-binstall\b|\brustup\b"
     r"|\bnpm\b|\bnpx\b|\bpnpm\b|\byarn\b|\bbunx?\b|\bdeno\b|\bcorepack\b|\bnvm\b|\bvolta\b"
     r"|\bpip[0-9.]*\b|\bpipx\b|\buv\b|\buvx\b|\bpoetry\b|\bconda\b|\beasy_install\b|\bensurepip\b"
     r"|\bgem\b|\bbundler?\b|\bgo\s+(?:install|get|run)\b|\bapt(?:-get)?\b|\bdpkg\b|\brpm\b|\byum\b|\bdnf\b|\bapk\b"
@@ -360,15 +390,38 @@ OTHER_FORBIDDEN = [
 ]
 
 
+def command_tokens(text: str):
+    """Install/download tokens in `text`; a token directly followed by `/` is
+    a path segment (`docker/Dockerfile`, `/var/lib/apt/lists`), not a command."""
+    for m in COMMAND_TOKENS.finditer(text):
+        if not text[m.end():].startswith("/"):
+            yield m
+
+
 def indent_of(line: str) -> int:
     return len(line) - len(line.lstrip(" "))
+
+
+def strip_comment(line: str) -> str:
+    """`line` without a trailing `# comment`. Only lines without any quote
+    or backtick are stripped: there a `#` after whitespace starts a comment
+    for YAML and for the shell, or lies inside a string opened on an earlier
+    line, which is not executed either. Lines with quotes stay whole (more
+    text is checked, never less)."""
+    if any(q in line for q in "\"'`"):
+        return line
+    m = re.search(r"(^|\s)#", line)
+    return line[: m.start()] if m else line
 
 
 def logical_commands(lines: list[str]) -> list[tuple[int, str]]:
     """Join the physical lines of one YAML value into the logical command the
     shell sees, so a continuation line cannot hide flags from the allow-list:
 
-    * folded block scalars (`key: >`) are joined into one command per paragraph;
+    * comments are stripped per physical line (see `strip_comment`);
+    * folded block scalars (`key: >`) are joined into one command per
+      paragraph; a more-indented line keeps its line breaks (YAML folding
+      rules), so it is a command of its own and ends the paragraph;
     * literal block scalars (`key: |`) give one command per line;
     * a plain scalar continued on more-indented lines is joined into one.
 
@@ -379,7 +432,7 @@ def logical_commands(lines: list[str]) -> list[tuple[int, str]]:
         line = lines[i]
         block = BLOCK_SCALAR.match(line)
         if block:
-            out.append((i + 1, line))
+            out.append((i + 1, strip_comment(line)))
             owner = indent_of(line)
             body: list[tuple[int, str]] = []
             j = i + 1
@@ -387,19 +440,29 @@ def logical_commands(lines: list[str]) -> list[tuple[int, str]]:
                 body.append((j + 1, lines[j]))
                 j += 1
             if block.group("style") == "|":
-                out.extend((n, text) for n, text in body if text.strip())
+                out.extend((n, strip_comment(text)) for n, text in body if strip_comment(text).strip())
             else:
+                base = min((indent_of(t) for _, t in body if t.strip()), default=0)
                 paragraph: list[tuple[int, str]] = []
-                for n, text in body + [(0, "")]:
-                    if text.strip():
-                        paragraph.append((n, text.strip()))
-                    elif paragraph:
+
+                def flush() -> None:
+                    if paragraph:
                         out.append((paragraph[0][0], " ".join(t for _, t in paragraph)))
-                        paragraph = []
+                        paragraph.clear()
+
+                for n, text in body:
+                    if not text.strip():
+                        flush()
+                    elif indent_of(text) > base:
+                        flush()
+                        out.append((n, strip_comment(text).strip()))
+                    else:
+                        paragraph.append((n, strip_comment(text).strip()))
+                flush()
             i = j
             continue
         key = KEY_START.match(line)
-        joined = line
+        joined = strip_comment(line)
         j = i + 1
         if key and line[key.end():].strip() and not line.strip().endswith(":"):
             column = line.index(key.group("key"))
@@ -411,15 +474,41 @@ def logical_commands(lines: list[str]) -> list[tuple[int, str]]:
                 and not KEY_START.match(lines[j])
                 and not lines[j].lstrip().startswith("- ")
             ):
-                joined += " " + lines[j].strip()
+                joined += " " + strip_comment(lines[j]).strip()
                 j += 1
         out.append((i + 1, joined))
         i = j
     return out
 
 
+CARGO_RESOLVING = re.compile(r"\bcargo\s+(?:\+\S+\s+)?(build|test|run|check|clippy|fetch|doc|bench|tree|deny)\b")
+
+
+def unlocked_cargo(text: str) -> list[str]:
+    """cargo subcommands that resolve dependencies but lack `--locked`
+    (without it cargo may rewrite Cargo.lock with newer releases). Only
+    commands are looked at: a segment that starts with cargo (after `run:`,
+    a list dash or `VAR=value` assignments), not names or other values."""
+    found = []
+    for segment in re.split(r"&&|\|\||;|\||\$\(|`", text):
+        words = segment.strip()
+        words = re.sub(r"^(?:-\s+)+", "", words)
+        key = re.match(r"^[\"']?([\w-]+)[\"']?\s*:(\s|$)", words)
+        if key:
+            if key.group(1) != "run":
+                continue
+            words = words[key.end():].strip()
+        words = re.sub(r"^(?:(?:[A-Za-z_][A-Za-z0-9_]*=\S*|env|time|nice|command|exec|then|do|else|!)\s+)+", "", words)
+        m = CARGO_RESOLVING.match(words)
+        if m and not re.search(r"(^|\s)(--locked|--version|-V)(\s|$)", words):
+            found.append(m.group(1))
+    return found
+
+
 def check_commands(lineno: int, text: str, path: Path, result: Result) -> None:
     where = f"{path}:{lineno}"
+    for sub in unlocked_cargo(text):
+        result.errors.append(f"{where}: cargo {sub} must use --locked")
     allowed_spans: list[tuple[int, int]] = []
     for pattern in ALLOWED_COMMANDS:
         for m in pattern.finditer(text):
@@ -427,7 +516,7 @@ def check_commands(lineno: int, text: str, path: Path, result: Result) -> None:
             if "crate" in pattern.groupindex:
                 crate, version = m.group("crate"), m.group("version")
                 result.add("tool", crate, version, lambda c=crate, v=version: crate_published(c, v), where)
-    for m in COMMAND_TOKENS.finditer(text):
+    for m in command_tokens(text):
         if not any(start <= m.start() < end for start, end in allowed_spans):
             result.errors.append(f"{where}: install/download command {m.group(0)!r} is not an allowed verified form")
 
@@ -441,6 +530,8 @@ def scan_github_file(path: Path, root: Path, result: Result, queue: list[Path]) 
         return
     lines = text.splitlines()
     for lineno, logical in logical_commands(lines):
+        if USES_LINE.match(logical):
+            continue  # verified below; action names like docker/… are not commands
         check_commands(lineno, logical, path, result)
     for lineno, line in enumerate(lines, 1):
         where = f"{path}:{lineno}"
@@ -468,6 +559,12 @@ def scan_github_file(path: Path, root: Path, result: Result, queue: list[Path]) 
             if pattern.search(line):
                 result.errors.append(f"{where}: {why}")
 
+        images = list(IMAGE_REF.finditer(line))
+        for m in images:
+            add_image(result, m.group("name"), m.group("tag"), m.group("digest"), where)
+        if re.search(r"\b(image|generator)\s*=", line) and len(images) != len(re.findall(r"\b(?:image|generator)\s*=", line)):
+            result.errors.append(f"{where}: image=/generator= must be name:tag@sha256:<digest>")
+
 
 def check_uses(target: str, tag: str | None, where: str, root: Path, result: Result, queue: list[Path]) -> None:
     if target.startswith("./"):
@@ -493,6 +590,393 @@ def check_uses(target: str, tag: str | None, where: str, root: Path, result: Res
     result.add("action", target.split("@")[0], tag, lambda: action_published(repo, sha, tag), where)
 
 
+# ── container images and Debian packages ────────────────────────────────────
+
+IMAGE_REF = re.compile(
+    r"(?P<name>(?:[a-z0-9.-]+(?::[0-9]+)?/)?[a-z0-9._-]+(?:/[a-z0-9._-]+)*)"
+    r":(?P<tag>[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})@sha256:(?P<digest>[0-9a-f]{64})"
+)
+MANIFEST_TYPES = ", ".join(
+    [
+        "application/vnd.oci.image.index.v1+json",
+        "application/vnd.docker.distribution.manifest.list.v2+json",
+        "application/vnd.oci.image.manifest.v1+json",
+        "application/vnd.docker.distribution.manifest.v2+json",
+    ]
+)
+# Before this, a `created` time is a reproducible-build placeholder, not a date.
+EARLIEST_REAL_DATE = dt.datetime(2015, 1, 1, tzinfo=dt.timezone.utc)
+
+
+def split_image(name: str) -> tuple[str, str]:
+    """(registry host, repository path) of an image name, Docker Hub rules."""
+    first, _, rest = name.partition("/")
+    if rest and ("." in first or ":" in first or first == "localhost"):
+        registry, repo = first, rest
+    else:
+        registry, repo = "docker.io", name
+    if registry == "docker.io":
+        registry = "registry-1.docker.io"
+        if "/" not in repo:
+            repo = f"library/{repo}"
+    return registry, repo
+
+
+_registry_tokens: dict[tuple[str, str], str] = {}
+
+
+def registry_get(registry: str, repo: str, path: str, accept: str) -> bytes:
+    """GET https://<registry>/v2/<repo>/<path>, with an anonymous pull token
+    when the registry asks for one (WWW-Authenticate: Bearer …)."""
+    url = f"https://{registry}/v2/{repo}/{path}"
+    for _ in range(2):
+        headers = {"User-Agent": USER_AGENT, "Accept": accept}
+        token = _registry_tokens.get((registry, repo))
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=60) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as err:
+            challenge = err.headers.get("WWW-Authenticate", "") if err.headers else ""
+            if err.code != 401 or not challenge.lower().startswith("bearer ") or token:
+                raise LookupFailed(f"GET {url}: HTTP {err.code}") from err
+            params = dict(re.findall(r'(\w+)="([^"]*)"', challenge))
+            realm = params.pop("realm", "")
+            if not realm.startswith("https://"):
+                raise LookupFailed(f"GET {url}: unusable auth challenge") from err
+            params.setdefault("scope", f"repository:{repo}:pull")
+            answer = fetch_json(realm + "?" + urllib.parse.urlencode(params))
+            token = answer.get("token") or answer.get("access_token")  # type: ignore[union-attr]
+            if not token:
+                raise LookupFailed(f"GET {url}: no registry token") from err
+            _registry_tokens[(registry, repo)] = token
+        except (urllib.error.URLError, TimeoutError) as err:
+            raise LookupFailed(f"GET {url}: {err}") from err
+    raise LookupFailed(f"GET {url}: not authorised")
+
+
+def _blob_json(registry: str, repo: str, kind: str, digest: str, accept: str) -> dict:
+    body = registry_get(registry, repo, f"{kind}/{digest}", accept)
+    import hashlib
+
+    if "sha256:" + hashlib.sha256(body).hexdigest() != digest:
+        raise LookupFailed(f"{repo}@{digest}: registry content does not match the digest")
+    return json.loads(body)
+
+
+_image_cache: dict[tuple[str, str], dt.datetime] = {}
+
+
+def image_published(name: str, digest: str) -> dt.datetime:
+    """When the image `name@digest` was published (see the module docstring)."""
+    key = (name, digest)
+    if key in _image_cache:
+        return _image_cache[key]
+    registry, repo = split_image(name)
+    if registry == "gcr.io":
+        listing = json.loads(registry_get(registry, repo, "tags/list", "application/json"))
+        info = listing.get("manifest", {}).get(digest)
+        if not info:
+            raise LookupFailed(f"{digest} is not in {name}")
+        stamps = [int(info.get(k, 0)) for k in ("timeUploadedMs", "timeCreatedMs")]
+        published = dt.datetime.fromtimestamp(max(stamps) / 1000, dt.timezone.utc)
+    else:
+        top = _blob_json(registry, repo, "manifests", digest, MANIFEST_TYPES)
+        manifests = [top]
+        if "manifests" in top:  # index: every real platform image (not attestations)
+            manifests = [
+                _blob_json(registry, repo, "manifests", m["digest"], MANIFEST_TYPES)
+                for m in top["manifests"]
+                if m.get("platform", {}).get("os") not in (None, "unknown")
+            ]
+        dates = []
+        for manifest in manifests:
+            config = _blob_json(registry, repo, "blobs", manifest["config"]["digest"], "*/*")
+            dates.append(parse_ts(config["created"]))
+        if not dates:
+            raise LookupFailed("no platform images behind the digest")
+        published = max(dates)
+    if published < EARLIEST_REAL_DATE:
+        raise LookupFailed(f"no real publish date ({published:%Y-%m-%d}); cannot be dated")
+    _image_cache[key] = published
+    return published
+
+
+def debian_published(package: str, version: str) -> dt.datetime:
+    """First time the amd64 (or arch-independent) .deb appeared in the Debian archive."""
+    url = (
+        "https://snapshot.debian.org/mr/binary/"
+        f"{urllib.parse.quote(package, safe='')}/{urllib.parse.quote(version, safe='')}/binfiles?fileinfo=1"
+    )
+    data = fetch_json(url, min_interval=1.0)
+    seen = [
+        info["first_seen"]
+        for item in data.get("result", [])  # type: ignore[union-attr]
+        if item.get("architecture") in ("amd64", "all")
+        for info in data.get("fileinfo", {}).get(item["hash"], [])  # type: ignore[union-attr]
+        if info.get("archive_name") in ("debian", "debian-security")
+    ]
+    if not seen:
+        raise LookupFailed("not in snapshot.debian.org for amd64")
+    return min(dt.datetime.strptime(s, "%Y%m%dT%H%M%SZ").replace(tzinfo=dt.timezone.utc) for s in seen)
+
+
+def add_image(result: "Result", name: str, tag: str, digest: str, where: str) -> None:
+    result.add("image", f"{name}:{tag}", digest[:12], lambda: image_published(name, f"sha256:{digest}"), where)
+
+
+DEBIAN_PIN = re.compile(r"^(?P<pkg>[a-z0-9][a-z0-9+.-]+)=(?P<version>[0-9A-Za-z.+~:-]+)$")
+APT_FLAGS = {"-y", "--yes", "-q", "-qq", "--no-install-recommends", "-s", "--simulate"}
+SIMULATE_FLAGS = {"-s", "--simulate"}
+# `test "$(apt-get install -s … | grep -c '^Inst ')" = N`: proves that apt
+# installs exactly N packages, i.e. no unpinned dependency.
+APT_PROOF = re.compile(
+    r"""\btest\s+"\$\(apt-get install(?P<args>[^|"]*)\|\s*grep -c '\^Inst '\)"\s*=\s*(?P<count>[0-9]+)"""
+)
+APT_INSTALL = re.compile(r"\bapt-get install\b(?P<args>[^&;|)\"]*)")
+SNAPSHOT_URL = re.compile(
+    r"https://snapshot\.debian\.org/archive/(?P<archive>debian|debian-security)/(?P<stamp>[0-9]{8}T[0-9]{6}Z)/?(?=[\s'\"]|$)"
+)
+URL = re.compile(r"\b(?:https?|ftp|git|ssh)://\S+")
+DOCKER_ALLOWED = [
+    re.compile(rf"\bapt-get update{END}"),
+    re.compile(rf"\brustup target add [a-z0-9_-]+{END}"),
+]
+
+
+def snapshot_published(stamp: str) -> dt.datetime:
+    """A snapshot.debian.org timestamp is the state of the archive at that time."""
+    try:
+        return dt.datetime.strptime(stamp, "%Y%m%dT%H%M%SZ").replace(tzinfo=dt.timezone.utc)
+    except ValueError as err:
+        raise LookupFailed(f"invalid snapshot timestamp {stamp}") from err
+
+
+def dockerfile_instructions(text: str) -> list[tuple[int, str, str]]:
+    """(line, INSTRUCTION, arguments) with backslash continuations joined and
+    comments dropped (Dockerfile semantics)."""
+    out: list[tuple[int, str, str]] = []
+    buffer: list[str] = []
+    start = 0
+    for lineno, line in enumerate(text.splitlines(), 1):
+        if not buffer and (not line.strip() or line.lstrip().startswith("#")):
+            continue
+        if buffer and line.lstrip().startswith("#"):
+            continue
+        if not buffer:
+            start = lineno
+        stripped = line.rstrip()
+        if stripped.endswith("\\"):
+            buffer.append(stripped[:-1])
+            continue
+        buffer.append(stripped)
+        joined = " ".join(part.strip() for part in buffer)
+        buffer = []
+        word, _, rest = joined.partition(" ")
+        out.append((start, word.upper(), rest.strip()))
+    if buffer:
+        out.append((start, "UNTERMINATED", " ".join(buffer)))
+    return out
+
+
+def apt_args(args: str) -> tuple[list[str], list[str]]:
+    words = args.split()
+    return [w for w in words if not w.startswith("-")], [w for w in words if w.startswith("-")]
+
+
+def check_apt_installs(command: str, where: str, result: "Result") -> list[tuple[int, int]]:
+    """Every `apt-get install` must use exact pins and known flags, and a real
+    install must be preceded (in the same RUN) by a dry-run proof that apt
+    installs exactly those packages. Dates every pin; returns accepted spans."""
+    spans: list[tuple[int, int]] = []
+    proven: set[frozenset[str]] = set()
+    for m in APT_PROOF.finditer(command):
+        pins, flags = apt_args(m.group("args"))
+        if set(flags) & SIMULATE_FLAGS and len(set(pins)) == int(m.group("count")):
+            proven.add(frozenset(pins))
+    for m in APT_INSTALL.finditer(command):
+        pins, flags = apt_args(m.group("args"))
+        bad = [f for f in flags if f not in APT_FLAGS]
+        unpinned = [p for p in pins if not DEBIAN_PIN.match(p)]
+        if bad or unpinned or not pins:
+            result.errors.append(
+                f"{where}: apt-get install needs exact package=version pins and known flags "
+                f"(unpinned: {unpinned or '-'}, flags: {bad or '-'})"
+            )
+            continue
+        simulate = bool(set(flags) & SIMULATE_FLAGS)
+        if not simulate and frozenset(pins) not in proven:
+            result.errors.append(
+                f"{where}: apt-get install of {' '.join(pins)} is not proven exact: precede it with "
+                f"test \"$(apt-get install -s … | grep -c '^Inst ')\" = {len(set(pins))}"
+            )
+            continue
+        spans.append(m.span())
+        for pin in pins:
+            pm = DEBIAN_PIN.match(pin)
+            assert pm
+            pkg, version = pm.group("pkg"), pm.group("version")
+            result.add("debian", pkg, version, lambda p=pkg, v=version: debian_published(p, v), where)
+    return spans
+
+
+def check_from_source(source: str, stages: set[str], where: str, label: str, result: "Result") -> None:
+    if source.lower() in stages or source.isdigit():
+        return
+    m = IMAGE_REF.fullmatch(source)
+    if not m:
+        result.errors.append(f"{where}: {label}{source} must be a stage or name:tag@sha256:<digest>")
+        return
+    add_image(result, m.group("name"), m.group("tag"), m.group("digest"), where)
+
+
+SYNTAX_DIRECTIVE = re.compile(r"^\s*#\s*syntax\s*=\s*(?P<ref>\S*)", re.I)
+
+
+def check_dockerfile(path: Path, result: Result) -> None:
+    try:
+        text = path.read_text()
+    except (OSError, UnicodeDecodeError) as err:
+        result.errors.append(f"{path}: cannot read: {err}")
+        return
+    # A syntax directive makes BuildKit download that frontend image.
+    for lineno, line in enumerate(text.splitlines(), 1):
+        m = SYNTAX_DIRECTIVE.match(line)
+        if m:
+            im = IMAGE_REF.fullmatch(m.group("ref"))
+            if im:
+                add_image(result, im.group("name"), im.group("tag"), im.group("digest"), f"{path}:{lineno}")
+            else:
+                result.errors.append(f"{path}:{lineno}: syntax directive must be name:tag@sha256:<digest>")
+    stages: set[str] = set()
+    froms = 0
+    apt_used = False
+    snapshots = 0
+    for lineno, instruction, args in dockerfile_instructions(text):
+        where = f"{path}:{lineno}"
+        for m in REDIRECT_ENV.finditer(args):
+            result.errors.append(f"{where}: {m.group(0)} can redirect what installers download; not allowed")
+        if "BUILDKIT_SYNTAX" in args:
+            result.errors.append(f"{where}: BUILDKIT_SYNTAX selects a frontend image; not allowed")
+        if "<<" in args:
+            result.errors.append(f"{where}: heredocs cannot be verified by the age gate; not allowed")
+            continue
+        if instruction == "FROM":
+            froms += 1
+            words = [w for w in args.split() if not w.startswith("--platform=")]
+            if any(w.startswith("--") for w in words) or not words or "$" in args:
+                result.errors.append(f"{where}: FROM must name a pinned image without variables or flags")
+                continue
+            image = words[0]
+            if len(words) not in (1, 3) or (len(words) == 3 and words[1].lower() != "as"):
+                result.errors.append(f"{where}: cannot parse FROM {args}")
+                continue
+            internal = image.lower() in stages or image == "scratch"
+            if len(words) == 3:
+                stages.add(words[2].lower())
+            if internal:
+                continue
+            m = IMAGE_REF.fullmatch(image)
+            if not m:
+                result.errors.append(f"{where}: {image} must be name:tag@sha256:<digest>")
+                continue
+            add_image(result, m.group("name"), m.group("tag"), m.group("digest"), where)
+        elif instruction in ("COPY", "ADD"):
+            for source in re.findall(r"--from=(\S+)", args):
+                check_from_source(source, stages, where, "--from=", result)
+            if instruction == "ADD" and re.search(r"\b(https?|git|ssh)://|git@", args):
+                result.errors.append(f"{where}: ADD from a URL is not checked by the age gate yet")
+        elif instruction == "RUN":
+            for mount in re.findall(r"--mount=(\S+)", args):
+                for option in mount.split(","):
+                    key, _, value = option.partition("=")
+                    if key == "from":
+                        check_from_source(value, stages, where, "--mount from=", result)
+            for sub in unlocked_cargo(args):
+                result.errors.append(f"{where}: cargo {sub} must use --locked")
+            # Package sources: only snapshot.debian.org at a fixed (dated) time.
+            for url in URL.findall(args):
+                snap = SNAPSHOT_URL.match(url) or SNAPSHOT_URL.match(url.rstrip("'\""))
+                if not snap:
+                    result.errors.append(f"{where}: URL {url} cannot be verified (only snapshot.debian.org/archive/…/<timestamp>)")
+                    continue
+                snapshots += 1
+                stamp = snap.group("stamp")
+                result.add("snapshot", f"snapshot.debian.org/{snap.group('archive')}", stamp,
+                           lambda st=stamp: snapshot_published(st), where)
+            if APT_INSTALL.search(args):
+                apt_used = True
+            allowed = check_apt_installs(args, where, result)
+            allowed += [m.span() for pattern in DOCKER_ALLOWED for m in pattern.finditer(args)]
+            for m in command_tokens(args):
+                if not any(start <= m.start() < end for start, end in allowed):
+                    result.errors.append(f"{where}: install/download command {m.group(0)!r} is not an allowed verified form")
+            if re.search(r"\b(apt|aptitude)\s+install\b", args):
+                result.errors.append(f"{where}: use apt-get install with pins")
+        elif instruction == "ARG" and re.search(r"\bBUILDKIT_", args):
+            result.errors.append(f"{where}: BuildKit control arguments are not allowed")
+        elif instruction == "UNTERMINATED":
+            result.errors.append(f"{where}: instruction ends with a line continuation")
+        elif instruction == "ONBUILD":
+            result.errors.append(f"{where}: ONBUILD cannot be verified")
+    if froms == 0:
+        result.errors.append(f"{path}: no FROM instruction; cannot be verified")
+    if apt_used and snapshots == 0:
+        result.errors.append(
+            f"{path}: apt-get install needs package sources at a fixed snapshot.debian.org timestamp"
+        )
+
+
+COMPOSE_IMAGE = re.compile(r"^\s*(?:-\s+)?[\"']?image[\"']?\s*:\s*[\"']?(?P<ref>[^\s\"'#]*)[\"']?\s*(?:#.*)?$")
+TOP_LEVEL_SERVICES = re.compile(r"^[\"']?services[\"']?\s*:", re.M)
+
+
+def check_compose(path: Path, result: Result) -> None:
+    try:
+        text = path.read_text()
+    except (OSError, UnicodeDecodeError) as err:
+        result.errors.append(f"{path}: cannot read: {err}")
+        return
+    if not TOP_LEVEL_SERVICES.search(text):
+        result.errors.append(f"{path}: no top-level services; cannot be verified")
+    for lineno, line in enumerate(text.splitlines(), 1):
+        where = f"{path}:{lineno}"
+        if line.lstrip().startswith("#"):
+            continue  # comments configure nothing
+        if re.search(r"^\s*(?:-\s+)?[\"']?build[\"']?\s*:", line):
+            result.errors.append(f"{where}: build: in compose files is not checked by the age gate")
+        if re.search(r"^\s*(?:-\s+)?[\"']?(include|extends)[\"']?\s*:", line) or re.search(r"\b(include|extends)\b\s*:", line):
+            result.errors.append(f"{where}: include/extends pull in other compose files; not allowed")
+        if not re.search(r"\bimage\b", line):
+            continue
+        m = COMPOSE_IMAGE.match(line)
+        if not m:
+            result.errors.append(f"{where}: unverifiable image line (only `image: name:tag@sha256:<digest>`)")
+            continue
+        ref = m.group("ref")
+        own = ref.split("@", 1)[0].rsplit(":", 1)[0]
+        if own in OWN_IMAGES:
+            continue  # built from this repository
+        im = IMAGE_REF.fullmatch(ref)
+        if not im:
+            result.errors.append(f"{where}: {ref or '(empty)'} must be name:tag@sha256:<digest>")
+            continue
+        add_image(result, im.group("name"), im.group("tag"), im.group("digest"), where)
+
+
+def is_compose(path: Path) -> bool:
+    """Named like a compose file, or any other YAML file with top-level services."""
+    if COMPOSE.match(path.name.lower()):
+        return True
+    if path.suffix.lower() not in (".yml", ".yaml"):
+        return False
+    try:
+        return bool(TOP_LEVEL_SERVICES.search(path.read_text(errors="replace")))
+    except OSError:
+        return True  # unreadable: let check_compose report it (fail closed)
+
+
 # ── unsupported manifests (fail closed) ──────────────────────────────────────
 
 UNSUPPORTED = re.compile(
@@ -502,6 +986,10 @@ UNSUPPORTED = re.compile(
     r"|Package\.resolved|Podfile\.lock|mix\.lock|flake\.lock|rust-toolchain|\.tool-versions|\.nvmrc|\.node-version"
     r"|\.python-version|Dockerfile.*|.*\.dockerfile|Containerfile|(docker-)?compose.*\.ya?ml)$"
 )
+
+
+DOCKERFILE = re.compile(r"^(dockerfile.*|.*\.dockerfile|containerfile.*)$", re.I)
+COMPOSE = re.compile(r"^(docker-)?compose.*\.ya?ml$", re.I)
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -525,6 +1013,7 @@ def evaluate(root: Path) -> Result:
     result = Result()
     root = root.resolve()
     files = list(walk(root))
+    github = root / ".github"
     for path in files:
         name = path.name
         if name == "Cargo.lock":
@@ -537,10 +1026,13 @@ def evaluate(root: Path) -> Result:
             result.errors.append(f"{path}: package.json without package-lock.json")
         elif name == "rust-toolchain.toml":
             check_rust_toolchain(path, result)
+        elif DOCKERFILE.match(name):
+            check_dockerfile(path, result)
+        elif github not in path.parents and is_compose(path):
+            check_compose(path, result)
         elif UNSUPPORTED.match(name):
             result.errors.append(f"{path}: dependency manifest the age gate cannot check yet; extend tools/dep-age.py")
 
-    github = root / ".github"
     queue: list[Path] = [p for p in files if github in p.parents]
     seen: set[Path] = set()
     while queue:

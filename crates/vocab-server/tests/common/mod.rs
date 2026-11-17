@@ -1,17 +1,18 @@
-//! Shared harness of the scheduler and session tests: a temporary database,
-//! a manual clock, the HTTP router and synthetic packs (`test-` ids,
-//! invented sentences only).
+//! Shared harness of the integration tests: a temporary database, a manual
+//! clock, the HTTP router (logged in with a synthetic `test-` password) and
+//! synthetic packs (`test-` ids, invented sentences only).
 
 // Each test binary that includes this module uses a different subset of it.
 #![allow(dead_code)]
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use axum::body::{Body, to_bytes};
-use axum::http::{Request, StatusCode};
+use axum::http::{HeaderValue, Request, StatusCode, header};
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use tower::ServiceExt;
+use vocab_server::auth::{self, Auth, Credentials};
 use vocab_server::catalog::{self, WordId, WordTraits};
 use vocab_server::clock::{Clock, DayRule, ManualClock, Moment, StudyDay, Timestamp};
 use vocab_server::config::Limits;
@@ -28,6 +29,81 @@ pub fn day(text: &str) -> StudyDay {
 
 pub fn prague() -> DayRule {
     DayRule::new("Europe/Prague", 4).expect("bundled tzdb")
+}
+
+// ── authentication (synthetic secrets only) ────────────────────────────────
+
+/// `public_origin` of the test apps (placeholder domain of the design).
+pub const ORIGIN: &str = "https://vocab.example.home";
+pub const PASSWORD: &str = "test-password-for-the-integration-tests";
+pub const IMPORT_TOKEN: &str = "test-import-token-for-the-integration-tests";
+
+/// `VOCAB_PASSWORD_HASH_B64` of [`PASSWORD`], hashed once per test binary.
+pub fn password_hash_b64() -> &'static str {
+    static HASH: OnceLock<String> = OnceLock::new();
+    HASH.get_or_init(|| auth::hash_password(PASSWORD).expect("hash the test password"))
+}
+
+pub fn credentials() -> Credentials {
+    Credentials::new(password_hash_b64(), IMPORT_TOKEN).expect("test credentials")
+}
+
+/// Auth with the design's 180-day sessions.
+pub fn auth() -> Auth {
+    Auth::new(credentials(), ORIGIN, 180)
+}
+
+/// Auth whose sessions outlive any clock jump of a test (100 years), for
+/// tests about other things than sessions.
+pub fn long_auth() -> Auth {
+    Auth::new(credentials(), ORIGIN, 36_500)
+}
+
+/// Log in through `router`; returns the `name=value` cookie pair.
+pub async fn login(router: &axum::Router) -> String {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/login")
+                .header(header::ORIGIN, ORIGIN)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({ "password": PASSWORD }).to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK, "test login");
+    let cookie = response
+        .headers()
+        .get(header::SET_COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .expect("session cookie");
+    cookie.split(';').next().expect("cookie pair").to_owned()
+}
+
+/// `router` as a logged-in browser of the app's origin would use it: logs
+/// in on the first request and adds the session cookie and the `Origin`
+/// header to every request that does not set them itself.
+pub fn logged_in(router: axum::Router) -> axum::Router {
+    let cookie: Arc<tokio::sync::OnceCell<String>> = Arc::new(tokio::sync::OnceCell::new());
+    let inner = router;
+    axum::Router::new().fallback_service(tower::service_fn(move |mut request: Request<Body>| {
+        let inner = inner.clone();
+        let cookie = Arc::clone(&cookie);
+        async move {
+            let pair = cookie.get_or_init(|| login(&inner)).await;
+            let headers = request.headers_mut();
+            if !headers.contains_key(header::COOKIE) {
+                headers.insert(header::COOKIE, HeaderValue::from_str(pair).expect("cookie"));
+            }
+            if !headers.contains_key(header::ORIGIN) {
+                headers.insert(header::ORIGIN, HeaderValue::from_static(ORIGIN));
+            }
+            inner.oneshot(request).await
+        }
+    }))
 }
 
 pub struct Env {
@@ -51,8 +127,13 @@ pub fn env() -> Env {
 pub fn env_in(dir: tempfile::TempDir, now: &str) -> Env {
     let db = Db::open(dir.path()).expect("db");
     let clock = Arc::new(ManualClock::new(ts(now)));
-    let state = AppState::with_clock(db.clone(), Arc::clone(&clock) as Arc<dyn Clock>, prague());
-    let router = http::app(state, &Limits::default());
+    let state = AppState::with_clock(
+        db.clone(),
+        Arc::clone(&clock) as Arc<dyn Clock>,
+        prague(),
+        long_auth(),
+    );
+    let router = logged_in(http::app(state, &Limits::default()));
     Env {
         dir,
         db,

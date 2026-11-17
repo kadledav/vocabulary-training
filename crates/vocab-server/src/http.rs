@@ -12,10 +12,16 @@
 //! started finishes in the background (see `workflows`), so the timeout
 //! answer of an import tells the owner that importing again is safe.
 //!
+//! Access control (design §9) is one layer over every route: each route of
+//! the table in [`routes`] is public, needs a session, or needs the import
+//! token; anything else needs a session. State-changing requests must pass
+//! the CSRF guard (Origin + JSON). The `auth` module does the checks.
+//!
 //! [`serve`] owns the connection level: a header read timeout (which also
 //! closes idle keep-alive connections) and a cap on open connections, so a
 //! client that trickles bytes cannot hold sockets forever (slowloris).
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
@@ -25,24 +31,28 @@ use std::time::{Duration, Instant};
 use axum::body::Body;
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, MatchedPath, Path, Query, Request, State};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
+use axum::handler::Handler;
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{MethodFilter, MethodRouter, on};
 use axum::{Json, Router};
 use http_body_util::BodyExt;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::graceful::GracefulShutdown;
 use hyper_util::service::TowerToHyperService;
+use jiff::SignedDuration;
 use serde::Deserialize;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 
+use crate::auth::{Auth, CsrfRejection, LoginError, SessionCheck};
 use crate::catalog::{self, SourceId, WordId, WordQuery};
 use crate::clock::{Clock, DayRule, Moment, SystemClock};
 use crate::config::Limits;
 use crate::db::{Db, DbError};
 use crate::importer::Via;
+use crate::rate_limit::RateLimit;
 use crate::scheduler::{AnswerMatch, RawGrade};
 use crate::session::{self, RateInput, SessionError, SessionId, StartKind, StartRequest};
 use crate::settings::{self, SettingsError, SettingsPatch};
@@ -60,7 +70,9 @@ const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; st
 const SECURITY_HEADERS: &[(&str, &str)] = &[
     ("content-security-policy", CONTENT_SECURITY_POLICY),
     ("x-content-type-options", "nosniff"),
-    ("referrer-policy", "no-referrer"),
+    // Not `no-referrer`: under it Firefox sends `Origin: null` on same-origin
+    // POSTs, which the CSRF guard (§9.3) must refuse. Nothing leaves the site.
+    ("referrer-policy", "same-origin"),
     ("cross-origin-opener-policy", "same-origin"),
     (
         "permissions-policy",
@@ -85,6 +97,16 @@ const PREVIEW_TIMEOUT_MESSAGE: &str =
 const DRAIN_FACTOR: usize = 4;
 const TIMEOUT_MESSAGE: &str = "The request took too long";
 
+/// Body limit of `POST /api/auth/login` (§9.4).
+const LOGIN_BODY_BYTES: usize = 2 * 1024;
+/// Body limit of the connector routes (§9.4).
+const CONNECTOR_BODY_BYTES: usize = 1024 * 1024;
+/// Paste import (preview and commit together) and connector: at most this
+/// many requests per [`RATE_WINDOW`] (§9.4).
+const IMPORT_RATE_MAX: usize = 30;
+const CONNECTOR_RATE_MAX: usize = 30;
+const RATE_WINDOW: SignedDuration = SignedDuration::from_mins(10);
+
 /// Most rows of the import log returned by `GET /api/import/recent`.
 const RECENT_IMPORTS: u32 = 20;
 
@@ -95,21 +117,24 @@ pub struct AppState {
     clock: Arc<dyn Clock>,
     /// Where study days begin (config `timezone`, `day_rollover_hour`).
     day_rule: DayRule,
+    /// Password, sessions, import token, CSRF guard.
+    auth: Arc<Auth>,
     /// Body limit of the import routes (set by [`app`] from the limits).
     import_body_bytes: usize,
 }
 
 impl AppState {
-    pub fn new(db: Db, day_rule: DayRule) -> Self {
-        Self::with_clock(db, Arc::new(SystemClock), day_rule)
+    pub fn new(db: Db, day_rule: DayRule, auth: Auth) -> Self {
+        Self::with_clock(db, Arc::new(SystemClock), day_rule, auth)
     }
 
     /// With a controllable clock (tests).
-    pub fn with_clock(db: Db, clock: Arc<dyn Clock>, day_rule: DayRule) -> Self {
+    pub fn with_clock(db: Db, clock: Arc<dyn Clock>, day_rule: DayRule, auth: Auth) -> Self {
         Self {
             db,
             clock,
             day_rule,
+            auth: Arc::new(auth),
             import_body_bytes: Limits::default().import_body_bytes,
         }
     }
@@ -118,6 +143,200 @@ impl AppState {
     fn moment(&self) -> Moment {
         Moment::of(self.clock.now(), &self.day_rule)
     }
+}
+
+// ── routes ─────────────────────────────────────────────────────────────────
+
+/// Who may call a route (design §9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    /// Anyone: health check, login, and the shell needed to render the
+    /// login screen.
+    Public,
+    /// A logged-in browser (session cookie). Also the rule for a method a
+    /// known path does not have; unknown paths only get a 404.
+    Session,
+    /// The connector (`Authorization: Bearer <import token>`), never a
+    /// session cookie; only `/api/connector/v1/*`.
+    ImportToken,
+}
+
+/// One route of the app.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteInfo {
+    pub method: Method,
+    /// Path template as registered, e.g. `/api/words/{id}`.
+    pub path: &'static str,
+    pub access: Access,
+}
+
+/// Every route of the app with its access rule. The router is built from
+/// the same table, so tests can check each route's protection.
+pub fn routes() -> Vec<RouteInfo> {
+    endpoints()
+        .into_iter()
+        .map(|e| RouteInfo {
+            method: e.verb.method(),
+            path: e.path,
+            access: e.access,
+        })
+        .collect()
+}
+
+/// HTTP methods the app uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verb {
+    Get,
+    Post,
+    Patch,
+}
+
+impl Verb {
+    fn method(self) -> Method {
+        match self {
+            Self::Get => Method::GET,
+            Self::Post => Method::POST,
+            Self::Patch => Method::PATCH,
+        }
+    }
+
+    fn filter(self) -> MethodFilter {
+        match self {
+            Self::Get => MethodFilter::GET,
+            Self::Post => MethodFilter::POST,
+            Self::Patch => MethodFilter::PATCH,
+        }
+    }
+}
+
+/// Route groups share a body limit, a timeout and possibly a rate limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Group {
+    Standard,
+    Login,
+    ImportPreview,
+    ImportCommit,
+    Connector,
+}
+
+const GROUPS: [Group; 5] = [
+    Group::Standard,
+    Group::Login,
+    Group::ImportPreview,
+    Group::ImportCommit,
+    Group::Connector,
+];
+
+struct Endpoint {
+    verb: Verb,
+    path: &'static str,
+    access: Access,
+    group: Group,
+    handler: MethodRouter<AppState>,
+}
+
+fn endpoint<H, T>(
+    group: Group,
+    access: Access,
+    verb: Verb,
+    path: &'static str,
+    handler: H,
+) -> Endpoint
+where
+    H: Handler<T, AppState>,
+    T: 'static,
+{
+    Endpoint {
+        verb,
+        path,
+        access,
+        group,
+        handler: on(verb.filter(), handler),
+    }
+}
+
+/// The route table (design §8).
+fn endpoints() -> Vec<Endpoint> {
+    use Access::{ImportToken, Public, Session};
+    use Group::{Connector, ImportCommit, ImportPreview, Login, Standard};
+    use Verb::{Get, Patch, Post};
+    vec![
+        endpoint(Standard, Public, Get, HEALTHZ_PATH, healthz),
+        endpoint(
+            Standard,
+            Public,
+            Get,
+            web_assets::INDEX_PATH,
+            web_assets::index,
+        ),
+        endpoint(
+            Standard,
+            Public,
+            Get,
+            web_assets::ASSET_PATH,
+            web_assets::asset,
+        ),
+        endpoint(Login, Public, Post, "/api/auth/login", login),
+        endpoint(Standard, Session, Post, "/api/auth/logout", logout),
+        endpoint(Standard, Session, Get, "/api/auth/me", me),
+        endpoint(Standard, Session, Get, "/api/import/recent", import_recent),
+        endpoint(
+            ImportPreview,
+            Session,
+            Post,
+            "/api/import/preview",
+            import_preview,
+        ),
+        endpoint(
+            ImportCommit,
+            Session,
+            Post,
+            "/api/import/commit",
+            import_commit,
+        ),
+        endpoint(Standard, Session, Get, "/api/sources", list_sources),
+        endpoint(Standard, Session, Get, "/api/words", list_words),
+        endpoint(Standard, Session, Get, "/api/words/{id}", show_word),
+        endpoint(Standard, Session, Get, "/api/today", today),
+        endpoint(Standard, Session, Post, "/api/sessions", start_session),
+        endpoint(
+            Standard,
+            Session,
+            Get,
+            "/api/sessions/current",
+            current_session,
+        ),
+        endpoint(
+            Standard,
+            Session,
+            Post,
+            "/api/sessions/{id}/reviews",
+            rate_item,
+        ),
+        endpoint(
+            Standard,
+            Session,
+            Post,
+            "/api/sessions/{id}/undo",
+            undo_rating,
+        ),
+        endpoint(
+            Standard,
+            Session,
+            Post,
+            "/api/sessions/{id}/finish",
+            finish_session,
+        ),
+        endpoint(Standard, Session, Get, "/api/settings", get_settings),
+        endpoint(Standard, Session, Patch, "/api/settings", patch_settings),
+        endpoint(
+            Connector,
+            ImportToken,
+            Get,
+            "/api/connector/v1/sources",
+            connector_sources,
+        ),
+    ]
 }
 
 /// The complete application router.
@@ -130,45 +349,62 @@ pub fn app(state: AppState, limits: &Limits) -> Router {
         duration: limits.request_timeout(),
         message: TIMEOUT_MESSAGE,
     };
-    let default_routes = Router::new()
-        .route(HEALTHZ_PATH, get(healthz))
-        .route("/api/import/recent", get(import_recent))
-        .route("/api/sources", get(list_sources))
-        .route("/api/words", get(list_words))
-        .route("/api/words/{id}", get(show_word))
-        .route("/api/today", get(today))
-        .route("/api/sessions", post(start_session))
-        .route("/api/sessions/current", get(current_session))
-        .route("/api/sessions/{id}/reviews", post(rate_item))
-        .route("/api/sessions/{id}/undo", post(undo_rating))
-        .route("/api/sessions/{id}/finish", post(finish_session))
-        .route("/api/settings", get(get_settings).patch(patch_settings))
-        .with_state(state.clone())
-        .merge(web_assets::router());
-    let preview = Router::new()
-        .route("/api/import/preview", post(import_preview))
-        .with_state(state.clone());
-    let commit = Router::new()
-        .route("/api/import/commit", post(import_commit))
-        .with_state(state);
-    let routes = with_limits(default_routes, limits.body_bytes, standard)
-        .merge(with_limits(
-            preview,
-            limits.import_body_bytes,
-            TimeoutPolicy {
-                message: PREVIEW_TIMEOUT_MESSAGE,
-                ..standard
-            },
-        ))
-        .merge(with_limits(
-            commit,
-            limits.import_body_bytes,
-            TimeoutPolicy {
-                duration: limits.import_commit_timeout(),
-                message: IMPORT_TIMEOUT_MESSAGE,
-            },
-        ));
-    harden(routes, limits)
+    // Preview and commit share one budget: one paste is usually both.
+    let import_limit = Arc::new(RateLimit::new(IMPORT_RATE_MAX, RATE_WINDOW));
+    let connector_limit = Arc::new(RateLimit::new(CONNECTOR_RATE_MAX, RATE_WINDOW));
+    let endpoints = endpoints();
+    let mut access: HashMap<&'static str, Vec<(Method, Access)>> = HashMap::new();
+    for e in &endpoints {
+        access
+            .entry(e.path)
+            .or_default()
+            .push((e.verb.method(), e.access));
+    }
+    let mut routes = Router::new();
+    for group in GROUPS {
+        let mut router: Router<AppState> = Router::new();
+        for e in endpoints.iter().filter(|e| e.group == group) {
+            router = router.route(e.path, e.handler.clone());
+        }
+        let router = router.with_state(state.clone());
+        let (body_bytes, timeout, rate) = match group {
+            Group::Standard => (limits.body_bytes, standard, None),
+            Group::Login => (LOGIN_BODY_BYTES, standard, None),
+            Group::ImportPreview => (
+                limits.import_body_bytes,
+                TimeoutPolicy {
+                    message: PREVIEW_TIMEOUT_MESSAGE,
+                    ..standard
+                },
+                Some(&import_limit),
+            ),
+            Group::ImportCommit => (
+                limits.import_body_bytes,
+                TimeoutPolicy {
+                    duration: limits.import_commit_timeout(),
+                    message: IMPORT_TIMEOUT_MESSAGE,
+                },
+                Some(&import_limit),
+            ),
+            Group::Connector => (CONNECTOR_BODY_BYTES, standard, Some(&connector_limit)),
+        };
+        let mut router = with_limits(router, body_bytes, timeout);
+        if let Some(limit) = rate {
+            router = router.layer(middleware::from_fn_with_state(
+                (Arc::clone(limit), Arc::clone(&state.clock)),
+                limit_rate,
+            ));
+        }
+        routes = routes.merge(router);
+    }
+    let guard = Guard {
+        state,
+        access: Arc::new(access),
+    };
+    harden(
+        routes.layer(middleware::from_fn_with_state(guard, protect)),
+        limits,
+    )
 }
 
 /// How long a route group may take, and what to answer when it is too slow.
@@ -220,6 +456,103 @@ async fn healthz(State(state): State<AppState>) -> Response {
             )
         }
     }
+}
+
+// ── authentication (design §9) ─────────────────────────────────────────────
+
+/// Body of `POST /api/auth/login`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoginBody {
+    password: String,
+}
+
+fn ok_status() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "status": "ok" }))
+}
+
+fn set_cookie(response: &mut Response, cookie: &str) {
+    if let Ok(value) = HeaderValue::from_str(cookie) {
+        response.headers_mut().append(header::SET_COOKIE, value);
+    }
+}
+
+fn retry_after(response: &mut Response, secs: u64) {
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from(secs));
+}
+
+/// "N minutes" (rounded up) for messages about waiting.
+fn minutes_text(secs: u64) -> String {
+    let minutes = secs.div_ceil(60).max(1);
+    if minutes == 1 {
+        "1 minute".to_owned()
+    } else {
+        format!("{minutes} minutes")
+    }
+}
+
+async fn login(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<LoginBody>, JsonRejection>,
+) -> Response {
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => {
+            return rejected_body(&rejection, "The body must be JSON {\"password\": \"…\"}.");
+        }
+    };
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok());
+    match state
+        .auth
+        .login(&state.db, &state.clock, body.password, user_agent)
+        .await
+    {
+        Ok(cookie) => {
+            let mut response = ok_status().into_response();
+            set_cookie(&mut response, &cookie);
+            response
+        }
+        Err(LoginError::WrongPassword) => error_response(
+            StatusCode::UNAUTHORIZED,
+            "invalid_password",
+            "Wrong password.",
+        ),
+        Err(LoginError::Locked { retry_after_secs }) => {
+            let mut response = error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "locked",
+                &format!(
+                    "Too many failed logins. Try again in {}.",
+                    minutes_text(retry_after_secs)
+                ),
+            );
+            retry_after(&mut response, retry_after_secs);
+            response
+        }
+        Err(err @ LoginError::Internal(_)) => internal_error(&err),
+    }
+}
+
+async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    match state.auth.logout(&state.db, &headers).await {
+        Ok(cookie) => {
+            let mut response = ok_status().into_response();
+            set_cookie(&mut response, &cookie);
+            response
+        }
+        Err(err) => internal_error(&err),
+    }
+}
+
+/// `GET /api/auth/me`: answers 200 only with a live session (the guard
+/// answers 401 otherwise).
+async fn me() -> Response {
+    Json(serde_json::json!({ "authenticated": true })).into_response()
 }
 
 // ── API handlers ────────────────────────────────────────────────────────────
@@ -361,6 +694,12 @@ async fn list_sources(State(state): State<AppState>) -> Response {
     }
 }
 
+/// `GET /api/connector/v1/sources` (import token only): the sources with
+/// their reading position and word count, for the connector (R-12).
+async fn connector_sources(state: State<AppState>) -> Response {
+    list_sources(state).await
+}
+
 /// An optional numeric query parameter: absent or empty (`?scope=`) means
 /// "not given"; anything else must be an integer (G7).
 fn optional_number<'de, D: serde::Deserializer<'de>>(
@@ -441,6 +780,21 @@ enum ApiError {
 impl From<rusqlite::Error> for ApiError {
     fn from(err: rusqlite::Error) -> Self {
         Self::Db(DbError::from(err))
+    }
+}
+
+/// Answer for a JSON body that could not be read: 413 when it is over the
+/// route's body limit (the same answer as the import routes give), 400 when
+/// it is not the expected JSON.
+fn rejected_body(rejection: &JsonRejection, message: &str) -> Response {
+    if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "too_large",
+            "The request is too large.",
+        )
+    } else {
+        bad_request(message)
     }
 }
 
@@ -530,10 +884,14 @@ async fn start_session(
     State(state): State<AppState>,
     body: Result<Json<StartBody>, JsonRejection>,
 ) -> Response {
-    let Ok(Json(body)) = body else {
-        return bad_request(
-            "The body must be JSON {\"kind\": \"start\"|\"continue\", \"scope_source_id\"?, \"add_new_anyway\"?}.",
-        );
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => {
+            return rejected_body(
+                &rejection,
+                "The body must be JSON {\"kind\": \"start\"|\"continue\", \"scope_source_id\"?, \"add_new_anyway\"?}.",
+            );
+        }
     };
     let request = StartRequest {
         scope: body.scope_source_id.map(SourceId::new),
@@ -611,8 +969,14 @@ async fn rate_item(
     let Some(id) = session_id(id) else {
         return not_found().await;
     };
-    let Ok(Json(body)) = body else {
-        return bad_request("The body must be a JSON review object (design §8).");
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => {
+            return rejected_body(
+                &rejection,
+                "The body must be a JSON review object (design §8).",
+            );
+        }
     };
     let input = match body.into_input() {
         Ok(input) => input,
@@ -674,8 +1038,14 @@ async fn patch_settings(
     State(state): State<AppState>,
     body: Result<Json<SettingsPatch>, JsonRejection>,
 ) -> Response {
-    let Ok(Json(patch)) = body else {
-        return bad_request("The body must be a JSON object of known settings.");
+    let patch = match body {
+        Ok(Json(patch)) => patch,
+        Err(rejection) => {
+            return rejected_body(
+                &rejection,
+                "The body must be a JSON object of known settings.",
+            );
+        }
     };
     respond(
         state
@@ -686,6 +1056,116 @@ async fn patch_settings(
 }
 
 // ── middleware ──────────────────────────────────────────────────────────────
+
+/// State of the access-control layer: the app and the access rule of every
+/// (path template, method) of the route table.
+#[derive(Debug, Clone)]
+struct Guard {
+    state: AppState,
+    access: Arc<HashMap<&'static str, Vec<(Method, Access)>>>,
+}
+
+impl Guard {
+    /// The access rule of the matched route; [`Access::Session`] for
+    /// anything not in the table (secure by default).
+    fn access_of(&self, request: &Request) -> Access {
+        let method = if request.method() == Method::HEAD {
+            &Method::GET
+        } else {
+            request.method()
+        };
+        request
+            .extensions()
+            .get::<MatchedPath>()
+            .and_then(|path| self.access.get(path.as_str()))
+            .and_then(|rules| rules.iter().find(|(m, _)| m == method))
+            .map_or(Access::Session, |(_, access)| *access)
+    }
+}
+
+fn unauthenticated() -> Response {
+    error_response(StatusCode::UNAUTHORIZED, "unauthenticated", "Log in first.")
+}
+
+/// Access control of every route (design §9): import token for the
+/// connector; CSRF guard and (unless public) a live session for the rest.
+async fn protect(State(guard): State<Guard>, request: Request, next: Next) -> Response {
+    let auth = &guard.state.auth;
+    let access = guard.access_of(&request);
+    if access == Access::ImportToken {
+        if auth.has_import_token(request.headers()) {
+            return next.run(request).await;
+        }
+        let mut response = error_response(
+            StatusCode::UNAUTHORIZED,
+            "unauthenticated",
+            "A valid import token is required.",
+        );
+        response
+            .headers_mut()
+            .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+        return response;
+    }
+    match auth.check_csrf(request.method(), request.headers()) {
+        Ok(()) => {}
+        Err(CsrfRejection::Origin) => {
+            return error_response(
+                StatusCode::FORBIDDEN,
+                "forbidden_origin",
+                "The request does not come from this app.",
+            );
+        }
+        Err(CsrfRejection::ContentType) => {
+            return error_response(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "unsupported_media_type",
+                "Send JSON with Content-Type: application/json.",
+            );
+        }
+    }
+    if access == Access::Public {
+        return next.run(request).await;
+    }
+    let now = guard.state.clock.now();
+    match auth
+        .check_session(&guard.state.db, request.headers(), now)
+        .await
+    {
+        Ok(SessionCheck::Valid { renewal }) => {
+            let mut response = next.run(request).await;
+            // A handler that sets the cookie itself (logout) wins.
+            if let Some(cookie) = renewal
+                && !response.headers().contains_key(header::SET_COOKIE)
+            {
+                set_cookie(&mut response, &cookie);
+            }
+            response
+        }
+        Ok(SessionCheck::Invalid) => unauthenticated(),
+        Err(err) => internal_error(&err),
+    }
+}
+
+/// Per-group request budget (§9.4).
+async fn limit_rate(
+    State((limit, clock)): State<(Arc<RateLimit>, Arc<dyn Clock>)>,
+    request: Request,
+    next: Next,
+) -> Response {
+    match limit.hit(clock.now()) {
+        Ok(()) => next.run(request).await,
+        Err(wait) => {
+            let secs = u64::try_from(wait.as_secs()).unwrap_or(0).max(1);
+            let mut response = error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                &format!("Too many requests. Try again in {}.", minutes_text(secs)),
+            );
+            retry_after(&mut response, secs);
+            response
+        }
+    }
+}
 
 async fn security_headers(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
@@ -851,7 +1331,7 @@ pub fn healthcheck(listen: SocketAddr, timeout: Duration) -> Result<(), String> 
 mod tests {
     use axum::body::{Bytes, to_bytes};
     use axum::http::Method;
-    use axum::routing::post;
+    use axum::routing::{get, post};
     use tower::ServiceExt;
 
     use super::*;

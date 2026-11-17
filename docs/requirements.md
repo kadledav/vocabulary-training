@@ -196,12 +196,11 @@ The pass/fail line between 3 and 4 is visible in the button row. Labels are in E
 | Host path | Container mount | Content |
 |---|---|---|
 | `/mnt/tank/services/vocabulary/data` | read-write | SQLite database |
-| `/mnt/tank/services/vocabulary/config` | **read-only** | app configuration (non-secret) |
 | `/mnt/tank/services/vocabulary/cache` | read-write | generated audio files (regenerable from the DB) |
 
 - **Backup** is done by the existing daily ZFS replication `tank/services` → `backup-tank/services`. Snapshots are atomic, so the live SQLite file is captured consistently; the app needs **no backup logic of its own**. The SQLite database must therefore use a crash-safe journal mode (WAL or rollback journal, `synchronous` ≥ NORMAL) and keep all its files (incl. `-wal`/`-shm`) inside `data/`.
-- Secrets (login password hash / connector token) come from `.env`, not from the config volume.
-- The container's fixed non-root UID/GID is documented; the dataset owner/ACL grants it write on `data` and `cache`, read on `config`.
+- Configuration (non-secret `VOCAB_*` settings) and secrets (login password hash / connector token) come from the Compose environment (`.env`); there is no config volume.
+- The container's fixed non-root UID/GID is documented (deployment: 3101:3101); the dataset owner/ACL grants it write on `data` and `cache`.
 - A restore procedure (stop container → restore `data/` from a snapshot or the replica → start) is documented in the stack's README and tested once before phase 1 is accepted.
 - **R-86 SHOULD** — Export of all vocabulary + progress to a single JSON file from the UI.
 

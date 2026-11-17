@@ -1,5 +1,7 @@
 //! HTTP skeleton: the embedded shell, security headers, `/healthz`.
 
+mod common;
+
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
 use axum::response::Response;
@@ -20,7 +22,10 @@ struct TestApp {
 fn app() -> TestApp {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = Db::open(dir.path()).expect("db");
-    let router = http::app(AppState::new(db, prague()), &Limits::default());
+    let router = common::logged_in(http::app(
+        AppState::new(db, prague(), common::auth()),
+        &Limits::default(),
+    ));
     TestApp { _dir: dir, router }
 }
 
@@ -54,7 +59,7 @@ fn header<'a>(response: &'a Response, name: &str) -> &'a str {
 fn assert_security_headers(response: &Response) {
     assert_eq!(header(response, "content-security-policy"), CSP);
     assert_eq!(header(response, "x-content-type-options"), "nosniff");
-    assert_eq!(header(response, "referrer-policy"), "no-referrer");
+    assert_eq!(header(response, "referrer-policy"), "same-origin");
     assert_eq!(
         header(response, "cross-origin-opener-policy"),
         "same-origin"
@@ -195,6 +200,8 @@ mod served {
 
     struct Server {
         addr: SocketAddr,
+        /// `name=value` of a session cookie.
+        cookie: String,
         stop: Option<oneshot::Sender<()>>,
         task: tokio::task::JoinHandle<std::io::Result<()>>,
         _dir: tempfile::TempDir,
@@ -207,7 +214,11 @@ mod served {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("addr");
             let (stop, stopped) = oneshot::channel::<()>();
-            let app = http::app(AppState::new(db, super::prague()), &limits);
+            let app = http::app(
+                AppState::new(db, super::prague(), super::common::auth()),
+                &limits,
+            );
+            let cookie = super::common::login(&app).await;
             let task = tokio::spawn(async move {
                 http::serve(listener, app, &limits, async {
                     let _ = stopped.await;
@@ -216,6 +227,7 @@ mod served {
             });
             Self {
                 addr,
+                cookie,
                 stop: Some(stop),
                 task,
                 _dir: dir,
@@ -295,7 +307,9 @@ mod served {
         let body_len = 6 * 1024 * 1024; // over the 5 MiB import body limit
         let head = format!(
             "POST /api/import/preview HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
-             Content-Length: {body_len}\r\nConnection: close\r\n\r\n"
+             Origin: {}\r\nCookie: {}\r\nContent-Length: {body_len}\r\nConnection: close\r\n\r\n",
+            super::common::ORIGIN,
+            server.cookie,
         );
         stream.write_all(head.as_bytes()).await.expect("head");
         let mut body = Vec::with_capacity(body_len);

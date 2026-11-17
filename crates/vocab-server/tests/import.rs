@@ -2,6 +2,8 @@
 //! R-10, R-11, R-13, R-15, R-20, R-22–R-24, R-59, R-84). All packs are
 //! synthetic: `test-…` ids and sentences written for these tests.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -31,8 +33,13 @@ fn app() -> TestApp {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = Db::open(dir.path()).expect("db");
     let clock = Arc::new(ManualClock::new(ts("2026-11-20T09:00:00Z")));
-    let state = AppState::with_clock(db, Arc::clone(&clock) as Arc<dyn Clock>, prague());
-    let router = http::app(state, &Limits::default());
+    let state = AppState::with_clock(
+        db,
+        Arc::clone(&clock) as Arc<dyn Clock>,
+        prague(),
+        common::long_auth(),
+    );
+    let router = common::logged_in(http::app(state, &Limits::default()));
     TestApp { dir, clock, router }
 }
 
@@ -111,7 +118,11 @@ impl TestApp {
     fn dump(&self) -> String {
         let conn = self.sql();
         let tables: Vec<String> = conn
-            .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name")
+            // The test client's login session is not part of what an import may touch.
+            .prepare(
+                "SELECT name FROM sqlite_schema WHERE type = 'table' AND name <> 'auth_session' \
+                 ORDER BY name",
+            )
             .expect("tables")
             .query_map([], |row| row.get(0))
             .expect("query")
@@ -1703,7 +1714,22 @@ async fn r11_a_timed_out_commit_still_imports_every_pack() {
         import_commit_timeout_secs: 1,
         ..Limits::default()
     };
-    let router = http::app(AppState::new(db.clone(), prague()), &limits);
+    let router = common::logged_in(http::app(
+        AppState::new(db.clone(), prague(), common::long_auth()),
+        &limits,
+    ));
+    // Log in (and check the session once) before the database gets busy.
+    let warm_up = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/me")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(warm_up.status(), StatusCode::OK);
     let blocker = {
         let db = db.clone();
         tokio::spawn(async move {

@@ -2,12 +2,17 @@
 /**
  * Entry point of the single-page app: theme, navigation and hash routing.
  * Practice is a focused screen with its own top bar (no navigation); the
- * other screens share the navigation bar.
+ * login screen has no navigation either; the other screens share the
+ * navigation bar. Any "not logged in" answer of the server leads to the
+ * login screen, which returns to the screen afterwards.
  */
 
+import { onUnauthenticated } from './api.js';
+import { goToLogin } from './auth.js';
 import { h, mount } from './dom.js';
 import { startRouter } from './router.js';
 import { renderImport } from './screens/import.js';
+import { renderLogin } from './screens/login.js';
 import { renderPractice } from './screens/practice.js';
 import { renderSettings } from './screens/settings.js';
 import { renderSummary } from './screens/summary.js';
@@ -17,6 +22,7 @@ import { loadSettings } from './settings.js';
 import { applyRememberedTheme } from './theme.js';
 
 applyRememberedTheme();
+onUnauthenticated(goToLogin);
 void loadSettings();
 
 const root = document.getElementById('app');
@@ -46,8 +52,9 @@ if (root) {
     if (leave) leave();
     leave = null;
     const practice = route.name === 'practice';
+    const bare = practice || route.name === 'login';
     document.body.classList.toggle('in-practice', practice);
-    mount(header, ...(practice ? [] : [nav(route.name === 'word' ? 'words' : route.name)]));
+    mount(header, ...(bare ? [] : [nav(route.name === 'word' ? 'words' : route.name)]));
     switch (route.name) {
       case 'home':
         renderToday(content, isCurrent);
@@ -60,6 +67,9 @@ if (root) {
         break;
       case 'settings':
         renderSettings(content, isCurrent);
+        break;
+      case 'login':
+        renderLogin(content, isCurrent);
         break;
       case 'import':
         renderImport(content, isCurrent);

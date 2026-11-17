@@ -21,11 +21,14 @@ not ignored) breaks one of these rules. Every file is scanned as text
              inline <script>; markup files also no inline styles, event
              handler attributes or embedded frames;
 * R-92       no `pub(…)` restricted-visibility shortcuts in the Rust crates;
+* R-90       every Dockerfile's `FROM rust:<X>…` uses the release pinned in
+             rust-toolchain.toml (the image build does not read that file);
 * R-91       renovate.json: top-level minimumReleaseAge "14 days", every
              minimumReleaseAge anywhere equal to "14 days", only known presets.
 
 Afterwards it prints (without failing) the MUST requirements that no test
-names yet (tests start with their R-ID: `r23_…` in Rust, `test('R-23 …')` in JS).
+names yet (tests start with their R-ID: `r23_…` in Rust, `test('R-23 …')` in JS,
+`test_r23_…` in tools/tests).
 
 Standard library only. Self-tests: tools/tests/test_repo_guard.py.
 """
@@ -170,6 +173,31 @@ def check(root: Path, files: list[str]) -> list[str]:
             problems += check_fixture(rel, text)
 
     problems += check_renovate(root)
+    problems += check_rust_images(root, files)
+    return problems
+
+
+RUST_IMAGE = re.compile(r"^\s*FROM\s+(?:--\S+\s+)*(?:docker\.io/)?(?:library/)?rust:(?P<version>[0-9.]+)\b", re.I | re.M)
+DOCKERFILE_NAME = re.compile(r"(^|/)(Dockerfile[^/]*|[^/]*\.dockerfile|Containerfile[^/]*)$", re.I)
+
+
+def check_rust_images(root: Path, files: list[str]) -> list[str]:
+    """Rust images in Dockerfiles must match rust-toolchain.toml's channel."""
+    toolchain = root / "rust-toolchain.toml"
+    channel = None
+    if toolchain.is_file():
+        m = re.search(r'^\s*channel\s*=\s*"([^"]+)"', toolchain.read_text(), re.M)
+        channel = m.group(1) if m else None
+    problems = []
+    for rel in files:
+        if not DOCKERFILE_NAME.search(rel) or not (root / rel).is_file():
+            continue
+        for m in RUST_IMAGE.finditer((root / rel).read_text(errors="replace")):
+            if m.group("version") != channel:
+                problems.append(
+                    f"{rel}:{line_of(m.string, m.start())}: rust:{m.group('version')} does not match "
+                    f"rust-toolchain.toml channel {channel!r} (R-90)"
+                )
     return problems
 
 
@@ -336,6 +364,9 @@ def coverage(root: Path, files: list[str]) -> list[str]:
         elif rel.endswith(".js") and re.search(r"(^|/)(test|e2e)/", rel):
             text = (root / rel).read_text(errors="replace")
             covered.update(f"R-{int(n):02d}" for n in re.findall(r"\btest\(\s*['\"`]R-(\d+)\b", text))
+        elif rel.endswith(".py") and rel.startswith("tools/tests/"):
+            text = (root / rel).read_text(errors="replace")
+            covered.update(f"R-{int(n):02d}" for n in re.findall(r"\bdef test_r(\d+)_", text))
     return [r for r in must if r not in covered]
 
 

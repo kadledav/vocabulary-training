@@ -7,6 +7,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # release.yml runs these checks before it publishes an image.
+  workflow_call:
 
 permissions:
   contents: read
@@ -117,3 +119,28 @@ jobs:
         env:
           CI: "true"
         run: npm run e2e
+
+  image-smoke:
+    name: image (build, smoke tests R-83)
+    # Nothing is built or run before the age gate and guards have passed.
+    needs: guards
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The builder built into the runner: no BuildKit image is pulled; the base
+      # images and Debian packages are the pinned ones of the Dockerfile.
+      - name: Build the image (loaded locally, not pushed)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: docker/Dockerfile.server
+          load: true
+          push: false
+          provenance: false
+          sbom: false
+          tags: vocab-server:ci
+      - name: Smoke tests (read-only, no capabilities, non-root, no shell, login)
+        run: python3 tools/image-smoke.py vocab-server:ci

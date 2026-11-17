@@ -1,5 +1,5 @@
 // @ts-check
-/** Hash routes (`#/`, `#/practice`, `#/summary`, `#/settings`, `#/import`, `#/words`, `#/words/12`). */
+/** Hash routes (`#/`, `#/practice`, `#/summary`, `#/settings`, `#/import`, `#/words`, `#/words/12`, `#/login`). */
 
 /**
  * @typedef {{ name: string, params: Record<string, string> }} Route
@@ -15,7 +15,7 @@ export function parseRoute(hash) {
   const path = hash.replace(/^#/, '') || '/';
   const parts = path.split('/').filter((part) => part !== '');
   if (parts.length === 0) return { name: 'home', params: {} };
-  if (parts.length === 1 && ['practice', 'summary', 'settings', 'import', 'words'].includes(parts[0])) {
+  if (parts.length === 1 && ['practice', 'summary', 'settings', 'import', 'words', 'login'].includes(parts[0])) {
     return { name: parts[0], params: {} };
   }
   if (parts[0] === 'words' && parts.length === 2 && /^[0-9]+$/.test(parts[1])) {

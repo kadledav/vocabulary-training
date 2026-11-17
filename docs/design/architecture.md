@@ -2,7 +2,7 @@
 
 Status: **design v1.0 for phase 1** · Date: 2026-11-17 · Author: design agent · Reviewer: guarantor
 Inputs: `docs/requirements.md` (v1.0 incl. the R-85 storage change and R-59), `docs/claude-project-instructions.txt` (pack format v1, single source of the instruction text), `docs/research/training-ui.md` (as amended by R-74), the owner's home infrastructure (`home/INFRASTRUCTURE.md`, Traefik and `another-service-notify` stacks).
-Hostname: `vocab.example.home` is a placeholder for the owner's real hostname (kept out of this public repo; set via `public_origin` in `config.json` and the Traefik rule in the home repo).
+Hostname: `vocab.example.home` is a placeholder for the owner's real hostname (kept out of this public repo; set via `VOCAB_PUBLIC_ORIGIN` in the Compose environment and the Traefik rule in the home repo).
 Companion file: `docs/vocab-pack.schema.json` (JSON Schema draft 2020-12 for pack format v1).
 
 The owner does not review this design; he wants a working app quickly and will give feedback by using it. So this document **decides** wherever a decision is reversible and lists only genuinely irreversible or out-of-scope items for him (§19.3).
@@ -19,7 +19,7 @@ The owner does not review this design; he wants a working app quickly and will g
 | Storage | SQLite via `rusqlite` (bundled SQLite), WAL journal, `synchronous=FULL`, one file set in `/data`. Migrations embedded, forward-only, `PRAGMA user_version`. |
 | Scheduling | **`fsrs` crate 6.6.2** (the reference FSRS-6 implementation used by Anki), incl. in-app parameter fitting. |
 | TTS | **Kokoro-82M v1.0** (Apache-2.0 weights) run by **sherpa-onnx 2.0.1** inside a separate hardened `vocab-tts` container with no network except an internal-only Docker network. MP3 (LAME), loudness-normalised to −16 LUFS. Default voice `af_heart` (US), `bf_emma` (UK) for R-42. |
-| Images | App: static musl binary on `gcr.io/distroless/static-debian13:nonroot` (pinned digest). TTS: `gcr.io/distroless/cc-debian13:nonroot` (pinned digest). Both run as UID/GID **65532:65532**, read-only rootfs, `cap_drop: ALL`, `no-new-privileges`, limits. |
+| Images | App: static musl binary on `gcr.io/distroless/static-debian13:nonroot` (pinned digest). TTS: `gcr.io/distroless/cc-debian13:nonroot` (pinned digest). Both default to UID/GID **65532:65532** (deployed as 3101:3101), read-only rootfs, `cap_drop: ALL`, `no-new-privileges`, limits. |
 | Network | Traefik `home` entrypoint only, host `vocab.example.home`; no `websecure` router, no published ports, no mesh VPN. TTS container only on an `internal: true` network. |
 | Auth | Single password (argon2id hash in `.env`) → 180-day `__Host-` session cookie (SameSite=Strict, HttpOnly, Secure). Separate bearer **import token** for the connector, scoped to 2 endpoints. Origin check on every state-changing request. Global login throttling. |
 | Backup | None in the app (R-85): ZFS dataset `tank/services/vocabulary`, replicated daily by the existing job. App keeps all DB files in `/data` and runs `quick_check` at start. |
@@ -63,7 +63,7 @@ The owner does not review this design; he wants a working app quickly and will g
                                           ▼  network proxy-net
                               ┌────────────────────────────┐
  Claude Desktop (Mac)         │ vocabulary  (vocab-server) │   /data  (rw)  SQLite + WAL
-  └ vocab connector .mcpb ───►│  :8080  HTTP API + SPA     │   /config (ro) config.json
+  └ vocab connector .mcpb ───►│  :8080  HTTP API + SPA     │   (config: environment)
     (bearer import token,     │  background: audio queue,  │   /cache (rw)  audio/*.mp3
      over LAN/VPN,      │  daily maintenance         │
      HTTPS via Traefik)       └──────────────┬─────────────┘
@@ -104,7 +104,7 @@ Subcommands: `serve` (default), `healthcheck` (GET `http://127.0.0.1:8080/health
 
 | Module | Responsibility | Owned state | Public interface (function level) |
 |---|---|---|---|
-| `config` | Load non-secret config from `/config/config.json` (optional file; unknown keys = startup error) and secrets from env. | — | `Config::load() -> Result<Config>`; fields: `public_origin`, `timezone`, `day_rollover_hour`, `listen`, `tts_url`, `log_level`, `session_days`, `limits{…}`, paths. Secrets as opaque types (`PasswordHash`, `ImportToken`, `TtsToken`) with `Debug` that prints `***`. |
+| `config` | Load non-secret config from `VOCAB_*` environment variables (unknown `VOCAB_*` or invalid values = startup error); secrets are read by `auth`. | — | `Config::load() -> Result<Config>`; fields: `public_origin`, `day_rule`, `listen`, `log_level`, `session_days`, `limits`, paths. Secrets as opaque types with `Debug` that prints `***`. |
 | `clock` | Time source and study-day arithmetic (injectable for tests). | — | `trait Clock { fn now(&self) -> Timestamp }`; `StudyDay::of(ts, &DayRule) -> StudyDay`; `StudyDay::{add_days, days_between}`. Uses `jiff` with bundled tzdb (the image has no `/usr/share/zoneinfo`). |
 | `db` | Connection, PRAGMAs, migrations, integrity check; async wrappers. | the SQLite file set; `schema_migrations` via `PRAGMA user_version` | `Db::open(path) -> Result<Db>`; `Db::read(|&Connection| …)`, `Db::write(|&Transaction| …)` (run on `spawn_blocking`, one connection behind a mutex — single user, ample). |
 | `catalog` | Vocabulary: sources, words, sentences, lists, forms, owner overrides, pack conflicts. Merge rules (§5.4). | tables `source`, `word`, `word_source`, `word_item`, `word_form`, `sentence`, `word_override`, `field_conflict` | `upsert_source(tx, &PackSource, ctx) -> SourceId`; `merge_word(tx, SourceId, &PackWord, ctx) -> WordMerge`; `preview_word(conn, &PackWord) -> WordMerge` (dry run); `word_view(conn, WordId)`; `search(conn, &WordQuery) -> Vec<WordRow>`; `update_word(tx, WordId, WordPatch)`; `delete_word(tx, WordId)`; `update_sentence(tx, SentenceId, en, cs)`; `set_sentence_hidden(tx, SentenceId, bool)`; `resolve_conflict(tx, ConflictId, Resolution)`; `add_owner_accepted(tx, WordId, &str)`; `traits(conn, &[WordId]) -> Vec<WordTraits>`; `presentation(conn, WordId) -> WordPresentation`; `speakables(conn) -> Vec<SpeakText>`; `sources(conn) -> Vec<SourceSummary>`; `feedback_items(conn) -> CatalogFeedback`; `export_all(conn) -> CatalogExport`. |
@@ -622,8 +622,8 @@ Practice item payload (everything needed to render offline later): `{item_id, ca
 
 - **Login:** global throttle (single user, so not per IP — X-Forwarded-For could be spoofed by any container on `proxy-net`): after 5 failures in 15 min, further attempts are refused for 15 min, doubling up to 24 h; success resets. Existing sessions keep working during a lockout.
 - **Connector:** 30 requests / 10 min per token; **paste import:** 30 / 10 min.
-- Body limits: 64 KiB default; 2 MiB `/api/import/*`; 1 MiB connector; 2 KiB login. Request timeout 30 s (import commit 120 s). Max 64 concurrent requests.
-- Security headers on every response: `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; media-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `Cross-Origin-Opener-Policy: same-origin`, `Permissions-Policy: camera=(), microphone=(), geolocation=()`, `Strict-Transport-Security: max-age=31536000` (this host only).
+- Body limits (over the limit → `413`): 64 KiB default; `/api/import/*` 5 MiB on the transport (a 2 MiB paste grows inside a JSON string), the decoded paste itself ≤ 2 MiB (else `422 invalid_paste`); 1 MiB connector; 2 KiB login. Request timeout 30 s (import commit 120 s). Max 64 concurrent requests.
+- Security headers on every response: `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; media-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: same-origin` (not `no-referrer`: Firefox then sends `Origin: null` on same-origin POSTs), `Cross-Origin-Opener-Policy: same-origin`, `Permissions-Policy: camera=(), microphone=(), geolocation=()`, `Strict-Transport-Security: max-age=31536000` (this host only).
 
 ---
 
@@ -687,32 +687,18 @@ Expected load: a 15-word pack ≈ 15 word clips + ~60 sentence clips; migrating 
 
 ### 12.1 Storage: ZFS dataset, UID/GID
 
-- Container UID/GID: **65532:65532** (distroless `nonroot`), fixed in the images and repeated in Compose.
+- Container UID/GID: the images default to **65532:65532** (distroless `nonroot`); the deployment runs them as the owner's TrueNAS user **3101:3101** (`user:` in Compose).
 - Owner, once (TrueNAS UI: Datasets → `tank/services` → Add dataset `vocabulary`, preset *Generic*; then in a shell):
 
 ```sh
-mkdir -p /mnt/tank/services/vocabulary/{data,config,cache}
-chown 65532:65532 /mnt/tank/services/vocabulary/data /mnt/tank/services/vocabulary/cache
-chmod 0700        /mnt/tank/services/vocabulary/data /mnt/tank/services/vocabulary/cache
-chown root:65532  /mnt/tank/services/vocabulary/config
-chmod 0750        /mnt/tank/services/vocabulary/config
-# config.json: owned by root, group-readable by the container
-install -o root -g 65532 -m 0640 config.json /mnt/tank/services/vocabulary/config/config.json
+mkdir -p /mnt/tank/services/vocabulary/{data,cache}
+chown 3101:3101 /mnt/tank/services/vocabulary/data /mnt/tank/services/vocabulary/cache
+chmod 0700      /mnt/tank/services/vocabulary/data /mnt/tank/services/vocabulary/cache
 ```
 
 - Backup: the existing recursive daily replication `tank/services` → `backup-tank/services` picks up the new child dataset automatically; check after the first run that `backup-tank/services/vocabulary` exists. ZFS snapshots are atomic across `data/vocabulary.sqlite`, `-wal` and `-shm`, and WAL mode is crash-safe, so every snapshot is a consistent DB. The app has no backup logic (R-85).
 
-`config/config.json` (non-secret; all keys except `public_origin` optional):
-
-```json
-{
-  "public_origin": "https://vocab.example.home",
-  "timezone": "Europe/Prague",
-  "day_rollover_hour": 4,
-  "tts_url": "http://vocabulary-tts:8090",
-  "log_level": "info"
-}
-```
+Configuration is environment only (no config file): `VOCAB_PUBLIC_ORIGIN` (required, e.g. `https://vocab.example.home`), `VOCAB_TIMEZONE` (default `Europe/Prague`), `VOCAB_DAY_ROLLOVER_HOUR` (default 4), `VOCAB_LOG_LEVEL` (default `info`); unknown `VOCAB_*` variables or invalid values stop the app with a message naming the variable.
 
 `.env` (in `home/docker/vocabulary/`, never committed; an `.env.example` with empty values is committed):
 
@@ -732,19 +718,19 @@ services:
     container_name: vocabulary
     image: ghcr.io/kadledav/vocabulary-training:0.1.0@sha256:<digest-from-CI>
     restart: unless-stopped
-    user: "65532:65532"
+    user: "3101:3101"
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     tmpfs:
       - /tmp:size=16m,mode=1777,noexec,nosuid,nodev
     environment:
+      - VOCAB_PUBLIC_ORIGIN=https://vocab.example.home
       - VOCAB_PASSWORD_HASH_B64=${VOCAB_PASSWORD_HASH_B64}
       - VOCAB_IMPORT_TOKEN=${VOCAB_IMPORT_TOKEN}
       - VOCAB_TTS_TOKEN=${VOCAB_TTS_TOKEN}
     volumes:
       - /mnt/tank/services/vocabulary/data:/data
-      - /mnt/tank/services/vocabulary/config:/config:ro
       - /mnt/tank/services/vocabulary/cache:/cache
     mem_limit: 256m
     memswap_limit: 256m
@@ -778,7 +764,7 @@ services:
     container_name: vocabulary-tts
     image: ghcr.io/kadledav/vocabulary-training-tts:0.1.0@sha256:<digest-from-CI>
     restart: unless-stopped
-    user: "65532:65532"
+    user: "3101:3101"
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
@@ -823,7 +809,7 @@ Notes:
 
 1. Stop the stack (Portainer → Stop, or `docker compose down`).
 2. Pick a snapshot: `zfs list -t snapshot -o name,creation -s creation tank/services/vocabulary` (local) or `backup-tank/services/vocabulary` (replica).
-3. Move the current data aside: `mv /mnt/tank/services/vocabulary/data /mnt/tank/services/vocabulary/data.broken-$(date +%F)` and `mkdir` a new `data` (`chown 65532:65532`, `chmod 0700`).
+3. Move the current data aside: `mv /mnt/tank/services/vocabulary/data /mnt/tank/services/vocabulary/data.broken-$(date +%F)` and `mkdir` a new `data` (`chown 3101:3101`, `chmod 0700`).
 4. Copy the **whole** `data/` directory from the snapshot — always the DB together with its `-wal`/`-shm` files, never the `.sqlite` alone:
    `cp -a /mnt/tank/services/vocabulary/.zfs/snapshot/<snap>/data/. /mnt/tank/services/vocabulary/data/`
    (from the replica: `/mnt/backup-tank/services/vocabulary/.zfs/snapshot/<snap>/data/.`).
@@ -835,7 +821,7 @@ Notes:
 
 - `docker/Dockerfile.server`: build stage `rust:1.99.0-slim-trixie@sha256:2752b332db73fdbb7dc576f06c82ed1f312005784ef913d7e04a28f5f55dc581` + `musl-tools` (exact Debian version pinned in the Dockerfile) + `rustup target add x86_64-unknown-linux-musl`; `cargo build --release --locked --target x86_64-unknown-linux-musl -p vocab-server`. Runtime stage `gcr.io/distroless/static-debian13:nonroot@sha256:25ac8f0c3b2334a9eb05452266bd4697864a8c8ef0ef71e5e6480d7f92868329`; copy `/vocab-server`; `USER 65532:65532`; `ENTRYPOINT ["/vocab-server"]`; `CMD ["serve"]`; OCI labels (source, MIT licence).
 - `docker/Dockerfile.tts`: build stage same Rust image; `ADD --checksum=sha256:<pinned> https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.1/sherpa-onnx-v2.0.1-linux-x64-static-lib.tar.bz2 /archives/` and `SHERPA_ONNX_ARCHIVE_DIR=/archives` (the `sherpa-onnx-sys` build script otherwise downloads the archive without checksum verification); model stage `ADD --checksum=sha256:60703707… …/tts-models/kokoro-multi-lang-v1_0.tar.bz2`, unpack (`bzip2` pinned), keep only the needed files. Runtime `gcr.io/distroless/cc-debian13:nonroot@sha256:08476c244888bfb425bae1ae4dd7c17f093e972aab8426883d97f3c6f280f7c1`; `/vocab-tts`, `/model/…`, `/licenses/…`.
-- Registry: `ghcr.io/kadledav/vocabulary-training` and `ghcr.io/kadledav/vocabulary-training-tts`, public (like the owner's other images). Tags `X.Y.Z` and `sha-<short>`; no `latest` is used for deployment. `docker/build-push-action` with `provenance: mode=max` and `sbom: true`.
+- Registry: `ghcr.io/kadledav/vocabulary-training` and `ghcr.io/kadledav/vocabulary-training-tts`, public (like the owner's other images). Tags `X.Y.Z` and `sha-<short>`; no `latest` is used for deployment. `docker/build-push-action` with `provenance: mode=max` and an SBOM builds the image **once** and pushes it as `sha-<short>`; `tools/release-promote.py` pulls that digest back, runs the smoke tests on it and only then adds the `X.Y.Z` tag to the same manifest (no rebuild).
 
 ---
 
@@ -858,7 +844,7 @@ Notes:
 | Requirement item | Control |
 |---|---|
 | R-83 minimal image, no shell, no package manager | App: `distroless/static-debian13:nonroot` + static binary. TTS: `distroless/cc-debian13:nonroot`. CI smoke test asserts `--entrypoint /bin/sh` fails. Healthchecks use the binaries themselves. |
-| R-83 fixed non-root UID/GID | `USER 65532:65532` in both images and `user: "65532:65532"` in Compose; dataset ownership per §12.1. |
+| R-83 fixed non-root UID/GID | `USER 65532:65532` in both images; Compose runs them as `user: "3101:3101"`; dataset ownership per §12.1. |
 | R-83 read-only rootfs; only data volume + small tmpfs writable | `read_only: true`; writable: `/data`, `/cache` (app only), `/tmp` tmpfs 16 MB `noexec`; SQLite `temp_store=MEMORY`. Config mounted `:ro`. |
 | R-83 cap_drop ALL, no-new-privileges, no socket, no host network, no published ports | Compose §12.2; app listens on 8080 (> 1024, no capability needed). |
 | R-83 memory, CPU, PID limits | App 256 MB / 1 CPU / 128 PIDs; TTS 1.5 GB / 2 CPU / 64 PIDs; swap disabled via `memswap_limit`. |
@@ -950,6 +936,7 @@ docs/                requirements.md  design/  research/  vocab-pack.schema.json
 
 - `rangeStrategy: bump` for Cargo keeps the `=x.y.z` exact pins. Security fixes are also held for 14 days (owner's hard rule, R-90); the CI age gate is the backstop for anything Renovate does not cover (transitive updates in lock-file maintenance, which Renovate does not age-filter: such a PR simply stays red until all its packages are 14 days old).
 - The sherpa-onnx archive checksum and the Kokoro model URL/checksum are updated by hand in the same PR (CI fails on a checksum mismatch). `fsrs` majors need a look at memory-state compatibility.
+- Debian packages of the build stages come from a fixed `snapshot.debian.org` timestamp (dated by dep-age); Renovate cannot bump it — timestamp and pins are updated by hand together (steps in the Dockerfile comment).
 
 ### 14.4 Tests keyed to R-IDs (R-94)
 
@@ -1208,4 +1195,4 @@ Nothing is marked infeasible.
 
 1. **Licence (FYI, no action unless he objects):** the TTS container image is a GPL-3.0 combined work (espeak-ng front-end of the TTS engine) and contains LGPL LAME; the app image and the repository stay MIT. Publishing the TTS image publicly on GHCR is fine because all sources are public. Alternative if he prefers: keep the `-tts` package private on GHCR (TrueNAS then needs a read-only GHCR pull token).
 2. **Hard rule consequence (FYI):** security fixes in dependencies are also held for 14 days (R-90). The design applies this everywhere (Renovate + CI gate) and does not add an exception mechanism.
-3. **Owner actions at M5 (not decisions):** create the dataset and ownership (§12.1), write `.env` and `config.json`, add the `vocab.example.home` DNS override on the LAN/VPN resolver, deploy the stack; at M11 install the Claude Desktop extension and enter the token.
+3. **Owner actions at M5 (not decisions):** create the dataset and ownership (§12.1), write `.env` (secrets) and the Compose environment, add the `vocab.example.home` DNS override on the LAN/VPN resolver, deploy the stack; at M11 install the Claude Desktop extension and enter the token.

@@ -4,6 +4,8 @@
 //! R-59 and R-84 end to end through the HTTP router. All data is synthetic:
 //! `test-…` ids and sentences invented for these tests (R-24, R-95).
 
+mod common;
+
 use std::sync::Arc;
 
 use axum::body::{Body, to_bytes};
@@ -32,8 +34,13 @@ fn app() -> TestApp {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = Db::open(dir.path()).expect("db");
     let clock = Arc::new(ManualClock::new(ts("2026-11-20T09:00:00Z")));
-    let state = AppState::with_clock(db, Arc::clone(&clock) as Arc<dyn Clock>, prague());
-    let router = http::app(state, &Limits::default());
+    let state = AppState::with_clock(
+        db,
+        Arc::clone(&clock) as Arc<dyn Clock>,
+        prague(),
+        common::long_auth(),
+    );
+    let router = common::logged_in(http::app(state, &Limits::default()));
     TestApp { dir, clock, router }
 }
 
@@ -110,7 +117,11 @@ impl TestApp {
     fn dump(&self) -> String {
         let conn = self.sql();
         let tables: Vec<String> = conn
-            .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name")
+            // The test client's login session is not part of what an import may touch.
+            .prepare(
+                "SELECT name FROM sqlite_schema WHERE type = 'table' AND name <> 'auth_session' \
+                 ORDER BY name",
+            )
             .expect("tables")
             .query_map([], |row| row.get(0))
             .expect("query")

@@ -1,0 +1,94 @@
+# Release (design §12.4, §14.2): on a version tag, run every CI check, then
+# build the server image ONCE, with SLSA provenance (mode=max) and an SBOM,
+# and push it under `sha-<short>` only. tools/release-promote.py pulls that
+# exact digest back, smoke-tests it and only then adds the `X.Y.Z` tag to the
+# same manifest (no rebuild; never `latest`). The digest goes into the job
+# summary and the GitHub release notes; deploy by tag AND digest.
+#
+# Every action is pinned by commit SHA, the BuildKit and SBOM-generator images
+# by digest; tools/dep-age.py dates all of them (R-90).
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  checks:
+    name: CI checks
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: publish image to GHCR
+    needs: checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Version from the tag
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          version="${TAG#v}"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo "tag $TAG is not vX.Y.Z" >&2; exit 1; fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "short=${COMMIT:0:7}" >> "$GITHUB_OUTPUT"
+      # Provenance and SBOM need a BuildKit container; its image is pinned.
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=moby/buildkit:v0.34.1@sha256:99368f3e46177c6405b9740e4461d91cee004128daeecca78d4ceac50ec1da5c
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build once and push under sha-<short>
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: docker/Dockerfile.server
+          push: true
+          provenance: mode=max
+          # SBOM attestation, made by a pinned generator image.
+          sbom: generator=docker/buildkit-syft-scanner:1.12.1@sha256:873a7458c3c8ac8e32c7b796c10e1600b07b963d2aa000a72a2d97aaaa2d6315
+          tags: ghcr.io/kadledav/vocabulary-training:sha-${{ steps.version.outputs.short }}
+          labels: |
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+      - name: Smoke-test the pushed digest, then tag it X.Y.Z
+        env:
+          NUMBER: ${{ steps.version.outputs.version }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: python3 tools/release-promote.py ghcr.io/kadledav/vocabulary-training "$DIGEST" "$NUMBER"
+      - name: Digest into the job summary and the release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          NUMBER: ${{ steps.version.outputs.version }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          ref="ghcr.io/kadledav/vocabulary-training:${NUMBER}@${DIGEST}"
+          notes="$(printf 'Server image, deploy by tag and digest:\n\n    %s\n\nIf this release adds a database migration, take a ZFS snapshot first (deploy/README.md).\n' "$ref")"
+          printf '%s\n' "$notes" >> "$GITHUB_STEP_SUMMARY"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            existing="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body)"
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes "$(printf '%s\n\n%s\n' "$existing" "$notes")"
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes "$notes" --verify-tag
+          fi

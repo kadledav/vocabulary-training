@@ -52,6 +52,17 @@ export function loadSettings() {
 }
 
 /**
+ * Fetch the settings again (after a login: the first load may have been
+ * refused).
+ *
+ * @returns {Promise<Settings>}
+ */
+export function reloadSettings() {
+  cached = null;
+  return loadSettings();
+}
+
+/**
  * Change some settings; resolves to the saved settings or an error message.
  *
  * @param {SettingsPatch} patch

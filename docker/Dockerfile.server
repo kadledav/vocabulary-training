@@ -1,0 +1,60 @@
+# vocab-server image (design §12.4, R-83): a static musl binary on distroless
+# "static" (no shell, no package manager, no libc), running as 65532:65532.
+#
+# Every input is pinned (R-90) and dated by tools/dep-age.py: base images by
+# tag and digest, Debian packages by exact version, crates by Cargo.lock.
+# Build from the repository root:
+#   docker build -f docker/Dockerfile.server -t vocab-server .
+
+# ── build stage ─────────────────────────────────────────────────────────────
+# The Rust release must match rust-toolchain.toml (checked by repo-guard);
+# rust-toolchain.toml itself is not in the build context, so the image's
+# own toolchain is used and nothing else is installed by rustup.
+FROM rust:1.99.0-slim-trixie@sha256:2752b332db73fdbb7dc576f06c82ed1f312005784ef913d7e04a28f5f55dc581 AS build
+
+# musl toolchain for the static build (the bundled SQLite is C), from a fixed
+# snapshot of the Debian archive, so the pinned versions stay installable
+# when trixie moves on. The dry run first proves that apt installs exactly
+# these three pinned packages and nothing unpinned.
+# To update: pick a snapshot timestamp at least 14 days old
+# (https://snapshot.debian.org/archive/debian/?year=…), take the versions of
+# musl, musl-dev and musl-tools in its dists/trixie/main/binary-amd64/Packages,
+# and change the timestamp and all six pins together (Renovate cannot).
+RUN echo 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/20261101T000000Z trixie main' > /etc/apt/sources.list \
+ && rm -f /etc/apt/sources.list.d/debian.sources \
+ && apt-get update \
+ && test "$(apt-get install -s --no-install-recommends musl=1.2.5-3.1~deb13u1 musl-dev=1.2.5-3.1~deb13u1 musl-tools=1.2.5-3.1~deb13u1 | grep -c '^Inst ')" = 3 \
+ && apt-get install -y --no-install-recommends musl=1.2.5-3.1~deb13u1 musl-dev=1.2.5-3.1~deb13u1 musl-tools=1.2.5-3.1~deb13u1 \
+ && rm -rf /var/lib/apt/lists/*
+
+# The musl standard library of the image's (pinned) Rust release.
+RUN rustup target add x86_64-unknown-linux-musl
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates crates
+COPY web web
+RUN cargo build --release --locked --target x86_64-unknown-linux-musl -p vocab-server \
+ && install -D -m 0755 target/x86_64-unknown-linux-musl/release/vocab-server /out/vocab-server \
+ && mkdir -p /out/data /out/cache
+
+# ── runtime stage ───────────────────────────────────────────────────────────
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:25ac8f0c3b2334a9eb05452266bd4697864a8c8ef0ef71e5e6480d7f92868329
+
+LABEL org.opencontainers.image.title="vocabulary-training" \
+      org.opencontainers.image.description="Vocabulary training app (vocab-server)" \
+      org.opencontainers.image.source="https://github.com/kadledav/vocabulary-training" \
+      org.opencontainers.image.licenses="MIT"
+
+COPY --from=build /out/vocab-server /vocab-server
+# Mount points. /data and /cache belong to the image's default user, so a
+# fresh named volume is writable; bind mounts get their ownership from the
+# host (deploy/README.md runs the app as 3101:3101). Configuration comes from
+# the environment (VOCAB_PUBLIC_ORIGIN, …); there is no config file.
+COPY --from=build --chown=65532:65532 /out/data /data
+COPY --from=build --chown=65532:65532 /out/cache /cache
+
+USER 65532:65532
+EXPOSE 8080
+ENTRYPOINT ["/vocab-server"]
+CMD ["serve"]

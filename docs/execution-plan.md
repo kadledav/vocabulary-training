@@ -1,6 +1,6 @@
 # Execution Plan — phase 1
 
-Status: **RUNNING M5 (resumed 2026-11-17)** — cap for this run: **20 % weekly usage** (owner's decision). Single branch `main`.
+Status: **PAUSED after M5 (2026-11-17)** — first usable version; waiting for the owner to push (CI verifies the image), tag a release and deploy. Next: owner feedback, then M6 (neural TTS). Single branch `main`.
 Guarantor: Claude (main session). The guarantor does not write application code; it briefs agents, runs verification commands, reviews, and decides.
 
 Inputs: `docs/requirements.md` (v1.0) · `docs/design/architecture.md` (after guarantor review) · `docs/research/training-ui.md` · `docs/claude-export-instructions.md` · `docs/vocab-pack.schema.json`
@@ -97,6 +97,9 @@ Estimate: design 0.2–0.4 M tokens · implementation 3–6 M · testing 0.5–1
 | 2026-11-17 | M4 fix round done (339 Rust, 36 node, 111 Playwright ×2 repeat green); M4 committed 4c3fbe7 | | owner push pending |
 | 2026-11-17 | **PAUSED** before M5 — end of the night run (M5 incl. reviews would likely cross that night's 18 % cap) | | next: M5 auth + image + deploy |
 | 2026-11-17 | Resumed (owner: "continue"); `phase-1` fast-forwarded into `main`, single branch from now on; owner set the cap for this run to 20 % | 14 % | M5 implementation agent started |
+| 2026-11-17 | M5 implemented (463k tokens): auth module, rate limits, login screen, hash-password, Dockerfile.server, image-smoke CI job, release workflow, deploy/; gates green (370 Rust, 118 Playwright, dep-age 240) | 15 % | first CI run of M1–M4 on GitHub: all jobs green |
+| 2026-11-17 | M5 bug review: no auth/CSRF/session holes; 8 confirmed (dep-age bypasses ×5, default-port origin, rate_limit visibility, release pushed untested build) + 5 plausible accepted (Referrer-Policy for Firefox, Debian snapshot pin, .env note, lockout decay, 413). Testing agent: 34 contract tests, 0 defects | 16 % | |
+| 2026-11-17 | M5 fix round incl. owner changes: config via env variables only (no config file), deployment UID:GID 3101:3101; gates green (398 Rust, 67 tool tests, 132 Playwright, cargo-deny ok, repo-guard ok; dep-age 0 too young, GitHub API rate-limited locally → verified in CI); real-export smoke with env config: login, 74 words/223 sentences import, re-import no-op, logout → 401, no book text in logs. M5 committed | 16 % | image build, smoke tests and release workflow only verifiable in CI after push |
 
 ### Resume notes for M5
 - Docker is not installed on the Mac: image build and smoke tests run only in GitHub Actions → the owner pushes, guarantor reads CI results.

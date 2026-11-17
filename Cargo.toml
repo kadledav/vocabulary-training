@@ -16,8 +16,13 @@ publish = false
 # "bump") only after the 14-day minimum release age; `tools/dep-age.py`
 # checks the whole Cargo.lock, transitive crates included.
 [workspace.dependencies]
+# Password verification (design §9.1): argon2id PHC strings. Default features
+# off: salts come from `getrandom` directly, no `rand_core`/`getrandom` 0.3.
+argon2 = { version = "=0.6.0", default-features = false, features = ["alloc", "password-hash"] }
 # `query`: query-string parameters of the read endpoints (design §8).
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "json", "matched-path", "query"] }
+# `VOCAB_PASSWORD_HASH_B64`: the PHC string in standard base64 (design §9.1).
+base64ct = { version = "=1.8.3", features = ["alloc"] }
 # FSRS-6 scheduler (design §6.1). Default features off: the optimiser is
 # part of the default build already; `experimental_cost_adr` is not used.
 fsrs = { version = "=6.6.2", default-features = false }
@@ -38,6 +43,8 @@ rusqlite = { version = "=0.41.1", features = ["bundled"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
 sha2 = "=0.11.1"
+# Constant-time comparison of the import token digest (design §9.2).
+subtle = "=2.6.1"
 thiserror = "=2.0.21"
 tokio = { version = "=1.54.1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "=0.1.44"
@@ -59,6 +66,15 @@ missing_debug_implementations = "warn"
 dbg_macro = "warn"
 todo = "warn"
 unwrap_used = "warn"
+
+# Password hashing is expensive on purpose (argon2id, 19 MiB); unoptimised it
+# takes seconds, which every test that logs in would pay. Only these crates
+# are optimised in dev/test builds; release builds optimise everything anyway.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
 
 [profile.release]
 lto = true

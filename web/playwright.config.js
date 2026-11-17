@@ -17,6 +17,9 @@ export default defineConfig({
   reporter: process.env.CI ? [['list'], ['github']] : 'list',
   use: {
     trace: 'retain-on-failure',
+    // The test servers sit behind an HTTPS proxy with a throw-away
+    // self-signed certificate (e2e/server.js): the session cookie is Secure.
+    ignoreHTTPSErrors: true,
   },
   projects: [
     {

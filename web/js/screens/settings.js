@@ -3,9 +3,10 @@
  * Settings (design §7.1 screen 10, M4 part): new words per day, block size,
  * theme, rating legend; voice, speed and auto-play are stored for the
  * neural audio of M6 (browser speech already uses voice and speed). Every
- * change is saved at once.
+ * change is saved at once. "Log out" ends this device's session.
  */
 
+import { logout } from '../auth.js';
 import { h, mount } from '../dom.js';
 import { loadSettings, saveSettings } from '../settings.js';
 
@@ -83,7 +84,32 @@ function numberField(id, label, help, value, min, max, onChange) {
 export function renderSettings(root, isCurrent) {
   const status = h('p', { class: 'status', role: 'status', 'data-testid': 'settings-status' });
   const form = h('div', { class: 'settings' }, h('p', { class: 'muted' }, 'Loading…'));
-  mount(root, h('h1', {}, 'Settings'), form, status);
+  const logoutButton = h(
+    'button',
+    {
+      type: 'button',
+      'data-testid': 'logout',
+      onclick: () => {
+        logoutButton.disabled = true;
+        void (async () => {
+          const answer = await logout();
+          logoutButton.disabled = false;
+          if (!isCurrent()) return;
+          if (answer.ok) window.location.hash = '#/login';
+          else status.textContent = answer.message;
+        })();
+      },
+    },
+    'Log out',
+  );
+  const account = h(
+    'section',
+    { class: 'settings account' },
+    h('h2', {}, 'Account'),
+    h('p', { class: 'muted small' }, 'Logging out ends the session on this device only.'),
+    logoutButton,
+  );
+  mount(root, h('h1', {}, 'Settings'), form, account, status);
 
   /** @param {SettingsPatch} patch */
   const save = async (patch) => {
