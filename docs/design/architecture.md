@@ -1086,7 +1086,7 @@ Renovate itself runs as the hosted GitHub App (not a pinned dependency of the re
 
 ## 17. Implementation plan
 
-Each milestone is sized for one implementation-agent run, leaves `main`/`phase-1` green (fmt, clippy `-D warnings`, tests, dep-age), and ends with the guarantor's checks. The data model (all tables of §4) and the pack format are complete from M1/M2 so later milestones add behaviour, not migrations.
+Each milestone is sized for one implementation-agent run, leaves `main` green (fmt, clippy `-D warnings`, tests, dep-age), and ends with the guarantor's checks. The data model (all tables of §4) and the pack format are complete from M1/M2 so later milestones add behaviour, not migrations.
 
 | # | Milestone | Done when | R-IDs |
 |---|---|---|---|

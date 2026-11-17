@@ -1,6 +1,6 @@
 # Execution Plan — phase 1
 
-Status: **PAUSED after M4 (2026-11-17)** — the night run of 2026-11-17 had a cap of 18 % weekly usage (owner's decision); M5 was not started because it would likely have crossed that cap. Resume with M5 when the owner says "continue".
+Status: **RUNNING M5 (resumed 2026-11-17)** — cap: the default stop at 80 % weekly usage (§3). Single branch `main`.
 Guarantor: Claude (main session). The guarantor does not write application code; it briefs agents, runs verification commands, reviews, and decides.
 
 Inputs: `docs/requirements.md` (v1.0) · `docs/design/architecture.md` (after guarantor review) · `docs/research/training-ui.md` · `docs/claude-export-instructions.md` · `docs/vocab-pack.schema.json`
@@ -12,18 +12,18 @@ Inputs: `docs/requirements.md` (v1.0) · `docs/design/architecture.md` (after gu
 - [ ] Design agent finished; guarantor reviewed `architecture.md` against every R-ID and fixed gaps with the design agent. Owner is **not** asked to approve (decision 2026-11-17) — only irreversible items are escalated (public exposure, paid services, licence problems, breaking the 14-day dependency rule).
 - [ ] Milestone list in §2 filled in from the reviewed design.
 - [ ] Toolchain check on the Mac (whatever the design chose: e.g. Rust toolchain, Docker) — report what is missing instead of installing silently.
-- [ ] Ask the owner once: OK to commit the docs and create branch `phase-1`? (Commits/pushes only with the owner's OK.)
+- [x] Commits go straight to `main` (single branch, owner's decision 2026-11-17); the owner pushes.
 
 ## 1. Loop per milestone
 
 | Step | Who | Model | What | Output |
 |---|---|---|---|---|
-| 1 | **Implementation agent** | Opus | Builds the milestone from the design section + R-IDs + "done when". Follows the owner's rules (below). | Code on branch `phase-1`, short report |
+| 1 | **Implementation agent** | Opus | Builds the milestone from the design section + R-IDs + "done when". Follows the owner's rules (below). | Code on `main` (uncommitted until acceptance), short report |
 | 2 | **Guarantor check** | — | Runs build, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` (all feature combos), existing tests, lock-file dependency-age check. Anything red → back to step 1. | Pass / list of failures |
 | 3 | **Testing agent** | Sonnet | Writes tests **from the requirements, not from the code**, keyed by R-ID, synthetic fixtures only; runs them. | Tests + failing list |
 | 4 | **Bug-finding agent** | Opus, fresh context | Independent review of the milestone diff (doesn't see the implementer's reasoning): correctness, security (R-83/R-84), encapsulation, thin-app principle violations. Each finding verified before it counts. | Confirmed findings |
 | 5 | **Fix loop** | Opus | Implementation agent fixes failing tests + confirmed findings. Max 2 rounds; then the guarantor decides (fix later / accept / escalate). | |
-| 6 | **Guarantor acceptance** | — | R-ID checklist for the milestone, all checks green, commit on `phase-1`, **usage check** (§3). | Milestone done |
+| 6 | **Guarantor acceptance** | — | R-ID checklist for the milestone, all checks green, commit on `main`, **usage check** (§3). | Milestone done |
 
 Rules passed to every agent:
 - Never use any dependency release < 14 days old (incl. transitive, ML models, base images, Actions); pin exactly; check the lock file.
@@ -69,7 +69,7 @@ Estimate: design 0.2–0.4 M tokens · implementation 3–6 M · testing 0.5–1
 ## 4. Owner actions (cannot be done by agents)
 
 - At M4: create ZFS dataset `tank/services/vocabulary` with `data/`, `config/`, `cache/` and the ownership/ACL for the container UID/GID (from the design); create `.env` with secrets; deploy the stack (Portainer/TrueNAS); add the DNS name for the `home` entrypoint.
-- **Pushes to GitHub are done by the owner** (no GitHub credentials in the agent shell). The guarantor commits accepted milestones locally on `phase-1` and tells the owner when there is something to push.
+- **Pushes to GitHub are done by the owner** (no GitHub credentials in the agent shell). The guarantor commits accepted milestones locally on `main` and tells the owner when there is something to push.
 - Paste the export instructions into the claude.ai project and produce the first real packs (incl. converting the old Bobiverse pages).
 
 ## 5. Progress log
@@ -96,6 +96,7 @@ Estimate: design 0.2–0.4 M tokens · implementation 3–6 M · testing 0.5–1
 | 2026-11-17 | M4 testing agent: 37 e2e contract tests, 4 defects; bug review: 10 findings (double-tap reveals next answer, lost-response rating mismatch, stalled request lock, dep-age YAML block bypass, Czech keyboard digits, …); fix round H1–H11, T1–T4, G sent | ~14 % | |
 | 2026-11-17 | M4 fix round done (339 Rust, 36 node, 111 Playwright ×2 repeat green); M4 committed 4c3fbe7 | | owner push pending |
 | 2026-11-17 | **PAUSED** before M5 — end of the night run (M5 incl. reviews would likely cross that night's 18 % cap) | | next: M5 auth + image + deploy |
+| 2026-11-17 | Resumed (owner: "continue"); `phase-1` fast-forwarded into `main`, single branch from now on; cap = default 80 % | 14 % | |
 
 ### Resume notes for M5
 - Docker is not installed on the Mac: image build and smoke tests run only in GitHub Actions → the owner pushes, guarantor reads CI results.
