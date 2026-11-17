@@ -7,6 +7,7 @@
 
 import { getJson } from '../api.js';
 import { h, mount } from '../dom.js';
+import { displayIcon } from '../icon.js';
 import { markedText } from '../marked.js';
 
 /**
@@ -39,7 +40,31 @@ export function renderWords(root, isCurrent) {
     autocomplete: 'off',
     spellcheck: 'false',
   });
-  const sourceSelect = h('select', { 'aria-label': 'Source' }, h('option', { value: '' }, 'All sources'));
+  // Radio buttons rather than a <select>: WebKit's built-in select styles
+  // are refused by the CSP (style-src 'self'), and radios are easier to tap.
+  let source = '';
+  /**
+   * @param {string} value
+   * @param {string} label
+   */
+  const sourceOption = (value, label) =>
+    h(
+      'label',
+      { class: 'choice-option' },
+      h('input', {
+        type: 'radio',
+        name: 'word-source',
+        value,
+        checked: value === source,
+        onchange: () => {
+          source = value;
+          void load();
+        },
+      }),
+      ' ',
+      label,
+    );
+  const sourceChoice = h('fieldset', { class: 'word-sources' }, h('legend', {}, 'Source'), sourceOption('', 'All sources'));
   const list = h('div', { class: 'word-list' }, h('p', { class: 'muted' }, 'Loading…'));
   let generation = 0;
 
@@ -47,7 +72,7 @@ export function renderWords(root, isCurrent) {
     const mine = ++generation;
     const params = new URLSearchParams();
     if (search.value.trim()) params.set('q', search.value.trim());
-    if (sourceSelect.value) params.set('source', sourceSelect.value);
+    if (source) params.set('source', source);
     const answer = /** @type {import('../api.js').ApiResult<WordRow[]>} */ (
       await getJson(`/api/words?${params}`)
     );
@@ -84,12 +109,11 @@ export function renderWords(root, isCurrent) {
   };
 
   search.addEventListener('input', () => void load());
-  sourceSelect.addEventListener('change', () => void load());
 
   mount(
     root,
     h('h1', {}, 'Words'),
-    h('div', { class: 'filters' }, search, sourceSelect),
+    h('div', { class: 'filters' }, search, sourceChoice),
     list,
   );
 
@@ -100,7 +124,7 @@ export function renderWords(root, isCurrent) {
         const label =
           `${source.title} (${source.word_count})` +
           (source.reading_position ? ` — ${source.reading_position}` : '');
-        sourceSelect.append(h('option', { value: String(source.id) }, label));
+        sourceChoice.append(sourceOption(String(source.id), label));
       }
     }
   })();
@@ -129,7 +153,7 @@ function wordView(word) {
     'article',
     { class: 'word-view' },
     h('p', {}, h('a', { href: '#/words' }, '← Words')),
-    h('h1', { lang: 'en' }, word.icon && !/^[a-z-]+$/.test(word.icon) ? `${word.icon} ` : '', word.headword),
+    h('h1', { lang: 'en' }, displayIcon(word.icon) ? `${displayIcon(word.icon)} ` : '', word.headword),
     h('p', { class: 'meaning', lang: 'en' }, word.meaning),
     h(
       'dl',

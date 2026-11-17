@@ -8,7 +8,7 @@ use super::{ItemOrigin, SessionId, SessionStatus, build};
 use crate::catalog::{self, PresentedSentence, SourceId, WordId, WordPresentation};
 use crate::clock::{Moment, StudyDay};
 use crate::scheduler::{
-    self, CardFormat, CardId, CardKind, LeechState, RawGrade, ReviewId, ReviewOutcome,
+    self, CardFormat, CardId, CardKind, CardState, LeechState, RawGrade, ReviewId, ReviewOutcome,
 };
 
 /// The card part of an item.
@@ -24,6 +24,9 @@ pub struct ItemCard {
     pub is_repeat: bool,
     /// Leech flagged (R-55): the client shows the leech screen (M9).
     pub leech_flagged: bool,
+    /// The card's last rating was a fail (4/5): the client's slip guard
+    /// watches for a reflex "1" (design §7.2).
+    pub last_failed: bool,
 }
 
 /// The rating an item got.
@@ -211,6 +214,32 @@ pub fn active_id(conn: &Connection, day: StudyDay) -> rusqlite::Result<Option<Se
     Ok(id.map(SessionId))
 }
 
+/// How many blocks were finished with at least one rating (undone ratings
+/// do not count), in all and on one study day.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct FinishedBlocks {
+    /// Ever (the rating legend shows during the first blocks, design §7.2).
+    pub total: u32,
+    /// On the study day asked about ("Continue +20" on Today).
+    pub today: u32,
+}
+
+/// Finished blocks in all and on study day `day`.
+pub fn finished_blocks(conn: &Connection, day: StudyDay) -> rusqlite::Result<FinishedBlocks> {
+    conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(p.study_day = ?1), 0) FROM practice_session p \
+         WHERE p.status = 'finished' AND EXISTS (SELECT 1 FROM session_item i \
+         WHERE i.session_id = p.id AND i.review_id IS NOT NULL)",
+        [day],
+        |row| {
+            Ok(FinishedBlocks {
+                total: row.get(0)?,
+                today: row.get(1)?,
+            })
+        },
+    )
+}
+
 /// Unanswered items of a block.
 pub fn remaining(conn: &Connection, id: &SessionId) -> rusqlite::Result<u32> {
     conn.query_row(
@@ -285,6 +314,7 @@ fn item_view(
             is_new: item.origin == ItemOrigin::New,
             is_repeat: item.origin == ItemOrigin::Repeat,
             leech_flagged: card.leech == LeechState::Flagged,
+            last_failed: card.state == CardState::Relearning,
         },
         word,
         sentence,

@@ -255,6 +255,91 @@ class Workflows(RepoCase):
         tools = [f for f in result.findings if f.kind == "tool"]
         self.assertEqual(len(tools), 1, "only the clean workflow's cargo-deny line is accepted")
 
+    def test_r90_playwright_browsers_only_from_the_locked_version(self):
+        ok = self.workflow(
+            """\
+            - run: npx --no-install playwright install chromium webkit
+            - run: npx --no-install playwright install webkit && npm run e2e
+            """
+        )
+        self.assertEqual(ok.errors, [])
+        bad = self.workflow(
+            """\
+            - run: npx playwright install chromium
+            - run: npx --no-install playwright install --with-deps chromium
+            - run: npx --no-install playwright@1.65.0 install chromium
+            - run: npx --no-install playwright install
+            - run: npx --no-install playwright install chromium; npx -y cowsay
+            - run: npx --no-install playwright install chromium-headless-shell
+            """
+        )
+        # One error per line (on the last line only the trailing npx is refused).
+        flagged = {e.split(": ", 1)[0].rsplit(":", 1)[-1] for e in bad.errors if "'npx'" in e}
+        self.assertEqual(flagged, {"4", "5", "6", "7", "8", "9"}, bad.errors)
+
+    def test_r90_block_scalars_are_checked_as_whole_commands(self):
+        # Reviewer probe (M4 H6): continuation lines must not hide flags.
+        bad = self.workflow(
+            """\
+            - run: >
+                npx --no-install playwright install chromium
+                --with-deps
+            - run: >-
+                npm run e2e
+                -- --grep x
+            - run: |
+                npm ci --ignore-scripts
+                npm install left-pad
+            - run: npx --no-install playwright install chromium
+                --with-deps
+            - name: x
+              run: "npm run e2e
+                && curl https://example.invalid"
+            """
+        )
+        flagged = {e.split(": ", 1)[0].rsplit(":", 1)[-1] for e in bad.errors if "install/download command" in e}
+        self.assertEqual(flagged, {"5", "8", "12", "13", "16"}, bad.errors)
+        ok = self.workflow(
+            """\
+            - run: |
+                npm ci --ignore-scripts
+                npm run e2e
+            - run: >
+                npx --no-install playwright install
+                chromium webkit
+            - name: Plain step
+              run: npm run test
+              working-directory: web
+            """
+        )
+        self.assertEqual(ok.errors, [])
+
+    def test_r90_trailing_backslash_continuations_are_rejected(self):
+        result = self.workflow(
+            """\
+            - run: |
+                npx --no-install playwright install chromium \\
+                  --with-deps
+            """
+        )
+        self.assertError(result, "trailing backslash")
+
+    def test_r90_download_redirecting_settings_are_rejected(self):
+        result = self.workflow(
+            """\
+            - env:
+                PLAYWRIGHT_DOWNLOAD_HOST: https://example.invalid
+                npm_config_registry: https://example.invalid
+                CARGO_REGISTRIES_X_INDEX: https://example.invalid
+                RUSTUP_DIST_SERVER: https://example.invalid
+                RUSTUP_UPDATE_ROOT: https://example.invalid
+              run: PLAYWRIGHT_BROWSERS_PATH=/tmp npx --no-install playwright install webkit
+            """
+        )
+        for name in ["PLAYWRIGHT_DOWNLOAD_HOST", "npm_config_registry", "CARGO_REGISTRIES_X_INDEX",
+                     "RUSTUP_DIST_SERVER", "RUSTUP_UPDATE_ROOT", "PLAYWRIGHT_BROWSERS_PATH"]:
+            self.assertError(result, f"{name} can redirect")
+
     def test_r90_containers_escapes_and_explicit_keys_are_rejected(self):
         result = self.workflow(
             """\

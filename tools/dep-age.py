@@ -21,6 +21,10 @@ complete, and on anything it cannot verify (fail closed):
         cargo install --locked <crate> --version X.Y.Z               -> crates.io API
         rustup toolchain install          (installs rust-toolchain.toml's version)
         npm ci --ignore-scripts / npm run <script>   (lock file checked above)
+        npx --no-install playwright install <chromium|webkit|firefox>…
+                                          (browsers of the Playwright version in the
+                                          lock file; --no-install never fetches another
+                                          version; no --with-deps, i.e. no OS packages)
       anything else (pip, npx, yarn, curl, docker, `| sh`, …) is an error;
     - container images, YAML escape sequences and explicit `? key` entries are errors.
 * dependency manifests the gate cannot check (requirements.txt, yarn.lock,
@@ -328,6 +332,7 @@ ALLOWED_COMMANDS = [
     re.compile(rf"\brustup toolchain install{END}"),
     re.compile(rf"\bnpm ci --ignore-scripts{END}"),
     re.compile(rf"\bnpm run [A-Za-z0-9:_-]+{END}"),
+    re.compile(rf"\bnpx --no-install playwright install(?: (?:chromium|webkit|firefox))+{END}"),
 ]
 COMMAND_TOKENS = re.compile(
     r"\bcargo\s+(?:install|binstall|\+)|\bcargo-binstall\b|\brustup\b"
@@ -340,11 +345,91 @@ COMMAND_TOKENS = re.compile(
     r"|\|\s*(?:ba|z|da|k)?sh\b|\b(?:ba|z|da|k)?sh\s+-c\b|\bsudo\b|\beval\b|\bsource\s+<\(",
     re.I,
 )
+# Settings that redirect where installers download from (or what they install).
+REDIRECT_ENV = re.compile(
+    r"\b(?:PLAYWRIGHT_[A-Z0-9_]*|npm_config_[A-Za-z0-9_]*|NPM_CONFIG_[A-Z0-9_]*|CARGO_[A-Z0-9_]*REGISTR[A-Z0-9_]*"
+    r"|RUSTUP_DIST_SERVER|RUSTUP_UPDATE_ROOT)\b"
+)
+TRAILING_BACKSLASH = re.compile(r"\\\s*$")
+BLOCK_SCALAR = re.compile(r"^(?P<indent>\s*)(?:-\s+)*(?:[\w\"'.-]+\s*:\s*)?(?P<style>[|>])[-+0-9]*\s*(?:#.*)?$")
+KEY_START = re.compile(r"^(?P<indent>\s*)(?:-\s+)*(?P<key>[\w\"'.-]+\s*:)(?:\s|$)")
 OTHER_FORBIDDEN = [
     (re.compile(r"\b(image|container|services)[\"']?\s*:"), "container images are not checked by the age gate yet"),
     (re.compile(r"\\[xuUN0-9]"), "YAML/shell escape sequences cannot be verified"),
     (re.compile(r"^\s*(?:-\s+)*\?(\s|$)"), "explicit '? key' YAML entries cannot be verified"),
 ]
+
+
+def indent_of(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def logical_commands(lines: list[str]) -> list[tuple[int, str]]:
+    """Join the physical lines of one YAML value into the logical command the
+    shell sees, so a continuation line cannot hide flags from the allow-list:
+
+    * folded block scalars (`key: >`) are joined into one command per paragraph;
+    * literal block scalars (`key: |`) give one command per line;
+    * a plain scalar continued on more-indented lines is joined into one.
+
+    Returns (first line number, text) pairs covering every line once."""
+    out: list[tuple[int, str]] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        block = BLOCK_SCALAR.match(line)
+        if block:
+            out.append((i + 1, line))
+            owner = indent_of(line)
+            body: list[tuple[int, str]] = []
+            j = i + 1
+            while j < len(lines) and (lines[j].strip() == "" or indent_of(lines[j]) > owner):
+                body.append((j + 1, lines[j]))
+                j += 1
+            if block.group("style") == "|":
+                out.extend((n, text) for n, text in body if text.strip())
+            else:
+                paragraph: list[tuple[int, str]] = []
+                for n, text in body + [(0, "")]:
+                    if text.strip():
+                        paragraph.append((n, text.strip()))
+                    elif paragraph:
+                        out.append((paragraph[0][0], " ".join(t for _, t in paragraph)))
+                        paragraph = []
+            i = j
+            continue
+        key = KEY_START.match(line)
+        joined = line
+        j = i + 1
+        if key and line[key.end():].strip() and not line.strip().endswith(":"):
+            column = line.index(key.group("key"))
+            while (
+                j < len(lines)
+                and lines[j].strip()
+                and not lines[j].lstrip().startswith("#")
+                and indent_of(lines[j]) > column
+                and not KEY_START.match(lines[j])
+                and not lines[j].lstrip().startswith("- ")
+            ):
+                joined += " " + lines[j].strip()
+                j += 1
+        out.append((i + 1, joined))
+        i = j
+    return out
+
+
+def check_commands(lineno: int, text: str, path: Path, result: Result) -> None:
+    where = f"{path}:{lineno}"
+    allowed_spans: list[tuple[int, int]] = []
+    for pattern in ALLOWED_COMMANDS:
+        for m in pattern.finditer(text):
+            allowed_spans.append(m.span())
+            if "crate" in pattern.groupindex:
+                crate, version = m.group("crate"), m.group("version")
+                result.add("tool", crate, version, lambda c=crate, v=version: crate_published(c, v), where)
+    for m in COMMAND_TOKENS.finditer(text):
+        if not any(start <= m.start() < end for start, end in allowed_spans):
+            result.errors.append(f"{where}: install/download command {m.group(0)!r} is not an allowed verified form")
 
 
 def scan_github_file(path: Path, root: Path, result: Result, queue: list[Path]) -> None:
@@ -354,8 +439,15 @@ def scan_github_file(path: Path, root: Path, result: Result, queue: list[Path]) 
     except UnicodeDecodeError:
         result.errors.append(f"{path}: not UTF-8; cannot be verified")
         return
-    for lineno, line in enumerate(text.splitlines(), 1):
+    lines = text.splitlines()
+    for lineno, logical in logical_commands(lines):
+        check_commands(lineno, logical, path, result)
+    for lineno, line in enumerate(lines, 1):
         where = f"{path}:{lineno}"
+        if TRAILING_BACKSLASH.search(line):
+            result.errors.append(f"{where}: a trailing backslash continues the command on the next line; cannot be verified")
+        for m in REDIRECT_ENV.finditer(line):
+            result.errors.append(f"{where}: {m.group(0)} can redirect what installers download; not allowed")
 
         if USES_WORD.search(line):
             m = USES_LINE.match(line)
@@ -371,17 +463,6 @@ def scan_github_file(path: Path, root: Path, result: Result, queue: list[Path]) 
                 result.add("node", "node", version, lambda v=version: node_published(v), where)
             else:
                 result.errors.append(f"{where}: only `node-version: X.Y.Z` is supported as a version input")
-
-        allowed_spans: list[tuple[int, int]] = []
-        for pattern in ALLOWED_COMMANDS:
-            for m in pattern.finditer(line):
-                allowed_spans.append(m.span())
-                if "crate" in pattern.groupindex:
-                    crate, version = m.group("crate"), m.group("version")
-                    result.add("tool", crate, version, lambda c=crate, v=version: crate_published(c, v), where)
-        for m in COMMAND_TOKENS.finditer(line):
-            if not any(start <= m.start() < end for start, end in allowed_spans):
-                result.errors.append(f"{where}: install/download command {m.group(0)!r} is not an allowed verified form")
 
         for pattern, why in OTHER_FORBIDDEN:
             if pattern.search(line):

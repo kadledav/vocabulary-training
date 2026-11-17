@@ -27,8 +27,8 @@ pub use build::{
 };
 pub use queue::{finish, rate, undo_last};
 pub use view::{
-    AnswerView, BlockSummary, ItemCard, ItemView, LookAgain, RateResult, SessionView, StartResult,
-    UndoResult, current,
+    AnswerView, BlockSummary, FinishedBlocks, ItemCard, ItemView, LookAgain, RateResult,
+    SessionView, StartResult, UndoResult, current, finished_blocks,
 };
 
 use crate::catalog::SourceId;

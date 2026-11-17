@@ -372,6 +372,9 @@ pub struct WordPresentation {
     pub id: WordId,
     pub headword: String,
     pub pronunciation: Option<String>,
+    /// Text for speech when it differs from the headword (pack `speak`);
+    /// the browser-speech fallback reads it (R-41).
+    pub speak: Option<String>,
     pub grammar: Option<String>,
     pub czech: Vec<String>,
     pub meaning: String,
@@ -398,8 +401,8 @@ pub struct WordPresentation {
 pub fn presentation(conn: &Connection, id: WordId) -> rusqlite::Result<Option<WordPresentation>> {
     let base = conn
         .query_row(
-            "SELECT headword, pronunciation, grammar, meaning, note, hint, icon, spelling, spelling_note \
-             FROM word WHERE id = ?1",
+            "SELECT headword, pronunciation, grammar, meaning, note, hint, icon, spelling, spelling_note, \
+             speak FROM word WHERE id = ?1",
             [id.0],
             |row| {
                 let spelling = row.get::<_, Option<bool>>(7)?.unwrap_or(false);
@@ -407,6 +410,7 @@ pub fn presentation(conn: &Connection, id: WordId) -> rusqlite::Result<Option<Wo
                     id,
                     headword: row.get(0)?,
                     pronunciation: row.get(1)?,
+                    speak: row.get(9)?,
                     grammar: row.get(2)?,
                     meaning: row.get(3)?,
                     note: row.get(4)?,

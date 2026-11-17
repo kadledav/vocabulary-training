@@ -16,3 +16,7 @@ __pycache__/
 # Root-level only: testdata/packs/ (synthetic fixtures) must stay tracked.
 /packs/
 /exports/
+
+# Playwright output
+/web/test-results/
+/web/playwright-report/

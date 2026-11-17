@@ -90,3 +90,7 @@ Estimate: design 0.2–0.4 M tokens · implementation 3–6 M · testing 0.5–1
 | 2026-11-17 | M3 implementation agent started | 10 % | |
 | 2026-11-17 | M3 implemented (345k tokens); gates green (286 tests, dep-age 210, cargo-deny ok); accepted deviations incl. backlog counts only served kinds (risk: Produce cards unlocked before M8 all due at once — handle in M8); M3 testing + bug-finding agents started | 11 % | |
 | 2026-11-17 | M3 testing agent: 35 contract tests, 1 low defect (UUID); bug review: 9 findings (undo vs import-unlocked cards, first-review format, scoped sentences, leech same-day, resume drops add-anyway, empty scope, expired block state, duplicated filters); fix round G1–G10 sent | ~12 % | |
+| 2026-11-17 | M3 fix round done (336 tests, migration 0003); real-word smoke: block of 5 new words by usefulness, ratings/requeue/undo/finish OK; M3 committed f7c2aeb | 12 % | owner push pending |
+| 2026-11-17 | M4 implementation agent started (est. 3–4 % incl. reviews) | 12 % | |
+| 2026-11-17 | M4 implemented (343k tokens); gates green (339 Rust, 34 node, 18 Playwright webkit-phone+chromium-desktop, dep-age 216); guarantor visual check of screenshots OK (note: "More" content hidden under fixed rating bar); M4 testing + bug-finding agents started | 13 % | |
+| 2026-11-17 | M4 testing agent: 37 e2e contract tests, 4 defects; bug review: 10 findings (double-tap reveals next answer, lost-response rating mismatch, stalled request lock, dep-age YAML block bypass, Czech keyboard digits, …); fix round H1–H11, T1–T4, G sent | ~14 % | |

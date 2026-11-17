@@ -8,6 +8,9 @@
 import { getJson, postJson } from '../api.js';
 import { h, mount } from '../dom.js';
 
+/** Longer than the server's own import timeout (120 s), so its answer arrives. */
+const IMPORT_TIMEOUT_MS = 130_000;
+
 const INSTRUCTIONS_URL =
   'https://github.com/kadledav/vocabulary-training/blob/main/docs/claude-project-instructions.txt';
 
@@ -273,7 +276,8 @@ export function renderImport(root, isCurrent) {
     previewed = mode === 'preview' ? '' : previewed;
     busy(true);
     const answer = /** @type {import('../api.js').ApiResult<ImportReport>} */ (
-      await postJson(`/api/import/${mode}`, { text })
+      // The server gives an import up to 120 s before it answers itself.
+      await postJson(`/api/import/${mode}`, { text }, { timeoutMs: IMPORT_TIMEOUT_MS })
     );
     if (!isCurrent()) return;
     if (answer.ok) {

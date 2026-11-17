@@ -8,7 +8,7 @@ use serde::Serialize;
 use crate::catalog::{self, SourceId, SourceSummary};
 use crate::clock::StudyDay;
 use crate::scheduler::{self, CardState};
-use crate::session::{self, NewAllowance, SessionId};
+use crate::session::{self, FinishedBlocks, NewAllowance, SessionId};
 use crate::settings;
 
 /// Days of the Today forecast.
@@ -49,6 +49,8 @@ pub struct TodayView {
     pub new_available: u32,
     pub new_words: NewAllowance,
     pub active_session: Option<ActiveBlock>,
+    /// Blocks finished in all and today (rating legend rule, "Continue").
+    pub finished_blocks: FinishedBlocks,
     /// All sources with their reading position (scope chooser).
     pub sources: Vec<SourceSummary>,
 }
@@ -116,6 +118,7 @@ pub fn today(
         new_available,
         new_words: session::new_word_allowance(conn, day, &settings)?,
         active_session,
+        finished_blocks: session::finished_blocks(conn, day)?,
         sources: catalog::sources(conn)?,
     })
 }

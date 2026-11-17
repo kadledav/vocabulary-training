@@ -1,26 +1,37 @@
 // @ts-check
 /**
- * Entry point of the single-page app: navigation and hash routing.
- * M2 has the Import page and a read-only word list; practice arrives in M4.
+ * Entry point of the single-page app: theme, navigation and hash routing.
+ * Practice is a focused screen with its own top bar (no navigation); the
+ * other screens share the navigation bar.
  */
 
 import { h, mount } from './dom.js';
 import { startRouter } from './router.js';
 import { renderImport } from './screens/import.js';
+import { renderPractice } from './screens/practice.js';
+import { renderSettings } from './screens/settings.js';
+import { renderSummary } from './screens/summary.js';
+import { renderToday } from './screens/today.js';
 import { renderWord, renderWords } from './screens/words.js';
+import { loadSettings } from './settings.js';
+import { applyRememberedTheme } from './theme.js';
+
+applyRememberedTheme();
+void loadSettings();
 
 const root = document.getElementById('app');
 
-/** @param {string} name */
+/** @param {string} name the route whose link is current */
 function nav(name) {
   const link = (/** @type {string} */ href, /** @type {string} */ label, /** @type {string} */ route) =>
     h('a', { href, 'aria-current': route === name ? 'page' : false }, label);
   return h(
     'nav',
-    { class: 'top' },
-    link('#/', 'Vocabulary', 'home'),
-    link('#/import', 'Import', 'import'),
+    { class: 'top', 'aria-label': 'Main' },
+    link('#/', 'Today', 'home'),
     link('#/words', 'Words', 'words'),
+    link('#/import', 'Import', 'import'),
+    link('#/settings', 'Settings', 'settings'),
   );
 }
 
@@ -29,9 +40,27 @@ if (root) {
   const content = h('div', { class: 'content' });
   root.before(header);
   mount(root, content);
+  /** @type {(() => void) | null} */
+  let leave = null;
   startRouter((route, isCurrent) => {
-    mount(header, nav(route.name === 'word' ? 'words' : route.name));
+    if (leave) leave();
+    leave = null;
+    const practice = route.name === 'practice';
+    document.body.classList.toggle('in-practice', practice);
+    mount(header, ...(practice ? [] : [nav(route.name === 'word' ? 'words' : route.name)]));
     switch (route.name) {
+      case 'home':
+        renderToday(content, isCurrent);
+        break;
+      case 'practice':
+        leave = renderPractice(content, isCurrent);
+        break;
+      case 'summary':
+        renderSummary(content, isCurrent);
+        break;
+      case 'settings':
+        renderSettings(content, isCurrent);
+        break;
       case 'import':
         renderImport(content, isCurrent);
         break;
@@ -41,20 +70,8 @@ if (root) {
       case 'word':
         void renderWord(content, route.params.id, isCurrent);
         break;
-      case 'home':
-        mount(
-          content,
-          h('h1', {}, 'Vocabulary'),
-          h(
-            'section',
-            { class: 'card' },
-            h('p', {}, 'Practice is not available yet.'),
-            h('p', {}, h('a', { href: '#/import' }, 'Import packs'), ' or ', h('a', { href: '#/words' }, 'browse the words'), '.'),
-          ),
-        );
-        break;
       default:
-        mount(content, h('h1', {}, 'Not found'), h('p', {}, h('a', { href: '#/' }, 'Home')));
+        mount(content, h('h1', {}, 'Not found'), h('p', {}, h('a', { href: '#/' }, 'Today')));
     }
     window.scrollTo(0, 0);
   });

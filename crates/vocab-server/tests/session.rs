@@ -1337,3 +1337,103 @@ async fn g10_client_review_ids_are_uuids_stored_lowercase() {
     assert_eq!(again["duplicate"], true);
     assert_eq!(env.int("SELECT COUNT(*) FROM review_log"), 1);
 }
+
+// ── what the practice UI needs (M4) ─────────────────────────────────────────
+
+#[tokio::test]
+async fn r62_items_tell_the_client_when_the_last_rating_was_a_fail() {
+    let env = env();
+    env.import(
+        "test-novel",
+        vec![word("alpha", 9, 3), word("beta", 8, 3), word("gamma", 7, 3)],
+    )
+    .await;
+    let session = start_block(&env).await;
+    assert!(
+        session["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .all(|i| i["card"]["last_failed"] == false),
+        "{session}"
+    );
+    // alpha rated 5 → its in-session repeat carries the flag (slip guard).
+    let rated = rate_next(&env, &session, 5).await;
+    let repeat_id = rated["repeat_item_id"].as_i64().expect("repeat item");
+    let repeat = rated["session"]["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|i| i["item_id"] == repeat_id)
+        .cloned()
+        .expect("repeat in queue");
+    assert_eq!(repeat["word"]["headword"], "alpha");
+    assert_eq!(repeat["card"]["last_failed"], true);
+    assert_eq!(next_item(&rated["session"])["card"]["last_failed"], false);
+}
+
+#[tokio::test]
+async fn r41_items_carry_the_text_for_speech() {
+    let env = env();
+    let mut spoken = word("alpha", 9, 3);
+    spoken["speak"] = json!("alpha speech");
+    env.import("test-novel", vec![spoken, word("beta", 8, 3)])
+        .await;
+    let session = start_block(&env).await;
+    let items = session["items"].as_array().expect("items");
+    assert_eq!(items[0]["word"]["speak"], "alpha speech");
+    assert!(items[1]["word"]["speak"].is_null());
+}
+
+#[tokio::test]
+async fn r62_today_counts_finished_blocks_for_the_legend_and_continue() {
+    let env = env();
+    env.import(
+        "test-novel",
+        vec![word("alpha", 9, 3), word("beta", 8, 3), word("gamma", 7, 3)],
+    )
+    .await;
+    set_settings(&env, json!({ "new_per_day": 1 })).await;
+    let fresh = today(&env, None).await;
+    assert_eq!(fresh["finished_blocks"], json!({ "total": 0, "today": 0 }));
+
+    let session = rate_all(&env, start_block(&env).await, 2).await;
+    // A block that is not finished yet does not count.
+    assert_eq!(today(&env, None).await["finished_blocks"]["total"], 0);
+    finish(&env, &session).await;
+    assert_eq!(
+        today(&env, None).await["finished_blocks"],
+        json!({ "total": 1, "today": 1 })
+    );
+
+    // A block ended without a rating, or whose only rating was undone,
+    // does not count.
+    let empty = start(&env, json!({ "kind": "continue" })).await;
+    if !empty["session"].is_null() {
+        finish(&env, &empty["session"]).await;
+    }
+    set_settings(&env, json!({ "new_per_day": 3 })).await;
+    let block = start_block(&env).await;
+    let rated = rate_next(&env, &block, 2).await;
+    let (status, _) = env
+        .post(
+            &format!("/api/sessions/{}/undo", session_id(&rated["session"])),
+            &json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    finish(&env, &block).await;
+    let unrated = start_block(&env).await;
+    finish(&env, &unrated).await;
+    assert_eq!(
+        today(&env, None).await["finished_blocks"],
+        json!({ "total": 1, "today": 1 })
+    );
+
+    // Next study day: the total stays, today starts at zero.
+    env.set_day("2026-11-21");
+    assert_eq!(
+        today(&env, None).await["finished_blocks"],
+        json!({ "total": 1, "today": 0 })
+    );
+}

@@ -67,7 +67,7 @@ jobs:
         run: cargo test --workspace --locked
 
   web:
-    name: web (typecheck)
+    name: web (typecheck, unit tests)
     needs: guards
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -85,3 +85,35 @@ jobs:
         run: npm ci --ignore-scripts
       - name: Type-check the frontend (tsc --noEmit, checkJs)
         run: npm run typecheck
+      - name: Unit tests of the frontend logic (node --test)
+        run: npm run test
+
+  e2e:
+    name: e2e (Playwright, WebKit phone + Chromium desktop)
+    needs: guards
+    # macOS: Playwright's WebKit runs there without extra OS packages, so
+    # nothing outside the lock files is installed (no OS packages).
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.22.2
+      - name: Install Rust toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - name: Build the server the tests start
+        run: cargo build --locked -p vocab-server
+      - name: Install dev dependencies from the lock file (no lifecycle scripts)
+        working-directory: web
+        run: npm ci --ignore-scripts
+      - name: Browsers of the locked Playwright version
+        working-directory: web
+        run: npx --no-install playwright install chromium webkit
+      - name: Playwright tests
+        working-directory: web
+        env:
+          CI: "true"
+        run: npm run e2e

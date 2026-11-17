@@ -45,11 +45,12 @@ export function h(tag, attrs = {}, ...children) {
 }
 
 /**
- * Replace all children of `parent`.
+ * Replace all children of `parent` (empty slots — null, undefined, false —
+ * are skipped).
  *
  * @param {Element} parent
- * @param {...Node} nodes
+ * @param {...(Node | null | undefined | false)} nodes
  */
 export function mount(parent, ...nodes) {
-  parent.replaceChildren(...nodes);
+  parent.replaceChildren(...nodes.filter((node) => node !== null && node !== undefined && node !== false));
 }
