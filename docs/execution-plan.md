@@ -1,6 +1,6 @@
 # Execution Plan — phase 1
 
-Status: **RUNNING M5 (resumed 2026-11-17)** — cap: the default stop at 80 % weekly usage (§3). Single branch `main`.
+Status: **RUNNING M5 (resumed 2026-11-17)** — cap for this run: **20 % weekly usage** (owner's decision). Single branch `main`.
 Guarantor: Claude (main session). The guarantor does not write application code; it briefs agents, runs verification commands, reviews, and decides.
 
 Inputs: `docs/requirements.md` (v1.0) · `docs/design/architecture.md` (after guarantor review) · `docs/research/training-ui.md` · `docs/claude-export-instructions.md` · `docs/vocab-pack.schema.json`
@@ -96,7 +96,7 @@ Estimate: design 0.2–0.4 M tokens · implementation 3–6 M · testing 0.5–1
 | 2026-11-17 | M4 testing agent: 37 e2e contract tests, 4 defects; bug review: 10 findings (double-tap reveals next answer, lost-response rating mismatch, stalled request lock, dep-age YAML block bypass, Czech keyboard digits, …); fix round H1–H11, T1–T4, G sent | ~14 % | |
 | 2026-11-17 | M4 fix round done (339 Rust, 36 node, 111 Playwright ×2 repeat green); M4 committed 4c3fbe7 | | owner push pending |
 | 2026-11-17 | **PAUSED** before M5 — end of the night run (M5 incl. reviews would likely cross that night's 18 % cap) | | next: M5 auth + image + deploy |
-| 2026-11-17 | Resumed (owner: "continue"); `phase-1` fast-forwarded into `main`, single branch from now on; cap = default 80 % | 14 % | |
+| 2026-11-17 | Resumed (owner: "continue"); `phase-1` fast-forwarded into `main`, single branch from now on; owner set the cap for this run to 20 % | 14 % | M5 implementation agent started |
 
 ### Resume notes for M5
 - Docker is not installed on the Mac: image build and smoke tests run only in GitHub Actions → the owner pushes, guarantor reads CI results.
