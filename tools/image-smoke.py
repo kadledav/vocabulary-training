@@ -78,6 +78,7 @@ FORBIDDEN_PATHS = frozenset([
 ])
 # The only program the image may hold.
 ALLOWED_EXECUTABLE = "vocab-server"
+ELF_MAGIC = b"\x7fELF"
 
 
 class SmokeFailure(Exception):
@@ -98,15 +99,18 @@ def failures() -> int:
     return sum(1 for _, ok, _ in RESULTS if ok is False)
 
 
-def image_programs(entries: list[tuple[str, int, bool]]) -> list[str]:
+def image_programs(entries: list[tuple[str, bool, bytes]]) -> list[str]:
     """Programs that must not be in the image, from its filesystem listing
-    as (tar name, mode, is regular file): anything at a FORBIDDEN_PATHS path
-    (a symlink such as bin/sh -> busybox counts), and any regular file with an
-    executable bit other than /vocab-server. Sorted, without duplicates."""
+    as (tar name, is regular file, first bytes of the content): anything at a
+    FORBIDDEN_PATHS path (a symlink such as bin/sh -> busybox counts), and any
+    regular file that is an ELF binary other than /vocab-server. Modes are not
+    looked at: Docker marks its own files (.dockerenv, etc/hosts) executable
+    and base-files ships non-ELF scripts that need a shell nobody has.
+    Sorted, without duplicates."""
     found = set()
-    for name, mode, is_file in entries:
+    for name, is_file, head in entries:
         path = os.path.normpath(name).lstrip("/")
-        if path in FORBIDDEN_PATHS or (is_file and mode & 0o111 and path != ALLOWED_EXECUTABLE):
+        if path in FORBIDDEN_PATHS or (is_file and head.startswith(ELF_MAGIC) and path != ALLOWED_EXECUTABLE):
             found.add(path)
     return sorted(found)
 
@@ -342,7 +346,10 @@ def static_checks(image: str) -> None:
         finally:
             docker("rm", "-f", created, check=False)
         with tarfile.open(fileobj=io.BytesIO(exported)) as tar:
-            entries = [(m.name, m.mode, m.isreg()) for m in tar.getmembers()]
+            entries = []
+            for m in tar.getmembers():
+                member = tar.extractfile(m) if m.isreg() else None
+                entries.append((m.name, m.isreg(), member.read(len(ELF_MAGIC)) if member else b""))
         present = image_programs(entries)
         check(not present, f"no shell, package manager or other program in the filesystem (found: {present})")
 

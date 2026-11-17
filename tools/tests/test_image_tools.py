@@ -94,33 +94,34 @@ class SessionCookie(unittest.TestCase):
         self.assertIsNone(smoke.session_cookie([("cookie", "__Host-vocab_session=abc")]))
 
 
+ELF = b"\x7fELF"
 DISTROLESS = [
-    ("./", 0o755, False),
-    ("etc/dpkg/", 0o755, False),
-    ("etc/dpkg/origins/debian", 0o644, True),
-    ("etc/ssl/certs/ca-certificates.crt", 0o644, True),
-    ("var/lib/dpkg/status.d/base-files", 0o644, True),
-    ("var/lib/dpkg/status.d/tzdata.md5sums", 0o644, True),
-    ("usr/share/zoneinfo/UTC", 0o644, True),
-    ("vocab-server", 0o755, True),
-    ("data/", 0o700, False),
+    ("./", False, b""),
+    (".dockerenv", True, b""),
+    ("dev/console", True, b""),
+    ("etc/hosts", True, b"127.0"),
+    ("etc/dpkg/", False, b""),
+    ("etc/ssl/certs/ca-certificates.crt", True, b"----"),
+    ("etc/update-motd.d/10-uname", True, b"#!/b"),
+    ("var/lib/dpkg/status.d/base-files", True, b"Pack"),
+    ("usr/lib/os-release", True, b"PRET"),
+    ("vocab-server", True, ELF),
 ]
 
 
 class ImagePrograms(unittest.TestCase):
-    def test_distroless_listing_with_dpkg_metadata_passes(self):
+    def test_distroless_listing_with_docker_files_and_scripts_passes(self):
         self.assertEqual(smoke.image_programs(DISTROLESS), [])
 
     def test_shell_is_found_even_as_symlink(self):
-        self.assertEqual(smoke.image_programs([*DISTROLESS, ("bin/sh", 0o777, False)]), ["bin/sh"])
-        self.assertEqual(smoke.image_programs([*DISTROLESS, ("./usr/bin/dpkg", 0o755, True)]), ["usr/bin/dpkg"])
+        self.assertEqual(smoke.image_programs([*DISTROLESS, ("bin/sh", False, b"")]), ["bin/sh"])
+        self.assertEqual(smoke.image_programs([*DISTROLESS, ("./usr/bin/dpkg", True, ELF)]), ["usr/bin/dpkg"])
 
-    def test_any_other_executable_file_is_found(self):
-        self.assertEqual(smoke.image_programs([*DISTROLESS, ("usr/bin/foo", 0o755, True)]), ["usr/bin/foo"])
-        self.assertEqual(smoke.image_programs([*DISTROLESS, ("opt/x", 0o645, True)]), ["opt/x"])
+    def test_any_other_elf_file_is_found(self):
+        self.assertEqual(smoke.image_programs([*DISTROLESS, ("usr/bin/foo", True, ELF)]), ["usr/bin/foo"])
 
-    def test_executable_directories_and_symlinks_are_not_programs(self):
-        self.assertEqual(smoke.image_programs([("usr/bin/", 0o755, False), ("lib/x", 0o777, False)]), [])
+    def test_elf_magic_on_a_non_file_is_ignored(self):
+        self.assertEqual(smoke.image_programs([("usr/bin/foo", False, ELF)]), [])
 
 
 class SmokeOutput(unittest.TestCase):
