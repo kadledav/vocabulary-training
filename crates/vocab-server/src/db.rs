@@ -19,10 +19,16 @@ use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 const DB_FILE_NAME: &str = "vocabulary.sqlite";
 
 /// Embedded, forward-only migrations; entry `i` brings the schema to version `i + 1`.
-const MIGRATIONS: &[(&str, &str)] = &[(
-    "0001_initial",
-    include_str!("../migrations/0001_initial.sql"),
-)];
+const MIGRATIONS: &[(&str, &str)] = &[
+    (
+        "0001_initial",
+        include_str!("../migrations/0001_initial.sql"),
+    ),
+    (
+        "0002_word_spelling_nullable",
+        include_str!("../migrations/0002_word_spelling_nullable.sql"),
+    ),
+];
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
@@ -118,6 +124,28 @@ impl Db {
             let value = f(&tx)?;
             tx.commit().map_err(DbError::from)?;
             Ok(value)
+        })
+        .await
+    }
+
+    /// Run work in a write transaction that is **always rolled back**, also
+    /// when the closure succeeds. Used for previews that must behave exactly
+    /// like the real operation but never persist anything.
+    pub async fn dry_run<T, E, F>(&self, f: F) -> Result<T, E>
+    where
+        F: FnOnce(&Transaction<'_>) -> Result<T, E> + Send + 'static,
+        T: Send + 'static,
+        E: From<DbError> + Send + 'static,
+    {
+        self.with_conn(move |conn| {
+            conn.pragma_update(None, "query_only", false)
+                .map_err(DbError::from)?;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(DbError::from)?;
+            let result = f(&tx);
+            tx.rollback().map_err(DbError::from)?;
+            result
         })
         .await
     }

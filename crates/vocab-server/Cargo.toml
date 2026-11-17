@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 axum.workspace = true
 hex.workspace = true
+http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 include_dir.workspace = true
@@ -29,6 +30,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+vocab-pack.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

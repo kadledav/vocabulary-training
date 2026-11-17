@@ -17,6 +17,17 @@ use jiff::tz::TimeZone;
 /// An instant in time (UTC based).
 pub type Timestamp = jiff::Timestamp;
 
+/// How timestamps are stored and sent: RFC 3339 UTC with whole seconds,
+/// e.g. `2026-11-17T10:00:00Z` (design §4).
+pub fn format_timestamp(ts: Timestamp) -> String {
+    ts.strftime("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+/// The UTC calendar date of `ts` as `YYYY-MM-DD`.
+pub fn utc_date(ts: Timestamp) -> String {
+    ts.strftime("%Y-%m-%d").to_string()
+}
+
 /// Errors from building a [`DayRule`] or parsing a [`StudyDay`].
 #[derive(Debug, thiserror::Error)]
 pub enum ClockError {
@@ -229,6 +240,13 @@ mod tests {
         assert!("2026-2-3".parse::<StudyDay>().is_err());
         assert!("2026-02-30".parse::<StudyDay>().is_err());
         assert!("20260203".parse::<StudyDay>().is_err());
+    }
+
+    #[test]
+    fn r11_import_timestamps_are_rfc3339_utc_seconds() {
+        let t = ts("2026-11-17T23:30:15.123456Z");
+        assert_eq!(format_timestamp(t), "2026-11-17T23:30:15Z");
+        assert_eq!(utc_date(t), "2026-11-17");
     }
 
     #[test]

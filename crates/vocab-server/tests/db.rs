@@ -67,7 +67,7 @@ fn r85_empty_database_migrates_to_v1_with_foreign_keys_and_integrity_ok() {
     let version: u32 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("user_version");
-    assert_eq!(version, 1);
+    assert_eq!(version, 2);
 
     let mut stmt = conn
         .prepare("SELECT name, strict FROM pragma_table_list WHERE schema = 'main' AND name NOT LIKE 'sqlite_%' ORDER BY name")
@@ -246,7 +246,7 @@ fn r85_reopening_is_idempotent() {
     let version: u32 = inspect(&data)
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("user_version");
-    assert_eq!(version, 1);
+    assert_eq!(version, 2);
 }
 
 #[test]
@@ -259,7 +259,7 @@ fn r85_newer_schema_is_refused() {
     match Db::open(&data) {
         Err(DbError::SchemaTooNew {
             found: 99,
-            known: 1,
+            known: 2,
         }) => {}
         other => panic!("expected SchemaTooNew, got {other:?}"),
     }
@@ -308,4 +308,56 @@ fn r85_writes_inside_a_read_fail_loudly() {
         .map_err(DbError::from)
     }))
     .expect("write after read");
+}
+
+/// Migration 0002 on a database at version 1 holding the synthetic fixture:
+/// data kept, `word.spelling` nullable, constraints intact.
+#[test]
+fn r85_v1_database_with_data_migrates_to_v2() {
+    let (_root, data) = data_dir();
+    {
+        let conn = Connection::open(data.join(DB_FILE)).expect("create");
+        conn.pragma_update(None, "foreign_keys", "ON").expect("fk");
+        conn.execute_batch(include_str!("../migrations/0001_initial.sql"))
+            .expect("v1 schema");
+        conn.pragma_update(None, "user_version", 1)
+            .expect("version");
+        conn.execute_batch(FIXTURE).expect("fixture");
+        conn.execute("UPDATE word SET spelling = 1 WHERE id = 1", [])
+            .expect("spelling");
+    }
+    drop(Db::open(&data).expect("migrates"));
+    let conn = inspect(&data);
+    let version: u32 = conn
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .expect("user_version");
+    assert_eq!(version, 2);
+    let (headword, spelling): (String, Option<i64>) = conn
+        .query_row(
+            "SELECT headword, spelling FROM word WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("word kept");
+    assert_eq!((headword.as_str(), spelling), ("glimmerwick", Some(1)));
+    let counts: (i64, i64, i64) = conn
+        .query_row(
+            "SELECT (SELECT count(*) FROM sentence), (SELECT count(*) FROM word_source), (SELECT count(*) FROM card)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .expect("counts");
+    assert!(
+        counts.0 >= 1 && counts.1 >= 1 && counts.2 >= 1,
+        "{counts:?}"
+    );
+    conn.execute("UPDATE word SET spelling = NULL WHERE id = 1", [])
+        .expect("nullable now");
+    assert!(
+        conn.execute("UPDATE word SET spelling = 2 WHERE id = 1", [])
+            .is_err(),
+        "CHECK kept"
+    );
+    assert!(pragma_rows(&conn, "foreign_key_check").is_empty());
+    assert_eq!(pragma_rows(&conn, "integrity_check"), vec!["Text(\"ok\")"]);
 }

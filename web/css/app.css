@@ -8,6 +8,9 @@
   --text: #e8e6e3;
   --muted: #a9adb6;
   --accent: #7cb7ff;
+  --ok: #6fcf97;
+  --error: #ff8a80;
+  --border: #353b46;
   --radius: 0.75rem;
   font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   font-size: 100%;
@@ -21,6 +24,9 @@
     --text: #1d1f24;
     --muted: #555b66;
     --accent: #1f5fbf;
+    --ok: #1d7a46;
+    --error: #b3261e;
+    --border: #d9dbe0;
   }
 }
 
@@ -56,4 +62,234 @@ h1 {
 
 .muted {
   color: var(--muted);
+}
+
+/* ── navigation ─────────────────────────────────────────────────────────── */
+
+header {
+  max-width: 40rem;
+  margin: 0 auto;
+  padding: 0.75rem 1rem 0;
+}
+
+nav.top {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+a {
+  color: var(--accent);
+}
+
+nav.top a {
+  text-decoration: none;
+}
+
+nav.top a[aria-current="page"] {
+  text-decoration: underline;
+  text-underline-offset: 0.25em;
+}
+
+h2 {
+  font-size: 1.15rem;
+  margin: 1.5rem 0 0.5rem;
+}
+
+h3 {
+  font-size: 1rem;
+  margin: 0 0 0.25rem;
+}
+
+.small {
+  font-size: 0.875rem;
+}
+
+.error {
+  color: var(--error);
+}
+
+/* ── forms ──────────────────────────────────────────────────────────────── */
+
+textarea,
+input[type="search"],
+select {
+  width: 100%;
+  font: inherit;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  padding: 0.5rem 0.75rem;
+}
+
+textarea {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.85rem;
+  resize: vertical;
+}
+
+.actions {
+  display: flex;
+  gap: 0.75rem;
+  margin: 0.75rem 0;
+}
+
+button {
+  font: inherit;
+  min-height: 2.75rem;
+  padding: 0.5rem 1.25rem;
+  border-radius: 0.5rem;
+  border: 1px solid var(--accent);
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+}
+
+button.primary {
+  background: var(--accent);
+  color: var(--bg);
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.filters {
+  display: grid;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+
+/* ── import report ──────────────────────────────────────────────────────── */
+
+.card + .card,
+.report .card {
+  margin-top: 0.75rem;
+}
+
+.badge {
+  display: inline-block;
+  font-size: 0.75rem;
+  padding: 0.05rem 0.5rem;
+  margin-left: 0.25rem;
+  border-radius: 999px;
+  border: 1px solid var(--muted);
+  color: var(--muted);
+  vertical-align: middle;
+}
+
+.badge.status-ready,
+.badge.status-imported,
+.badge.outcome-new {
+  border-color: var(--ok);
+  color: var(--ok);
+}
+
+.badge.outcome-merged {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.badge.status-rejected,
+.badge.status-unreadable,
+.badge.outcome-invalid {
+  border-color: var(--error);
+  color: var(--error);
+}
+
+.pack-id {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.9em;
+  overflow-wrap: anywhere;
+}
+
+ul.words,
+ul.rows,
+ul.recent {
+  list-style: none;
+  padding: 0;
+  margin: 0.5rem 0 0;
+}
+
+ul.words > li,
+ul.rows > li,
+ul.recent > li {
+  padding: 0.4rem 0;
+  border-top: 1px solid var(--border);
+}
+
+ul.issues {
+  margin: 0.25rem 0;
+  padding-left: 1.25rem;
+}
+
+ul.issues.error {
+  color: var(--error);
+}
+
+ul.issues code,
+.conflicts code {
+  font-size: 0.85em;
+  overflow-wrap: anywhere;
+}
+
+.headword {
+  font-weight: 600;
+}
+
+.note {
+  font-style: italic;
+}
+
+details > summary {
+  cursor: pointer;
+  color: var(--muted);
+}
+
+/* ── word view ──────────────────────────────────────────────────────────── */
+
+dl.fields {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.25rem 1rem;
+}
+
+dl.fields .field {
+  display: contents;
+}
+
+dl.fields dt {
+  color: var(--muted);
+}
+
+dl.fields dd {
+  margin: 0;
+}
+
+.note-text p {
+  white-space: pre-wrap;
+}
+
+ol.sentences li {
+  margin-bottom: 0.75rem;
+}
+
+ol.sentences p {
+  margin: 0.1rem 0;
+}
+
+.sentences p:first-child {
+  font-size: 1.1875rem;
+}
+
+.hidden-sentence {
+  opacity: 0.5;
+}
+
+strong.target {
+  font-weight: 700;
+  text-decoration: underline;
+  text-underline-offset: 0.2em;
 }

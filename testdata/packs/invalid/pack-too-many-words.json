@@ -1,0 +1,1027 @@
+{
+  "format": "vocab-pack",
+  "format_version": 1,
+  "pack_id": "test-general--2026-11-17--1",
+  "exported_at": "2026-11-17",
+  "part": {
+    "index": 1,
+    "total": 1
+  },
+  "source": {
+    "id": "test-general",
+    "type": "general",
+    "title": "Test General Vocabulary"
+  },
+  "words": [
+    {
+      "headword": "w0",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w1",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w2",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w3",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w4",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w5",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w6",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w7",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w8",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w9",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w10",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w11",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w12",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w13",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w14",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w15",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w16",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w17",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w18",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w19",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w20",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w21",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w22",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w23",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w24",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w25",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w26",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w27",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w28",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w29",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w30",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w31",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w32",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w33",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w34",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w35",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w36",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w37",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w38",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w39",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w40",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w41",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w42",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w43",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w44",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w45",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w46",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w47",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w48",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w49",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w50",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w51",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w52",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w53",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w54",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w55",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w56",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w57",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w58",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w59",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w60",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w61",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w62",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w63",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w64",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w65",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w66",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w67",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w68",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w69",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w70",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w71",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w72",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w73",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w74",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w75",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w76",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w77",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w78",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w79",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w80",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w81",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w82",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w83",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w84",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w85",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w86",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w87",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w88",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w89",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w90",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w91",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w92",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w93",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w94",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w95",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w96",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w97",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w98",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w99",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    },
+    {
+      "headword": "w100",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": []
+    }
+  ]
+}

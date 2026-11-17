@@ -1,0 +1,16 @@
+{
+  "format": "vocab-pack",
+  "format_version": 1,
+  "pack_id": "test-general--2026-11-17--1",
+  "exported_at": "2026-11-17",
+  "part": {
+    "index": 1,
+    "total": 1
+  },
+  "source": {
+    "id": "test-general",
+    "type": "general",
+    "title": "Test General Vocabulary"
+  },
+  "words": []
+}

@@ -56,7 +56,7 @@
     "source": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "type", "title"],
+      "required": ["id", "type"],
       "properties": {
         "id": {
           "description": "Stable, lowercase-hyphenated id; the same book/film/article always has the same id. 'general' for general vocabulary.",
@@ -65,7 +65,12 @@
           "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"
         },
         "type": { "enum": ["book", "film", "series", "article", "general"] },
-        "title": { "type": "string", "minLength": 1, "maxLength": 300 },
+        "title": {
+          "description": "Title of the book/film/article; for general vocabulary \"General Vocabulary\". Optional: an existing source keeps its title; a new source without one is named \"General Vocabulary\" (type general) or after its id, with a warning.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
         "author": { "$ref": "#/$defs/optionalText", "maxLength": 300 },
         "series": { "$ref": "#/$defs/optionalText", "maxLength": 300 },
         "series_number": { "type": ["integer", "null"], "minimum": 1, "maximum": 9999 },
@@ -188,6 +193,12 @@
           "$ref": "#/$defs/optionalText",
           "maxLength": 40,
           "description": "One emoji or a Lucide icon name."
+        },
+        "seq": {
+          "description": "Optional order of the word within its source (P-1), e.g. the seq of a converted old vocabulary page. Used only when the word is first linked to the source; later packs never change an existing word's order. Without it the word goes after the source's highest seq (order of import and of the words array).",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000000
         },
         "sentences": {
           "description": "Practice sentences (target 3-5). Fewer than 3 visible sentences means the Understand card uses the word-only format.",

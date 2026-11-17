@@ -22,6 +22,10 @@ allow = [
     "Apache-2.0",
     "BSD-3-Clause",
     "MIT",
+    # MIT without the attribution clause (more permissive than MIT). Only
+    # `borrow-or-share`, pulled in by the `jsonschema` dev-dependency (M2
+    # schema conformance test); it is not part of any shipped binary.
+    "MIT-0",
     "Unicode-3.0",
     "Unlicense",
     "Zlib",

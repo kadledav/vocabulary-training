@@ -81,3 +81,8 @@ Estimate: design 0.2–0.4 M tokens · implementation 3–6 M · testing 0.5–1
 | 2026-11-17 | M1 implementation agent started | 7 % | |
 | 2026-11-17 | M1 implemented (243k tokens); guarantor gates green (fmt, clippy ×2, 32 tests, dep-age 129 items, repo-guard, typecheck); testing agent skipped for M1 (foundations/tooling, starts at M2) | 8 % | |
 | 2026-11-17 | M1 bug-finding review started | 8 % | |
+| 2026-11-17 | M1 bug review: 11 findings (dep-age/repo-guard bypasses, CI order, slowloris); 10 fixed, #10 moved to M2, 2 low accepted. M1 committed 5ad8705 | 9 % | owner push pending |
+| 2026-11-17 | M2 implementation agent started | 9 % | |
+| 2026-11-17 | M2 implemented (376k tokens); gates green (122 tests, dep-age 192); guarantor smoke import of the owner's real export: 70 Bobiverse words/223 sentences OK, re-import no-op; general pack rejected (missing source.title → format gap, fix: optional title + instruction line) | 9 % | |
+| 2026-11-17 | M2 testing agent (Sonnet) + bug-finding agent started in parallel | 9 % | |
+| 2026-11-17 | M2 review: 10 findings (paste memory DoS, spelling fill, seq, preview≠commit, timeout drops packs, tag wipe, invisible chars, body limit, UI race, R-92) + testing agent 83 tests / 2 bugs (same as review); fix round F1–F12 sent incl. optional source.title | ~10 % | |

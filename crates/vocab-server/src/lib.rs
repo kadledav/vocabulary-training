@@ -2,11 +2,14 @@
 //!
 //! Every module owns its state and exposes a small interface (R-92); the
 //! binary in `main.rs` only wires them together. Modules of later milestones
-//! (catalog, importer, scheduler, session, audio, auth, settings, stats,
-//! exports, workflows) are added next to these.
+//! (scheduler, session, audio, auth, settings, stats, exports) are added next
+//! to these.
 
+pub mod catalog;
 pub mod clock;
 pub mod config;
 pub mod db;
 pub mod http;
+pub mod importer;
 pub mod web_assets;
+pub mod workflows;

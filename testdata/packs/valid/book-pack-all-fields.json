@@ -1,0 +1,178 @@
+{
+  "format": "vocab-pack",
+  "format_version": 1,
+  "pack_id": "test-novel-2--2026-11-17--3",
+  "exported_at": "2026-11-17",
+  "part": {
+    "index": 2,
+    "total": 3
+  },
+  "source": {
+    "id": "test-novel-2",
+    "type": "book",
+    "title": "A Test Novel",
+    "author": "Test Author",
+    "series": "Test Series",
+    "series_number": 2,
+    "url": null
+  },
+  "words": [
+    {
+      "headword": "rattle",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": [
+        {
+          "en": "The old kettle [[rattled]] on the stove all morning.",
+          "cs": "Stará konvice celé dopoledne [[rachotila]] na sporáku.",
+          "origin": "book",
+          "location": "Chapter 3"
+        },
+        {
+          "en": "Somewhere down the hall a pipe [[rattled]] again.",
+          "cs": "Někde dole na chodbě zase [[rachotila]] trubka.",
+          "origin": "source",
+          "location": null
+        },
+        {
+          "en": "Nobody noticed that the radio [[rattled]] quietly.",
+          "cs": "Nikdo si nevšiml, že rádio tiše [[rachotila]].",
+          "origin": "example"
+        }
+      ],
+      "grammar": "verb and noun",
+      "forms": [
+        {
+          "form": "rattle",
+          "common": true
+        },
+        {
+          "form": "rattled",
+          "common": true
+        },
+        {
+          "form": "rattlingly",
+          "common": false
+        }
+      ],
+      "pronunciation": "RAT-ul",
+      "speak": "rattle",
+      "goal": "active",
+      "accepted": [
+        "rattle",
+        "rattled",
+        "rattling"
+      ],
+      "confusables": [
+        "rustle",
+        "prattle"
+      ],
+      "hint": "A baby's toy makes this sound.",
+      "spelling": false,
+      "note": "rattle = short, hard knocks; rustle = soft, papery.",
+      "tag": null,
+      "icon": "🔔",
+      "seq": 4
+    },
+    {
+      "headword": "mizzle",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 2,
+      "sentences": [
+        {
+          "en": "The old kettle [[mizzled]] on the stove all morning.",
+          "cs": "Stará konvice celé dopoledne [[mžilo]] na sporáku.",
+          "origin": "example"
+        },
+        {
+          "en": "Somewhere down the hall a pipe [[mizzled]] again.",
+          "cs": "Někde dole na chodbě zase [[mžilo]] trubka.",
+          "origin": "example"
+        },
+        {
+          "en": "Nobody noticed that the radio [[mizzled]] quietly.",
+          "cs": "Nikdo si nevšiml, že rádio tiše [[mžilo]].",
+          "origin": "example"
+        }
+      ],
+      "goal": "recognise",
+      "tag": {
+        "kind": "low-priority",
+        "text": "regional; drizzle is enough"
+      },
+      "spelling": true,
+      "spelling_note": "double z",
+      "note": "",
+      "seq": 5
+    },
+    {
+      "headword": "trundle",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 5,
+      "sentences": [
+        {
+          "en": "The old kettle [[trundled]] on the stove all morning.",
+          "cs": "Stará konvice celé dopoledne [[drkotal]] na sporáku.",
+          "origin": "example"
+        },
+        {
+          "en": "Somewhere down the hall a pipe [[trundled]] again.",
+          "cs": "Někde dole na chodbě zase [[drkotal]] trubka.",
+          "origin": "example"
+        },
+        {
+          "en": "Nobody noticed that the radio [[trundled]] quietly.",
+          "cs": "Nikdo si nevšiml, že rádio tiše [[drkotal]].",
+          "origin": "example"
+        }
+      ],
+      "tag": {
+        "kind": "seen-before",
+        "text": "also in test-novel-1"
+      },
+      "icon": "cart"
+    },
+    {
+      "headword": "waft",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": [
+        {
+          "en": "The old kettle [[wafted]] on the stove all morning.",
+          "cs": "Stará konvice celé dopoledne [[linula]] na sporáku.",
+          "origin": "example"
+        },
+        {
+          "en": "Somewhere down the hall a pipe [[wafted]] again.",
+          "cs": "Někde dole na chodbě zase [[linula]] trubka.",
+          "origin": "example"
+        },
+        {
+          "en": "Nobody noticed that the radio [[wafted]] quietly.",
+          "cs": "Nikdo si nevšiml, že rádio tiše [[linula]].",
+          "origin": "example"
+        }
+      ],
+      "tag": {
+        "kind": "not-from-source"
+      }
+    }
+  ],
+  "reading_position": "Chapter 50"
+}

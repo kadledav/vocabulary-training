@@ -6,6 +6,12 @@
 //! duration only (never bodies or query values, R-24). Handlers stay thin:
 //! parse, call a module, map errors.
 //!
+//! Body limits and timeouts are set per route group: the default (64 KiB,
+//! 30 s) for everything, larger ones for `/api/import/*` (2 MiB; the commit
+//! may take 120 s). A timeout only stops waiting: database work that already
+//! started finishes in the background (see `workflows`), so the timeout
+//! answer of an import tells the owner that importing again is safe.
+//!
 //! [`serve`] owns the connection level: a header read timeout (which also
 //! closes idle keep-alive connections) and a cap on open connections, so a
 //! client that trickles bytes cannot hold sockets forever (slowloris).
@@ -16,21 +22,29 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
+use axum::body::Body;
+use axum::extract::rejection::{PathRejection, QueryRejection};
+use axum::extract::{DefaultBodyLimit, MatchedPath, Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
+use http_body_util::BodyExt;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::graceful::GracefulShutdown;
 use hyper_util::service::TowerToHyperService;
+use serde::Deserialize;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 
+use crate::catalog::{self, WordId, WordQuery};
+use crate::clock::{Clock, SystemClock};
 use crate::config::Limits;
-use crate::db::Db;
+use crate::db::{Db, DbError};
+use crate::importer::Via;
 use crate::web_assets;
+use crate::workflows::{self, WorkflowError};
 
 const HEALTHZ_PATH: &str = "/healthz";
 
@@ -52,39 +66,114 @@ const SECURITY_HEADERS: &[(&str, &str)] = &[
     ("strict-transport-security", "max-age=31536000"),
 ];
 
+/// Answer of a timed-out commit. The commit runs in its own task
+/// (`workflows::commit_import`), so it does finish; repeating it is safe
+/// because every pack is imported at most once.
+const IMPORT_TIMEOUT_MESSAGE: &str = "The import is taking long and is still being imported \
+     in the background; re-pasting the same text is safe (packs that were already imported \
+     are skipped).";
+/// Answer of a timed-out preview (which never stores anything).
+const PREVIEW_TIMEOUT_MESSAGE: &str =
+    "The preview took too long; nothing was stored. Try again or preview fewer packs.";
+/// An oversized import body is read and discarded up to this many times
+/// the limit before answering 413, so the client gets the JSON error rather
+/// than a connection reset; anything larger is cut off.
+const DRAIN_FACTOR: usize = 4;
+const TIMEOUT_MESSAGE: &str = "The request took too long";
+
+/// Most rows of the import log returned by `GET /api/import/recent`.
+const RECENT_IMPORTS: u32 = 20;
+
 /// What the handlers need.
 #[derive(Debug, Clone)]
 pub struct AppState {
     db: Db,
+    clock: Arc<dyn Clock>,
+    /// Body limit of the import routes (set by [`app`] from the limits).
+    import_body_bytes: usize,
 }
 
 impl AppState {
     pub fn new(db: Db) -> Self {
-        Self { db }
+        Self::with_clock(db, Arc::new(SystemClock))
+    }
+
+    /// With a controllable clock (tests).
+    pub fn with_clock(db: Db, clock: Arc<dyn Clock>) -> Self {
+        Self {
+            db,
+            clock,
+            import_body_bytes: Limits::default().import_body_bytes,
+        }
     }
 }
 
 /// The complete application router.
 pub fn app(state: AppState, limits: &Limits) -> Router {
-    let api = Router::new()
+    let state = AppState {
+        import_body_bytes: limits.import_body_bytes,
+        ..state
+    };
+    let standard = TimeoutPolicy {
+        duration: limits.request_timeout(),
+        message: TIMEOUT_MESSAGE,
+    };
+    let default_routes = Router::new()
         .route(HEALTHZ_PATH, get(healthz))
+        .route("/api/import/recent", get(import_recent))
+        .route("/api/sources", get(list_sources))
+        .route("/api/words", get(list_words))
+        .route("/api/words/{id}", get(show_word))
+        .with_state(state.clone())
+        .merge(web_assets::router());
+    let preview = Router::new()
+        .route("/api/import/preview", post(import_preview))
+        .with_state(state.clone());
+    let commit = Router::new()
+        .route("/api/import/commit", post(import_commit))
         .with_state(state);
-    harden(Router::new().merge(web_assets::router()).merge(api), limits)
+    let routes = with_limits(default_routes, limits.body_bytes, standard)
+        .merge(with_limits(
+            preview,
+            limits.import_body_bytes,
+            TimeoutPolicy {
+                message: PREVIEW_TIMEOUT_MESSAGE,
+                ..standard
+            },
+        ))
+        .merge(with_limits(
+            commit,
+            limits.import_body_bytes,
+            TimeoutPolicy {
+                duration: limits.import_commit_timeout(),
+                message: IMPORT_TIMEOUT_MESSAGE,
+            },
+        ));
+    harden(routes, limits)
 }
 
-/// Wrap `routes` with the request limits, logging and security headers.
+/// How long a route group may take, and what to answer when it is too slow.
+#[derive(Debug, Clone, Copy)]
+struct TimeoutPolicy {
+    duration: Duration,
+    message: &'static str,
+}
+
+/// Give the routes of `routes` a body limit and a timeout.
+fn with_limits(routes: Router, body_bytes: usize, timeout: TimeoutPolicy) -> Router {
+    routes
+        .layer(DefaultBodyLimit::max(body_bytes))
+        .layer(middleware::from_fn_with_state(timeout, limit_time))
+}
+
+/// Wrap `routes` with the concurrency limit, logging and security headers.
 /// The last layer added is the outermost, so the headers are set on every
 /// response, including timeouts, overload answers and 404s.
 fn harden(routes: Router, limits: &Limits) -> Router {
     let slots = Arc::new(Semaphore::new(limits.max_concurrent_requests));
     routes
         .fallback(not_found)
-        .layer(DefaultBodyLimit::max(limits.body_bytes))
         .layer(middleware::from_fn_with_state(slots, limit_concurrency))
-        .layer(middleware::from_fn_with_state(
-            limits.request_timeout(),
-            limit_time,
-        ))
         .layer(middleware::from_fn(log_request))
         .layer(middleware::from_fn(security_headers))
 }
@@ -113,6 +202,196 @@ async fn healthz(State(state): State<AppState>) -> Response {
         }
     }
 }
+
+// ── API handlers ────────────────────────────────────────────────────────────
+
+/// Body of `POST /api/import/preview` and `POST /api/import/commit`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportRequest {
+    text: String,
+}
+
+fn internal_error(err: &dyn std::fmt::Display) -> Response {
+    tracing::error!(error = %err, "request failed");
+    error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "internal",
+        "Something went wrong on the server.",
+    )
+}
+
+fn workflow_error(err: &WorkflowError) -> Response {
+    match err {
+        WorkflowError::Paste(paste) => error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_paste",
+            &paste.to_string(),
+        ),
+        other => internal_error(other),
+    }
+}
+
+fn too_large() -> Response {
+    error_response(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "too_large",
+        "The request is too large. Import fewer packs at a time.",
+    )
+}
+
+/// Read the body of an import request: JSON `{"text": "…"}` of at most
+/// `limit` bytes. An oversized body is still read to its end (up to
+/// [`DRAIN_FACTOR`] × `limit`) and discarded, so the client receives the
+/// JSON 413 instead of a connection reset.
+async fn read_import_request(
+    headers: &HeaderMap,
+    body: Body,
+    limit: usize,
+) -> Result<ImportRequest, Box<Response>> {
+    let is_json = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("application/json"));
+    if !is_json {
+        return Err(Box::new(error_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_media_type",
+            "Send JSON with Content-Type: application/json.",
+        )));
+    }
+    let drain_limit = limit.saturating_mul(DRAIN_FACTOR);
+    let declared = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok());
+    if declared.is_some_and(|n| n > drain_limit) {
+        return Err(Box::new(too_large()));
+    }
+    let mut body = body;
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut total: usize = 0;
+    while let Some(frame) = body.frame().await {
+        let Ok(frame) = frame else {
+            return Err(Box::new(error_response(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "The request body could not be read.",
+            )));
+        };
+        if let Ok(data) = frame.into_data() {
+            total = total.saturating_add(data.len());
+            if total > drain_limit {
+                return Err(Box::new(too_large()));
+            }
+            if total <= limit {
+                bytes.extend_from_slice(&data);
+            }
+        }
+    }
+    if total > limit {
+        return Err(Box::new(too_large()));
+    }
+    serde_json::from_slice(&bytes).map_err(|_| {
+        Box::new(error_response(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "The request body must be JSON of the form {\"text\": \"…\"}.",
+        ))
+    })
+}
+
+async fn import_preview(State(state): State<AppState>, headers: HeaderMap, body: Body) -> Response {
+    let request = match read_import_request(&headers, body, state.import_body_bytes).await {
+        Ok(request) => request,
+        Err(response) => return *response,
+    };
+    match workflows::preview_import(&state.db, &request.text, state.clock.now()).await {
+        Ok(report) => Json(report).into_response(),
+        Err(err) => workflow_error(&err),
+    }
+}
+
+async fn import_commit(State(state): State<AppState>, headers: HeaderMap, body: Body) -> Response {
+    let request = match read_import_request(&headers, body, state.import_body_bytes).await {
+        Ok(request) => request,
+        Err(response) => return *response,
+    };
+    match workflows::commit_import(&state.db, &request.text, Via::Paste, state.clock.now()).await {
+        Ok(report) => Json(report).into_response(),
+        Err(err) => workflow_error(&err),
+    }
+}
+
+async fn import_recent(State(state): State<AppState>) -> Response {
+    match workflows::recent_imports(&state.db, RECENT_IMPORTS).await {
+        Ok(rows) => Json(rows).into_response(),
+        Err(err) => internal_error(&err),
+    }
+}
+
+async fn list_sources(State(state): State<AppState>) -> Response {
+    match state
+        .db
+        .read(|conn| catalog::sources(conn).map_err(DbError::from))
+        .await
+    {
+        Ok(rows) => Json(rows).into_response(),
+        Err(err) => internal_error(&err),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct WordsParams {
+    q: Option<String>,
+    source: Option<i64>,
+}
+
+async fn list_words(
+    State(state): State<AppState>,
+    params: Result<Query<WordsParams>, QueryRejection>,
+) -> Response {
+    let Ok(Query(params)) = params else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "Invalid query parameters.",
+        );
+    };
+    let query = WordQuery {
+        text: params.q,
+        source: params.source,
+    };
+    match state
+        .db
+        .read(move |conn| catalog::words(conn, &query).map_err(DbError::from))
+        .await
+    {
+        Ok(rows) => Json(rows).into_response(),
+        Err(err) => internal_error(&err),
+    }
+}
+
+async fn show_word(
+    State(state): State<AppState>,
+    id: Result<Path<i64>, PathRejection>,
+) -> Response {
+    let Ok(Path(id)) = id else {
+        return not_found().await;
+    };
+    match state
+        .db
+        .read(move |conn| catalog::word_view(conn, WordId::new(id)).map_err(DbError::from))
+        .await
+    {
+        Ok(Some(view)) => Json(view).into_response(),
+        Ok(None) => not_found().await,
+        Err(err) => internal_error(&err),
+    }
+}
+
+// ── middleware ──────────────────────────────────────────────────────────────
 
 async fn security_headers(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
@@ -149,14 +428,14 @@ async fn log_request(request: Request, next: Next) -> Response {
     response
 }
 
-async fn limit_time(State(timeout): State<Duration>, request: Request, next: Next) -> Response {
-    match tokio::time::timeout(timeout, next.run(request)).await {
+async fn limit_time(
+    State(timeout): State<TimeoutPolicy>,
+    request: Request,
+    next: Next,
+) -> Response {
+    match tokio::time::timeout(timeout.duration, next.run(request)).await {
         Ok(response) => response,
-        Err(_) => error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "timeout",
-            "The request took too long",
-        ),
+        Err(_) => error_response(StatusCode::SERVICE_UNAVAILABLE, "timeout", timeout.message),
     }
 }
 
@@ -226,7 +505,8 @@ pub async fn serve(
     }
 
     drop(listener);
-    if tokio::time::timeout(limits.request_timeout(), graceful.shutdown())
+    let longest = limits.request_timeout().max(limits.import_commit_timeout());
+    if tokio::time::timeout(longest, graceful.shutdown())
         .await
         .is_err()
     {
@@ -275,7 +555,7 @@ pub fn healthcheck(listen: SocketAddr, timeout: Duration) -> Result<(), String> 
 
 #[cfg(test)]
 mod tests {
-    use axum::body::{Body, Bytes, to_bytes};
+    use axum::body::{Bytes, to_bytes};
     use axum::http::Method;
     use axum::routing::post;
     use tower::ServiceExt;
@@ -283,6 +563,10 @@ mod tests {
     use super::*;
 
     fn test_router(limits: &Limits) -> Router {
+        test_router_with(limits, limits.body_bytes, TIMEOUT_MESSAGE)
+    }
+
+    fn test_router_with(limits: &Limits, body_bytes: usize, message: &'static str) -> Router {
         let routes = Router::new()
             .route(
                 "/echo",
@@ -295,7 +579,11 @@ mod tests {
                     "done"
                 }),
             );
-        harden(routes, limits)
+        let timeout = TimeoutPolicy {
+            duration: limits.request_timeout(),
+            message,
+        };
+        harden(with_limits(routes, body_bytes, timeout), limits)
     }
 
     fn post_bytes(len: usize) -> Request {
@@ -349,6 +637,39 @@ mod tests {
         );
         let body = to_bytes(response.into_body(), 1024).await.expect("body");
         assert!(String::from_utf8_lossy(&body).contains("\"timeout\""));
+    }
+
+    #[tokio::test]
+    async fn r84_route_groups_have_their_own_body_limit_and_timeout_message() {
+        let limits = Limits {
+            request_timeout_secs: 1,
+            ..Limits::default()
+        };
+        let router = test_router_with(&limits, limits.import_body_bytes, IMPORT_TIMEOUT_MESSAGE);
+        let big = router
+            .clone()
+            .oneshot(post_bytes(limits.body_bytes * 4))
+            .await
+            .expect("response");
+        assert_eq!(big.status(), StatusCode::OK);
+        let too_big = router
+            .clone()
+            .oneshot(post_bytes(limits.import_body_bytes + 1))
+            .await
+            .expect("response");
+        assert_eq!(too_big.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let slow = router
+            .oneshot(
+                Request::builder()
+                    .uri("/slow")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(slow.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(slow.into_body(), 4096).await.expect("body");
+        assert!(String::from_utf8_lossy(&body).contains("re-pasting the same text is safe"));
     }
 
     #[test]

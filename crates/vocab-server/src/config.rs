@@ -59,8 +59,8 @@ pub struct Config {
     pub paths: Paths,
 }
 
-/// Request limits (§9.4). Route-specific limits (import, connector, login)
-/// are set by the routes that need them.
+/// Request limits (§9.4). The import routes have their own body limit and
+/// commit timeout; the connector and login limits arrive with M11/M5.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Limits {
@@ -75,6 +75,13 @@ pub struct Limits {
     pub header_read_timeout_secs: u64,
     /// Open client connections; further connections wait in the backlog.
     pub max_connections: usize,
+    /// Body limit of `/api/import/*`: room for a 2 MiB paste inside a JSON
+    /// string, where quotes, backslashes and line breaks double in size (the
+    /// 2 MiB paste limit itself is checked on the decoded text).
+    pub import_body_bytes: usize,
+    /// Time an import commit may take before the server answers 503 (the
+    /// commit itself may still finish; see `workflows`).
+    pub import_commit_timeout_secs: u64,
 }
 
 impl Default for Limits {
@@ -85,6 +92,8 @@ impl Default for Limits {
             max_concurrent_requests: 64,
             header_read_timeout_secs: 10,
             max_connections: 256,
+            import_body_bytes: 5 * 1024 * 1024,
+            import_commit_timeout_secs: 120,
         }
     }
 }
@@ -96,6 +105,10 @@ impl Limits {
 
     pub fn header_read_timeout(&self) -> Duration {
         Duration::from_secs(self.header_read_timeout_secs)
+    }
+
+    pub fn import_commit_timeout(&self) -> Duration {
+        Duration::from_secs(self.import_commit_timeout_secs)
     }
 }
 
@@ -200,6 +213,8 @@ impl Config {
             || limits.max_concurrent_requests == 0
             || limits.header_read_timeout_secs == 0
             || limits.max_connections == 0
+            || limits.import_body_bytes == 0
+            || limits.import_commit_timeout_secs == 0
         {
             return Err(invalid("limits", "every limit must be greater than zero").into());
         }
@@ -295,6 +310,8 @@ mod tests {
         assert_eq!(config.session_days, 180);
         assert_eq!(config.limits, Limits::default());
         assert_eq!(config.limits.body_bytes, 64 * 1024);
+        assert_eq!(config.limits.import_body_bytes, 5 * 1024 * 1024);
+        assert_eq!(config.limits.import_commit_timeout_secs, 120);
         assert_eq!(config.paths, paths());
     }
 
@@ -360,6 +377,8 @@ mod tests {
             r#""limits": {"body_bytes": 0}"#,
             r#""limits": {"header_read_timeout_secs": 0}"#,
             r#""limits": {"max_connections": 0}"#,
+            r#""limits": {"import_body_bytes": 0}"#,
+            r#""limits": {"import_commit_timeout_secs": 0}"#,
         ] {
             let json = format!(r#"{{"public_origin": "https://a.example", {bad}}}"#);
             assert!(parse(&json).is_err(), "{bad} should be rejected");

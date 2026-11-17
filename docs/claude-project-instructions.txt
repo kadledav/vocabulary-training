@@ -36,6 +36,7 @@ When I ask you to export words "for the training app", produce vocabulary packs 
 }
 
 - `source.id`: lowercase-hyphenated, STABLE — always the same id for the same book/film/article (series + number if any, else a short title slug). Use `general` for my general vocabulary without a specific source.
+- `source.title`: always include it — the book/film/article title; for `general` use "General Vocabulary".
 - `source.type`: "book" | "film" | "series" | "article" | "general". `author`, `series`, `series_number` only when they apply; add `"url"` for articles.
 - `reading_position`: books only — how far I have read (ask me if you don't know). Omit for other types.
 - `pack_id`: n = 1, 2, … for multiple packs exported the same day for the same source.

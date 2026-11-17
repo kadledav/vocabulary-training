@@ -289,6 +289,31 @@ mod served {
     }
 
     #[tokio::test]
+    async fn r84_oversized_import_body_gets_a_json_413_not_a_reset() {
+        let server = Server::start(Limits::default()).await;
+        let mut stream = TcpStream::connect(server.addr).await.expect("connect");
+        let body_len = 6 * 1024 * 1024; // over the 5 MiB import body limit
+        let head = format!(
+            "POST /api/import/preview HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+             Content-Length: {body_len}\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(head.as_bytes()).await.expect("head");
+        let mut body = Vec::with_capacity(body_len);
+        body.extend_from_slice(b"{\"text\": \"");
+        body.resize(body_len - 2, b'x');
+        body.extend_from_slice(b"\"}");
+        // The whole body is accepted (read and discarded) by the server.
+        stream
+            .write_all(&body)
+            .await
+            .expect("body sent without a reset");
+        let (response, _) = read_until_closed(&mut stream, Duration::from_secs(10)).await;
+        assert!(response.starts_with("HTTP/1.1 413"), "{response}");
+        assert!(response.contains("\"too_large\""), "{response}");
+        server.stop().await;
+    }
+
+    #[tokio::test]
     async fn r83_open_connections_are_capped() {
         let server = Server::start(Limits {
             max_connections: 1,

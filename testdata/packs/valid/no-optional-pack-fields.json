@@ -1,0 +1,20 @@
+{
+  "format": "vocab-pack",
+  "format_version": 1,
+  "pack_id": "test-general--2026-11-17--1",
+  "source": {
+    "id": "test-general",
+    "type": "general",
+    "title": "Test General Vocabulary"
+  },
+  "words": [
+    {
+      "headword": "glint",
+      "meaning": "A small flash of light.",
+      "czech": [
+        "záblesk"
+      ],
+      "usefulness": 5
+    }
+  ]
+}
