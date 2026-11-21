@@ -4,7 +4,10 @@
 *
 !Cargo.toml
 !Cargo.lock
+!LICENSE
+!THIRD-PARTY-NOTICES.txt
 !crates/
 !web/index.html
 !web/css/
 !web/js/
+!web/img/

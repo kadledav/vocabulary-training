@@ -1,10 +1,14 @@
 .DS_Store
 .idea/
+# Local agent worktrees and settings
+/.claude/
 
 # Build output
 /target/
 node_modules/
 __pycache__/
+# Local cache of tools/dep-age.py (immutable registry facts)
+/.cache/
 
 # Never commit data or secrets (R-24, R-82, R-95)
 *.sqlite*

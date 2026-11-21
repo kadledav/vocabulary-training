@@ -4,9 +4,11 @@
 
 [graph]
 all-features = true
-# Only platforms we build for: the musl release binary, CI, the owner's Mac.
+# Only platforms we build for: the musl release binaries (amd64, arm64), CI,
+# the owner's Mac.
 targets = [
     "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
     "x86_64-unknown-linux-gnu",
     "aarch64-apple-darwin",
 ]

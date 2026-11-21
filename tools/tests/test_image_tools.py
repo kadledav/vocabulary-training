@@ -11,6 +11,7 @@ import contextlib
 import importlib.util
 import io
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -175,6 +176,48 @@ class SmokeOutput(unittest.TestCase):
             smoke.main(["image"])
         self.assertIn("::error title=image-smoke crashed::KeyError", out.getvalue())
 
+
+
+class Engines(unittest.TestCase):
+    """Docker on CI, Podman (behind a `docker` shim) on a Mac."""
+
+    def test_top_uses_each_engines_own_syntax(self):
+        with mock.patch.object(smoke, "_engine", "docker"):
+            self.assertEqual(smoke.top_args("c"), ["top", "c", "-eo", "pid,uid"])
+        with mock.patch.object(smoke, "_engine", "podman"):
+            self.assertEqual(smoke.top_args("c"), ["top", "c", "pid", "uid"])
+
+    def test_engine_is_detected_from_docker_version(self):
+        answer = subprocess.CompletedProcess([], 0, "Client:       Podman Engine\nVersion:      6.1.4\n", "")
+        with mock.patch.object(smoke, "_engine", None), mock.patch.object(smoke.subprocess, "run", return_value=answer):
+            self.assertEqual(smoke.engine(), "podman")
+        answer = subprocess.CompletedProcess([], 0, "Client: Docker Engine - Community\n", "")
+        with mock.patch.object(smoke, "_engine", None), mock.patch.object(smoke.subprocess, "run", return_value=answer):
+            self.assertEqual(smoke.engine(), "docker")
+
+    def test_process_uids_from_a_top_listing(self):
+        self.assertEqual(smoke.process_uids("PID   UID\n1     65532\n"), ["65532"])
+        self.assertEqual(smoke.process_uids("PID UID\n"), [])
+
+    def run_bind_mount(self, env: dict[str, str]) -> list:
+        with (
+            mock.patch.object(smoke, "root_available", return_value=False),
+            mock.patch.object(smoke, "RESULTS", []),
+            mock.patch.object(smoke, "serve_and_check") as serve,
+            mock.patch.dict(os.environ, env, clear=True),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            smoke.bind_mount_checks("image", "id", "test-pw")
+            serve.assert_not_called()
+            return list(smoke.RESULTS)
+
+    def test_without_root_the_bind_mount_checks_are_skipped_locally(self):
+        results = self.run_bind_mount({})
+        self.assertTrue(results and all(ok is None and "needs root" in detail for _, ok, detail in results), results)
+
+    def test_without_root_on_github_actions_it_is_a_failure(self):
+        results = self.run_bind_mount({"GITHUB_ACTIONS": "true"})
+        self.assertEqual([ok for _, ok, _ in results], [False])
 
 if __name__ == "__main__":
     unittest.main()

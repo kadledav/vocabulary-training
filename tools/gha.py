@@ -1,4 +1,5 @@
-"""GitHub Actions output of the image tools (image-smoke.py, release-promote.py).
+"""GitHub Actions output of the image tools (image-smoke.py, release-promote.py):
+annotations, the job summary and step outputs.
 
 Failures are printed as workflow commands (`::error title=…::…`), which
 GitHub turns into annotations that the public API shows without a login, and
@@ -54,6 +55,18 @@ def untrusted_block(heading: str, text: str, token: str | None = None) -> str:
     line of it can be read as a workflow command; returns the lines to print."""
     token = token or secrets.token_hex(16)
     return f"{heading}\n::stop-commands::{token}\n{text}\n::{token}::"
+
+
+def set_output(name: str, value: str) -> None:
+    """A step output (`$GITHUB_OUTPUT`); printed outside GitHub Actions."""
+    if "\n" in value or "\r" in value or "=" in name:
+        raise ValueError(f"output {name!r} must be one line")
+    path = os.environ.get("GITHUB_OUTPUT")
+    if not path:
+        print(f"output {name}={value}")
+        return
+    with open(path, "a", encoding="utf-8") as out:
+        out.write(f"{name}={value}\n")
 
 
 def append_summary(markdown: str) -> None:
