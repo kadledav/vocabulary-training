@@ -435,7 +435,7 @@ def tts_extras(packages: list[dict], root: Path) -> list[Component]:
                   "LAME: LGPL-2.0-or-later; its source is in the crate mp3lame-sys 0.1.11 "
                   "(https://crates.io/crates/mp3lame-sys/0.1.11); the binary can be relinked with a modified "
                   "LAME from this repository's sources (docker/tts-licenses/SOURCE.md)."),
-        Component("Kokoro-82M v1.0 model, voices and US/UK lexicons", "(kokoro-multi-lang-v1_0)", "Apache-2.0",
+        Component("Kokoro-82M v1.0 model, voices and US/UK lexicons", "(kokoro-int8-multi-lang-v1_0)", "Apache-2.0",
                   ["Apache-2.0"], [apache]),
         Component("CMUdict", "(cmusphinx/cmudict at 74790861)", "BSD-2-Clause", ["BSD-2-Clause"],
                   [text(here / "cmudict-LICENSE.txt")]),

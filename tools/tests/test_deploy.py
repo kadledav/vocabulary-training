@@ -102,9 +102,12 @@ class TtsService(unittest.TestCase):
             r"(?m)^    read_only: true$",
             r"(?m)^    cap_drop: \[ALL\]$",
             r'(?m)^    security_opt: \["no-new-privileges:true"\]$',
-            r"(?m)^    mem_limit: 1280m$",
-            r"(?m)^    memswap_limit: 1280m$",
-            r"(?m)^    cpus: 2\.0$",
+            # The smoke test runs under the same limit (tools/tts-smoke.py).
+            r"(?m)^    mem_limit: 512m$",
+            r"(?m)^    memswap_limit: 512m$",
+            r"(?m)^    cpus: 1\.0$",
+            r"(?m)^      - VOCAB_TTS_THREADS=1$",
+            r"(?m)^      - VOCAB_TTS_IDLE_SECONDS=\d+$",
             r"(?m)^    pids_limit: 64$",
             r'test: \["CMD", "/vocab-tts", "healthcheck"\]',
         ):
@@ -133,7 +136,7 @@ class TtsDockerfile(unittest.TestCase):
         self.assertRegex(stage, r'(?m)^ENTRYPOINT \["/vocab-tts"\]$')
         self.assertRegex(stage, r"(?m)^COPY --from=model /out/model /model$")
         self.assertNotRegex(stage, r"(?m)^(RUN|SHELL|VOLUME)\b")
-        self.assertIn("install -m 0444 model.onnx", self.TEXT)
+        self.assertIn("install -m 0444 model.int8.onnx", self.TEXT)
 
     def test_r90_tts_inputs_are_pinned_and_checksummed(self):
         froms = re.findall(r"(?m)^FROM\s+(\S+)", self.TEXT)
