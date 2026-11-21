@@ -419,14 +419,17 @@ async fn r82_a_session_survives_a_restart() {
     assert_eq!(response.status(), StatusCode::OK);
 }
 
+/// B2 (review probe p3): a password change ends every session, the
+/// changing one included; the device that made it gets a new token, so a
+/// stolen copy of its old cookie dies too.
 #[tokio::test]
-async fn r82_changing_the_password_keeps_only_the_changing_session() {
+async fn r82_changing_the_password_ends_every_session_and_reissues_this_device() {
     let app = app().await;
     let other = app.login().await;
     let mine = app.login().await;
     let new_password = "test-password-after-the-change";
 
-    // A wrong current password is a failed login; a short new one is refused.
+    // A wrong current password is refused; a short new one too.
     let response = app
         .change_password(&mine, "test-password-wrong", new_password)
         .await;
@@ -453,24 +456,34 @@ async fn r82_changing_the_password_keeps_only_the_changing_session() {
         .await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
+    let stolen = mine.clone();
     let response = app
         .change_password(&mine, common::PASSWORD, new_password)
         .await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(
-        set_cookie(&response).is_none(),
-        "the session stays as it is"
-    );
+    let reissued = set_cookie(&response).expect("a new session cookie");
+    assert!(reissued.contains("HttpOnly") && reissued.contains("SameSite=Strict"));
+    let mine = cookie_pair(&response).expect("cookie");
+    assert_ne!(mine, stolen, "a new token");
     assert_eq!(
         app.get_with_cookie("/api/today", &mine).await.status(),
         StatusCode::OK
     );
-    let response = app.get_with_cookie("/api/today", &other).await;
-    assert_eq!(
-        response.status(),
-        StatusCode::UNAUTHORIZED,
-        "other sessions end"
-    );
+    for (label, dead) in [
+        ("the old token of this device", &stolen),
+        ("another device", &other),
+    ] {
+        assert_eq!(
+            app.get_with_cookie("/api/auth/me", dead).await.status(),
+            StatusCode::UNAUTHORIZED,
+            "{label}"
+        );
+    }
+    let conn = rusqlite::Connection::open(app.dir.path().join("vocabulary.sqlite")).expect("open");
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM auth_session", [], |r| r.get(0))
+        .expect("count");
+    assert_eq!(rows, 1, "every other row is gone");
     let response = app.login_with(common::PASSWORD).await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "old password");
     assert_eq!(app.login_with(new_password).await.status(), StatusCode::OK);
@@ -484,15 +497,145 @@ async fn r82_changing_the_password_keeps_only_the_changing_session() {
             .status(),
         StatusCode::OK
     );
+    for dead in [&stolen, &other] {
+        assert_eq!(
+            restarted.get_with_cookie("/api/today", dead).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(
+        restarted.login_with(new_password).await.status(),
+        StatusCode::OK
+    );
+}
+
+/// B2: a session never lives longer than 365 days from its creation,
+/// however often it is renewed.
+#[tokio::test]
+async fn r82_a_session_ends_365_days_after_its_creation_even_when_renewed() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let mut last_max_age = None;
+    // Used every 30 days: renewed each time.
+    for step in 1..=12 {
+        app.advance(days(30));
+        let response = app.get_with_cookie("/api/today", &cookie).await;
+        assert_eq!(response.status(), StatusCode::OK, "day {}", step * 30);
+        let renewed = set_cookie(&response).expect("renewed");
+        let max_age: i64 = renewed
+            .split("Max-Age=")
+            .nth(1)
+            .and_then(|rest| rest.split(';').next())
+            .and_then(|n| n.parse().ok())
+            .expect("Max-Age");
+        last_max_age = Some(max_age);
+    }
+    // Day 360: the cookie is only good for the five days that are left.
+    assert_eq!(last_max_age, Some(5 * 24 * 3600));
+    app.advance(days(4));
+    assert_eq!(
+        app.get_with_cookie("/api/today", &cookie).await.status(),
+        StatusCode::OK,
+        "day 364"
+    );
+    app.advance(days(1));
+    assert_eq!(
+        app.get_with_cookie("/api/today", &cookie).await.status(),
+        StatusCode::UNAUTHORIZED,
+        "day 365"
+    );
+    // The same after a restart, from the stored creation time.
+    let other = app.login().await;
+    app.advance(days(170));
+    assert_eq!(
+        app.get_with_cookie("/api/today", &other).await.status(),
+        StatusCode::OK
+    );
+    app.advance(days(170));
+    assert_eq!(
+        app.get_with_cookie("/api/today", &other).await.status(),
+        StatusCode::OK
+    );
+    let start = app.clock.now();
+    let restarted = app_with(app.dir, common::auth());
+    restarted.clock.set(start);
+    restarted.advance(days(24));
     assert_eq!(
         restarted
             .get_with_cookie("/api/today", &other)
             .await
             .status(),
+        StatusCode::OK,
+        "day 364"
+    );
+    restarted.advance(days(1));
+    assert_eq!(
+        restarted
+            .get_with_cookie("/api/today", &other)
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED,
+        "day 365"
+    );
+}
+
+/// B2: "log out everywhere" ends every session, this device's included.
+#[tokio::test]
+async fn r82_logout_all_ends_every_session() {
+    let app = app().await;
+    let phone = app.login().await;
+    let laptop = app.login().await;
+    // Needs a session and the app's origin, like every state change.
+    let response = app
+        .send(request(&Method::POST, "/api/auth/logout-all", "{}", &[]))
+        .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let response = app
+        .send(bare(
+            &Method::POST,
+            "/api/auth/logout-all",
+            "{}",
+            &[
+                ("cookie", &laptop),
+                ("content-type", "application/json"),
+                ("origin", "https://other.example.home"),
+            ],
+        ))
+        .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        app.get_with_cookie("/api/auth/me", &phone).await.status(),
+        StatusCode::OK
+    );
+
+    let response = app
+        .send(request(
+            &Method::POST,
+            "/api/auth/logout-all",
+            "{}",
+            &[("cookie", &laptop)],
+        ))
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let cleared = set_cookie(&response).expect("cookie removed");
+    assert!(cleared.contains("Max-Age=0"), "{cleared}");
+    for cookie in [&phone, &laptop] {
+        assert_eq!(
+            app.get_with_cookie("/api/auth/me", cookie).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    let restarted = app_with(app.dir, common::auth());
+    assert_eq!(
+        restarted
+            .get_with_cookie("/api/auth/me", &phone)
+            .await
+            .status(),
         StatusCode::UNAUTHORIZED
     );
+    // Logging in again works; the password is unchanged.
     assert_eq!(
-        restarted.login_with(new_password).await.status(),
+        restarted.login_with(common::PASSWORD).await.status(),
         StatusCode::OK
     );
 }
@@ -603,22 +746,41 @@ async fn r82_two_concurrent_setups_exactly_one_wins() {
     assert_eq!(app.login_with(winner).await.status(), StatusCode::OK);
 }
 
+/// B3(a) (review probe p3): wrong setup codes lock nothing. Whoever can
+/// reach the app during setup cannot keep the owner from setting it up;
+/// each wrong code only costs a fixed delay.
 #[tokio::test]
-async fn r82_wrong_setup_codes_count_toward_the_login_lockout() {
+async fn r82_wrong_setup_codes_never_lock_setup_or_login() {
     let app = fresh();
-    for _ in 0..4 {
+    let started = std::time::Instant::now();
+    for attempt in 0..8 {
         let response = app.setup("0000-0000-00", common::PASSWORD).await;
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "attempt {attempt}"
+        );
+        assert!(response.headers().get(header::RETRY_AFTER).is_none());
+        assert_eq!(error_code(response).await, "invalid_setup_code");
     }
-    let response = app.setup("0000-0000-00", common::PASSWORD).await;
-    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(retry_after(&response), 15 * 60);
-    // Even the right code waits for the lockout.
-    let response = app.setup(&app.code.to_string(), common::PASSWORD).await;
-    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-    app.advance(minutes(15));
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(8 * 250),
+        "each wrong code is delayed: {:?}",
+        started.elapsed()
+    );
+    // The right code works at once, without any waiting period.
     let response = app.setup(&app.code.to_string(), common::PASSWORD).await;
     assert_eq!(response.status(), StatusCode::OK);
+    // … and the wrong codes did not count as failed logins.
+    assert_eq!(
+        app.login_with(common::PASSWORD).await.status(),
+        StatusCode::OK
+    );
+    let state: String = rusqlite::Connection::open(app.dir.path().join("vocabulary.sqlite"))
+        .expect("open")
+        .query_row("SELECT state_json FROM auth_throttle", [], |r| r.get(0))
+        .expect("state");
+    assert_eq!(state, "{}");
 }
 
 #[tokio::test]
@@ -799,7 +961,7 @@ async fn r82_a_new_connector_token_is_shown_once_and_replaces_the_old_one() {
         .await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
-    // ...and the current password again: a wrong one is a failed login.
+    // ...and the current password again.
     for body in [
         json!({ "current_password": "test-password-wrong" }),
         json!({}),
@@ -823,22 +985,6 @@ async fn r82_a_new_connector_token_is_shown_once_and_replaces_the_old_one() {
         false,
         "nothing created"
     );
-    for _ in 0..4 {
-        app.send(request(
-            &Method::POST,
-            "/api/auth/connector-token",
-            &json!({ "current_password": "test-password-wrong" }).to_string(),
-            &[("cookie", &cookie)],
-        ))
-        .await;
-    }
-    let response = app.login_with(common::PASSWORD).await;
-    assert_eq!(
-        response.status(),
-        StatusCode::TOO_MANY_REQUESTS,
-        "throttled like login"
-    );
-    app.advance(minutes(15));
 
     let first = common::connector_token(&app.router, &cookie).await;
     assert_eq!(first.len(), 64);
@@ -996,6 +1142,231 @@ async fn r82_five_failed_logins_lock_logins_for_15_minutes_doubling() {
     assert_eq!(retry_after(&response), 15 * 60);
 }
 
+/// B3(b): more than 20 failed logins within 24 hours lock logins for 24
+/// hours, also when they come slowly enough never to trip the first rule.
+#[tokio::test]
+async fn r82_more_than_twenty_failed_logins_in_a_day_lock_for_24_hours() {
+    let app = app().await;
+    let existing = app.login().await;
+    for n in 1..=20 {
+        let response = fail_logins(&app, 1).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "failure {n}");
+        app.advance(minutes(16));
+    }
+    let response = fail_logins(&app, 1).await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(retry_after(&response), 24 * 3600);
+    app.advance(minutes(24 * 60 - 1));
+    let response = app.login_with(common::PASSWORD).await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    // Existing sessions never notice.
+    assert_eq!(
+        app.get_with_cookie("/api/today", &existing).await.status(),
+        StatusCode::OK
+    );
+    app.advance(minutes(1));
+    assert_eq!(
+        app.login_with(common::PASSWORD).await.status(),
+        StatusCode::OK
+    );
+}
+
+/// B3(c) (review probe p3): a password typed inside a session is counted
+/// against that session, never against logins, and is never blocked by
+/// the login lock. Five wrong ones end the session.
+#[tokio::test]
+async fn r82_password_checks_inside_a_session_are_separate_from_the_login_lock() {
+    let app = app().await;
+    let mine = app.login().await;
+    let other = app.login().await;
+    let token_request = |cookie: &str, password: &str| {
+        request(
+            &Method::POST,
+            "/api/auth/connector-token",
+            &json!({ "current_password": password }).to_string(),
+            &[("cookie", cookie)],
+        )
+    };
+
+    // Somebody without a session locks logins …
+    let response = fail_logins(&app, 5).await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        app.login_with(common::PASSWORD).await.status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    // … and the logged-in owner still manages his account.
+    let response = app.send(token_request(&mine, common::PASSWORD)).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "connector token during the lock"
+    );
+    let response = app
+        .change_password(
+            &mine,
+            common::PASSWORD,
+            "test-password-changed-while-locked",
+        )
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "password change during the lock"
+    );
+    let mine = cookie_pair(&response).expect("new cookie");
+    let password = "test-password-changed-while-locked";
+    // (The change ended the other session; get a second one after the lock.)
+    assert_eq!(
+        app.get_with_cookie("/api/auth/me", &other).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    app.advance(minutes(15));
+    let response = app.login_with(password).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let other = cookie_pair(&response).expect("cookie");
+
+    // Four wrong passwords inside a session: refused, the session stays,
+    // and logins are not affected at all.
+    for attempt in 1..=4 {
+        let response = app.send(token_request(&mine, "test-password-wrong")).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "attempt {attempt}"
+        );
+        assert_eq!(error_code(response).await, "invalid_password");
+    }
+    assert_eq!(app.login_with(password).await.status(), StatusCode::OK);
+    // A right one in between starts the count again.
+    assert_eq!(
+        app.send(token_request(&mine, password)).await.status(),
+        StatusCode::OK
+    );
+    for _ in 1..=4 {
+        app.change_password(&mine, "test-password-wrong", "test-password-never-set")
+            .await;
+    }
+    assert_eq!(
+        app.get_with_cookie("/api/auth/me", &mine).await.status(),
+        StatusCode::OK
+    );
+    // The count survives a restart (it is stored with the session) …
+    let restarted = app_with(app.dir, common::auth());
+    restarted.clock.set(app.clock.now());
+    let app = restarted;
+    // … and the fifth wrong password ends this session, and only this one.
+    let response = app.send(token_request(&mine, "test-password-wrong")).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let cleared = set_cookie(&response).expect("cookie removed");
+    assert!(cleared.contains("Max-Age=0"), "{cleared}");
+    assert_eq!(error_code(response).await, "session_ended");
+    assert_eq!(
+        app.get_with_cookie("/api/auth/me", &mine).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        app.get_with_cookie("/api/auth/me", &other).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(app.login_with(password).await.status(), StatusCode::OK);
+}
+
+/// B3(d): failed logins and a running lock survive a restart;
+/// `reset-password` (here: its library function) clears them.
+#[tokio::test]
+async fn r82_the_login_throttle_survives_a_restart() {
+    let app = app().await;
+    assert_eq!(
+        fail_logins(&app, 3).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let now = app.clock.now();
+    let app = app_with(app.dir, common::auth());
+    app.clock.set(now);
+    // Failures three and four were before the restart; the fifth locks.
+    assert_eq!(
+        fail_logins(&app, 1).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let response = fail_logins(&app, 1).await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(retry_after(&response), 15 * 60);
+
+    // Restarting does not lift the lock …
+    let now = app.clock.now();
+    let app = app_with(app.dir, common::auth());
+    app.clock.set(now);
+    app.advance(minutes(5));
+    let response = app.login_with(common::PASSWORD).await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(retry_after(&response), 10 * 60);
+    // … nor the lock level: the second lock is 30 minutes.
+    app.advance(minutes(10));
+    let now = app.clock.now();
+    let app = app_with(app.dir, common::auth());
+    app.clock.set(now);
+    assert_eq!(retry_after(&fail_logins(&app, 5).await), 30 * 60);
+
+    // A successful login clears the stored state.
+    app.advance(minutes(30));
+    assert_eq!(
+        app.login_with(common::PASSWORD).await.status(),
+        StatusCode::OK
+    );
+    let state = |app: &App| -> String {
+        rusqlite::Connection::open(app.dir.path().join("vocabulary.sqlite"))
+            .expect("open")
+            .query_row("SELECT state_json FROM auth_throttle", [], |r| r.get(0))
+            .expect("state")
+    };
+    assert_eq!(LoginState::of(&state(&app)), LoginState::Clear);
+
+    // reset-password forgets failed logins too.
+    assert_eq!(retry_after(&fail_logins(&app, 5).await), 15 * 60);
+    assert_eq!(LoginState::of(&state(&app)), LoginState::Locked);
+    vocab_server::auth::reset_password(&app.db)
+        .await
+        .expect("reset");
+    assert_eq!(state(&app), "{}");
+    let now = app.clock.now();
+    let app = app_with(app.dir, common::auth());
+    app.clock.set(now);
+    let response = app.setup(&app.code.to_string(), common::PASSWORD).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "setup right after the reset"
+    );
+    assert_eq!(
+        app.login_with(common::PASSWORD).await.status(),
+        StatusCode::OK
+    );
+}
+
+/// What the stored throttle state says (without depending on its layout
+/// beyond the two facts the tests need).
+#[derive(Debug, PartialEq, Eq)]
+enum LoginState {
+    Clear,
+    Locked,
+    Counting,
+}
+
+impl LoginState {
+    fn of(json: &str) -> Self {
+        let state: Value = serde_json::from_str(json).expect("json");
+        let empty = |key: &str| state[key].as_array().is_none_or(Vec::is_empty);
+        if state["locked_until"].is_string() {
+            Self::Locked
+        } else if empty("failures") && empty("day_failures") {
+            Self::Clear
+        } else {
+            Self::Counting
+        }
+    }
+}
+
 #[tokio::test]
 async fn r82_the_lockout_doubling_starts_over_after_a_quiet_day() {
     let app = app().await;
@@ -1107,4 +1478,44 @@ async fn r83_connector_is_limited_to_30_requests_per_10_minutes() {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
     assert_eq!(send().await.status(), StatusCode::OK);
+}
+
+/// B4: while the app waits to be set up, the caller is asked to announce
+/// the setup code again and again; that stops once a password is set.
+#[tokio::test]
+async fn r82_the_setup_code_is_announced_again_until_the_app_is_set_up() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let (auth, code) = common::auth();
+    let app = app_with(
+        tempfile::tempdir().expect("tempdir"),
+        (Arc::clone(&auth), code),
+    );
+    let announced = Arc::new(AtomicU32::new(0));
+    let reminder = {
+        let (auth, db, announced) = (Arc::clone(&auth), app.db.clone(), Arc::clone(&announced));
+        tokio::spawn(async move {
+            auth.remind_setup(&db, std::time::Duration::from_millis(40), || {
+                announced.fetch_add(1, Ordering::Relaxed);
+            })
+            .await;
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let before_setup = announced.load(Ordering::Relaxed);
+    assert!(before_setup >= 3, "announced {before_setup} times");
+    assert!(!reminder.is_finished());
+
+    let response = app.setup(&app.code.to_string(), common::PASSWORD).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    tokio::time::timeout(std::time::Duration::from_secs(2), reminder)
+        .await
+        .expect("the reminder ends once the app is set up")
+        .expect("join");
+    let after_setup = announced.load(Ordering::Relaxed);
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(
+        announced.load(Ordering::Relaxed),
+        after_setup,
+        "no more reminders"
+    );
 }

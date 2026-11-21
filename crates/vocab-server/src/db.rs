@@ -10,6 +10,7 @@
 //! One connection behind a mutex is plenty for a single user. Calls run on
 //! tokio's blocking pool so they never stall the async runtime.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -22,24 +23,45 @@ const DB_FILE_NAME: &str = "vocabulary.sqlite";
 /// [`DataDirLock`]).
 const LOCK_FILE_NAME: &str = "vocabulary.lock";
 
-/// Embedded, forward-only migrations; entry `i` brings the schema to version `i + 1`.
-const MIGRATIONS: &[(&str, &str)] = &[
-    (
+/// One forward-only migration: its SQL, then an optional data step for
+/// what SQL alone cannot compute. Both run in one transaction.
+struct Migration {
+    name: &'static str,
+    sql: &'static str,
+    data_step: Option<fn(&Connection) -> rusqlite::Result<()>>,
+}
+
+const fn sql_only(name: &'static str, sql: &'static str) -> Migration {
+    Migration {
+        name,
+        sql,
+        data_step: None,
+    }
+}
+
+/// Embedded migrations; entry `i` brings the schema to version `i + 1`.
+const MIGRATIONS: &[Migration] = &[
+    sql_only(
         "0001_initial",
         include_str!("../migrations/0001_initial.sql"),
     ),
-    (
+    sql_only(
         "0002_word_spelling_nullable",
         include_str!("../migrations/0002_word_spelling_nullable.sql"),
     ),
-    (
+    sql_only(
         "0003_session_item_format",
         include_str!("../migrations/0003_session_item_format.sql"),
     ),
-    (
+    sql_only(
         "0004_auth_owner",
         include_str!("../migrations/0004_auth_owner.sql"),
     ),
+    Migration {
+        name: "0005_review_round_1",
+        sql: include_str!("../migrations/0005_review_round_1.sql"),
+        data_step: Some(rekey_sentences),
+    },
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -217,16 +239,6 @@ impl Db {
         .await
     }
 
-    /// Liveness probe: the connection answers a trivial query.
-    pub async fn ping(&self) -> Result<(), DbError> {
-        self.read(|conn| {
-            Ok(conn
-                .query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
-                .map(drop)?)
-        })
-        .await
-    }
-
     async fn with_conn<T, E, F>(&self, f: F) -> Result<T, E>
     where
         F: FnOnce(&mut Connection) -> Result<T, E> + Send + 'static,
@@ -293,13 +305,16 @@ fn migrate(conn: &mut Connection) -> Result<(), DbError> {
             known,
         });
     }
-    for (version, (name, sql)) in (1u32..).zip(MIGRATIONS.iter()).skip(current as usize) {
-        let name: &'static str = name;
+    for (version, migration) in (1u32..).zip(MIGRATIONS.iter()).skip(current as usize) {
+        let name = migration.name;
         let fail = |source| DbError::Migration { name, source };
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Exclusive)
             .map_err(fail)?;
-        tx.execute_batch(sql).map_err(fail)?;
+        tx.execute_batch(migration.sql).map_err(fail)?;
+        if let Some(data_step) = migration.data_step {
+            data_step(&tx).map_err(fail)?;
+        }
         let violations = tx
             .prepare("PRAGMA foreign_key_check")
             .and_then(|mut stmt| stmt.query([])?.next().map(|row| row.is_some()))
@@ -311,6 +326,153 @@ fn migrate(conn: &mut Connection) -> Result<(), DbError> {
             .map_err(fail)?;
         tx.commit().map_err(fail)?;
         tracing::info!(migration = name, version, "applied database migration");
+    }
+    Ok(())
+}
+
+/// One stored sentence, as the 0005 data step reads it.
+struct StoredSentence {
+    id: i64,
+    word_id: i64,
+    en_marked: String,
+    cs_marked: String,
+    location: Option<String>,
+    hidden: bool,
+    edited: bool,
+    updated_at: String,
+}
+
+/// The row a group of sentence copies becomes: the oldest id with the
+/// newest text, as an import merge would have left it (R-22). The owner's
+/// work wins: if a copy was edited, the newest edited copy gives the text;
+/// a hidden or edited copy makes the result hidden or edited. Otherwise the
+/// newest copy gives the Czech text and location, and its English only
+/// when it marks another part of the sentence. `copies` are oldest first.
+fn merged(copies: &[StoredSentence]) -> Option<StoredSentence> {
+    let (oldest, newest) = (copies.first()?, copies.last()?);
+    let source = copies.iter().rev().find(|c| c.edited).unwrap_or(newest);
+    let en_marked = if source.edited
+        || vocab_pack::keys::span_key(&source.en_marked)
+            != vocab_pack::keys::span_key(&oldest.en_marked)
+    {
+        source.en_marked.clone()
+    } else {
+        oldest.en_marked.clone()
+    };
+    Some(StoredSentence {
+        id: oldest.id,
+        word_id: oldest.word_id,
+        en_marked,
+        cs_marked: source.cs_marked.clone(),
+        location: source.location.clone(),
+        hidden: copies.iter().any(|c| c.hidden),
+        edited: copies.iter().any(|c| c.edited),
+        updated_at: copies.iter().map(|c| c.updated_at.clone()).max()?,
+    })
+}
+
+/// Data step of migration 0005: store every sentence's key as today's
+/// [`vocab_pack::keys::sentence_key`] computes it. Sentences of one word
+/// that now share a key are one sentence (see [`merged`]): reviews and
+/// practice items that showed a newer copy point to the oldest row, and
+/// the copies are deleted, set-based (one statement per table). A sentence
+/// whose new key is empty (punctuation only) is never merged and keeps its
+/// key.
+fn rekey_sentences(conn: &Connection) -> rusqlite::Result<()> {
+    // (word, key) → the copies, oldest first (rows come by id). A row whose
+    // new key is empty keeps its old key and is never grouped with others.
+    let mut groups: Vec<(String, Vec<StoredSentence>)> = Vec::new();
+    let mut group_of: HashMap<(i64, String), usize> = HashMap::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT id, word_id, en_marked, cs_marked, location, hidden, edited, updated_at, \
+             en_key FROM sentence ORDER BY id",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let sentence = StoredSentence {
+                id: row.get(0)?,
+                word_id: row.get(1)?,
+                en_marked: row.get(2)?,
+                cs_marked: row.get(3)?,
+                location: row.get(4)?,
+                hidden: row.get(5)?,
+                edited: row.get(6)?,
+                updated_at: row.get(7)?,
+            };
+            let key = vocab_pack::keys::sentence_key(&sentence.en_marked);
+            if key.is_empty() {
+                let old_key: String = row.get(8)?;
+                groups.push((old_key, vec![sentence]));
+                continue;
+            }
+            match group_of.get(&(sentence.word_id, key.clone())) {
+                Some(&index) => groups[index].1.push(sentence),
+                None => {
+                    group_of.insert((sentence.word_id, key.clone()), groups.len());
+                    groups.push((key, vec![sentence]));
+                }
+            }
+        }
+    }
+    conn.execute_batch(
+        "CREATE TEMP TABLE sentence_merge (old_id INTEGER PRIMARY KEY, keep_id INTEGER NOT NULL)",
+    )?;
+    let mut merged_rows = 0usize;
+    {
+        let mut map =
+            conn.prepare("INSERT INTO temp.sentence_merge (old_id, keep_id) VALUES (?1, ?2)")?;
+        let mut update = conn.prepare(
+            "UPDATE sentence SET en_marked = ?2, cs_marked = ?3, location = ?4, hidden = ?5, \
+             edited = ?6, updated_at = ?7 WHERE id = ?1",
+        )?;
+        for (_, copies) in groups.iter().filter(|(_, copies)| copies.len() > 1) {
+            let Some(result) = merged(copies) else {
+                continue;
+            };
+            for copy in &copies[1..] {
+                map.execute([copy.id, result.id])?;
+                merged_rows += 1;
+            }
+            update.execute(rusqlite::params![
+                result.id,
+                result.en_marked,
+                result.cs_marked,
+                result.location,
+                result.hidden,
+                result.edited,
+                result.updated_at
+            ])?;
+        }
+    }
+    conn.execute_batch(
+        "UPDATE review_log SET sentence_id = m.keep_id FROM temp.sentence_merge m \
+           WHERE review_log.sentence_id = m.old_id;
+         UPDATE session_item SET sentence_id = m.keep_id FROM temp.sentence_merge m \
+           WHERE session_item.sentence_id = m.old_id;
+         DELETE FROM sentence WHERE id IN (SELECT old_id FROM temp.sentence_merge);
+         DROP TABLE temp.sentence_merge;",
+    )?;
+    // Two passes: a new key may equal the old key of a row not yet updated,
+    // and `(word_id, en_key)` is unique. A row kept with its old key whose
+    // old key is now another row's key gets a key no text can have.
+    conn.execute("UPDATE sentence SET en_key = char(1) || id", [])?;
+    let mut update = conn.prepare("UPDATE sentence SET en_key = ?2 WHERE id = ?1")?;
+    for (key, copies) in &groups {
+        let Some(kept) = copies.first() else {
+            continue;
+        };
+        let taken = vocab_pack::keys::sentence_key(&kept.en_marked).is_empty()
+            && group_of.contains_key(&(kept.word_id, key.clone()));
+        if !taken {
+            update.execute(rusqlite::params![kept.id, key])?;
+        }
+    }
+    if merged_rows > 0 {
+        tracing::info!(
+            merged = merged_rows,
+            "merged sentences that differ only in punctuation"
+        );
     }
     Ok(())
 }

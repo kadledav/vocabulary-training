@@ -91,7 +91,7 @@ The app does **not** process books or translate anything. Claude, in the owner's
 
 **R-21 MUST** — For book words, the export instructions (R-14) tell Claude to quote real sentences from the book where the word is used **in the intended meaning**, in any of its forms, preferring sentences of reasonable length with few other difficult words. Words from films, articles or general vocabulary use Claude-written examples.
 
-**R-22 MUST** — Re-importing a word merges new sentences into the existing set (no duplicates), so the owner can ask Claude for more sentences later.
+**R-22 MUST** — Re-importing a word merges new sentences into the existing set (no duplicates), so the owner can ask Claude for more sentences later. The same sentence punctuated or cut slightly differently (dashes, `…` vs `...`, quote style, closing punctuation) is still the same sentence. When a later pack corrects the Czech translation or the marked span of a sentence the app already has, the correction replaces the stored version and the import report counts it — unless the owner edited or hid that sentence.
 
 **R-23 MUST** — The importer validates sentences (target span present and inside the text; translation non-empty) and reports bad entries in the preview instead of importing them silently.
 
@@ -123,7 +123,7 @@ Speech recognition (STT) is **out of scope** (decided 2026-11-17). The app only 
 - `low-priority`-tagged words are not introduced automatically; the owner can include them per word (then recognise-only, lowest retention target).
 
 **R-52 MUST — Two cards per word.** Each word has up to two independently scheduled cards, each with its own FSRS memory state and a fixed exercise format (changing the format inside a card would corrupt its scheduling):
-- **Understand** — every word. Default format: sentence comprehension (R-53). Words with fewer than 3 sentences use a word-only flip (word + audio → reveal Czech, meaning, one example).
+- **Understand** — every word. Default format: sentence comprehension (R-53). Words with fewer than 3 sentences use a word-only flip (word + audio → reveal Czech, meaning, one example); once such a word has 3 sentences its card becomes a sentence card (one-way, the only automatic format change).
 - **Produce** — only words with `goal = active` (R-15), created once the Understand card has stability ≥ 7 days. Format: a sentence with the word blanked out + the Czech sentence as cue → owner produces the word (R-56) → rates.
 - Understand and Produce of the same word are never scheduled on the same day.
 - New words are tested cold on the Understand card (owner already met them in the book), followed by the full card.
@@ -134,11 +134,13 @@ English sentence from a source with the target word highlighted + play button �
 
 **R-56 MUST — Produce answer mode.** Typed answer with a suggested grade (exact match after normalisation against `accepted` → suggest 2; otherwise suggest 4 and show the typed vs correct answer; a typo is a no-match the owner can rate 3 himself — no fuzzy matching). An "I'll just rate myself" button skips typing: reveal → self-rate.
 
-**R-54 MUST — Daily session.** Blocks of 20 cards with "Continue +20". New words (configurable, default 5/day) are mixed among reviews and paused automatically when the review backlog grows. Every rating is saved immediately; a session can be interrupted and resumed; the last rating can be undone.
+**R-54 MUST — Daily session.** Blocks of 20 cards with "Continue +20". New words (configurable 0–100 per day, default 5) are mixed among reviews and paused automatically when the review backlog grows. When today's new words are done (or paused), the owner can still ask for more: "Learn more new words" gives a block of unseen words (default: the daily number, at least 5; at most 50 per block) regardless of the daily limit and the pause; they count as introduced today. Every rating is saved immediately; a session can be interrupted and resumed; the last rating can be undone.
 
-**R-55 MUST — Problem words (leeches).** A card is flagged after 4 lapses (or two 5s in a row on a previously mature card). Flagged words are not suspended automatically; their next review shows the pack's `hint` and `confusables` with options: demote to recognise-only, lower usefulness, suspend. They are listed in the progress view.
+**R-55 MUST — Problem words (leeches).** A card is flagged after 4 lapses (or two 5s in a row on a previously mature card). A lapse is a study day on which a card that is not new was failed (4/5): at most one per card and day, however often its in-session repeats are failed or passed; in the same way only the first failure of a day lowers the card's memory state (R-50). Flagged words are not suspended automatically; their next review shows the pack's `hint` and `confusables` with options: demote to recognise-only, lower usefulness, suspend. They are listed in the progress view.
 
 **R-58 SHOULD (phase 1) — Spelling card.** A third, independently scheduled card for words where the pack sets `spelling: true` (Claude's call: words whose spelling doesn't follow from the sound, e.g. *desiccated*, *nuisance*, *verbatim*). Flow: the app plays the word (and optionally the sentence with the word blanked) → the owner types it → letter-by-letter comparison with the correct spelling → suggested grade (exact match → 2, otherwise 4), owner confirms. Spelling is strict: a typo is a miss. To keep it occasional ("sometimes, not every time"), Spelling cards use a low desired retention (≈ 0.80) so they come up rarely, and at most ~3 Spelling cards per 20-card block. Created only after the Understand card is past the new stage.
+
+**R-63 MUST — Extra practice.** When nothing is due (in the chosen scope), the owner can still practise — it is offered only then, due cards always come first: an extra block (block size from settings, scope respected) of words already seen that are not due yet, those rated 3–5 today first, then those most likely to be forgotten (lowest current recall probability); a card whose latest rating today was 1–2 is left out. Its ratings are ordinary reviews (the scheduler takes the real time since the last review into account, and a failure lowers the memory at most once a day, R-50/R-55). Today shows how many cards an extra block would have, how many new words are waiting, how many are left of today's limit (or why new words are paused) and how many cards are due tomorrow. If nothing qualifies, the app says there is nothing to practise.
 
 **R-59 MUST — Practice scope by source.** A session practises all sources together by default; the owner can restrict a session to one source (e.g. only Bobiverse 2, only General Vocabulary). The latest `reading_position` received for a book is shown on that source.
 
@@ -177,7 +179,7 @@ The pass/fail line between 3 and 4 is visible in the button row. Labels are in E
 
 **R-81 MUST — No public internet exposure.** Reachable only via the Traefik `home` entrypoint (LAN / VPN) and optionally mesh VPN. **Not** routed on the public `websecure` entrypoint. Any mesh VPN access requires an explicit change to the mesh-VPN ACL, limited to the owner's devices (not `*`).
 
-**R-82 MUST — Authentication.** The UI requires login even on the private network (other household devices share the network). The import API used by the connector requires a separate secret token. No secrets in the environment: on first start the owner sets the password (≥ 12 characters) with a one-time setup code from the container log; the password can be changed in Settings (logs out every other device) and reset with a `reset-password` command; the connector token is created in Settings and shown once. Only hashes are stored.
+**R-82 MUST — Authentication.** The UI requires login even on the private network (other household devices share the network). The import API used by the connector requires a separate secret token. No secrets in the environment: on first start the owner sets the password (≥ 12 characters) with a one-time setup code from the container log; the password can be changed in Settings (logs out every other device and replaces this device's session) and reset with a `reset-password` command; "Log out everywhere" (Settings, or the `logout-all` command) ends every session, and no session lives longer than a year; the connector token is created in Settings and shown once. Only hashes are stored.
 
 **R-83 MUST — Hardened container.**
 - Minimal image (`scratch` / distroless): no shell, no package manager.
@@ -224,5 +226,5 @@ All decided by the product owner on 2026-11-17.
 6. **Produce card** (R-56) — typed answer with suggested grade, plus an "I'll just rate myself" button that skips typing.
 7. **TTS accent** — US English; UK voice remains a SHOULD (R-42).
 8. **Rating labels** — English: Instantly / Knew it / Shaky / Vague / No idea (R-60).
-9. **New words per day** — default 5, configurable (R-54).
+9. **New words per day** — default 5, configurable 0–100 (R-54); "Learn more new words" and extra practice on demand (R-54, R-63, owner feedback after v0.1.0).
 10. **STT** — out of scope. **Translation / PDF processing in the app** — out of scope (done by Claude at export).

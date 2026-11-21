@@ -5,14 +5,16 @@ When I ask you to export words "for the training app", produce vocabulary packs 
 ## What to export
 - By default: the words we discussed in this conversation. If I say "everything" or name a book, export all words for that source that you know of.
 - If I say "update the sentences" for a book (e.g. "I'm now at chapter 20, update the sentences for Book 2"): re-export the words of that book that I already have, with sentences from the newly read part added. Copy each word's other fields verbatim from the earlier export if it is in this chat, otherwise keep them as close to before as you can; it is fine to repeat sentences you exported earlier — my app merges and skips duplicates.
-- If I attach one of my old vocabulary HTML pages (they contain `const words = [...]`), convert every word in it, keep all its information, and add sentences as described below. Keep each word's `seq` from the old page as the word field `"seq"` (integer), so the original order is preserved.
+- If I attach one of my old vocabulary HTML pages (they contain `const words = [...]`), convert every word in it, keep all its information, and add sentences as described below. The old word objects use short keys; map them as listed under "Converting my old pages" at the end.
 - If I paste a JSON with `"format": "vocab-feedback"` (exported by my app): follow its `instructions_for_claude`. In short: re-export the listed words of each source — write a `hint` for words in `needs_hint`, replace sentences listed in `hidden_sentences` with new ones, reconsider `goal`/`usefulness` where I overrode them, and add my `owner_accepted` answers to `accepted` if they are correct.
 - Group words by source: one pack contains words from ONE source only.
-- Max 15 words per pack. If there are more, output several packs and set `part` (e.g. 1 of 3). Never cut a pack in the middle.
+- Max 30 words per pack. If there are more, output several packs and set `part` (e.g. 1 of 3). Never cut a pack in the middle; if you are running out of space, stop after a complete pack and tell me to say "continue".
 
 ## Output rules
 - Each pack in its own ```json code block. Nothing inside the code block except the JSON.
+- Keep everything together so I can copy it in one go: all packs in ONE answer, one code block after another. If you create a file instead, create exactly ONE file (`vocab-export.txt`) that contains all packs one after another, each in its own ```json block — never one file per pack and never a zip.
 - Strictly valid JSON: double-quoted keys and strings, no comments, no trailing commas, escape `"` and `\` inside strings. Typographic quotes (“ ” ’) inside text are fine.
+- Leave an optional field out when you have nothing for it (`null` is read the same way, but leaving it out is clearer).
 - After the code blocks, one short line: how many words, how many packs, and anything you were unsure about.
 
 ## Pack format (format_version 1)
@@ -37,8 +39,8 @@ When I ask you to export words "for the training app", produce vocabulary packs 
 
 - `source.id`: lowercase-hyphenated, STABLE — always the same id for the same book/film/article (series + number if any, else a short title slug). Use `general` for my general vocabulary without a specific source.
 - `source.title`: always include it — the book/film/article title; for `general` use "General Vocabulary".
-- `source.type`: "book" | "film" | "series" | "article" | "general". `author`, `series`, `series_number` only when they apply; add `"url"` for articles.
-- `reading_position`: books only — how far I have read (ask me if you don't know). Omit for other types.
+- `source.type`: "book" | "film" | "series" | "article" | "general". `author`, `series`, `series_number` only when they apply; add `"url"` for articles (a full web address starting with `https://` or `http://`).
+- `exported_at`: today's date. `reading_position`: books only — how far I have read (ask me if you don't know). Omit for other types.
 - `pack_id`: n = 1, 2, … for multiple packs exported the same day for the same source.
 
 ## Word format
@@ -58,7 +60,6 @@ When I ask you to export words "for the training app", produce vocabulary packs 
   "hint": "Think of the sound a heavy book makes when dropped on a carpet.",
   "spelling": false,
   "note": "thud = dull and heavy; thump = punchier, often repeated; bang = loud and sharp; crash = with breaking.",
-  "tag": null,
   "icon": "📦",
   "sentences": [
     { "en": "There was a loud [[thud]] from the corridor.", "cs": "Z chodby se ozvalo hlasité [[žuchnutí]].", "origin": "book", "location": "Chapter 12" },
@@ -83,17 +84,36 @@ Field rules:
 - `hint`: one short memory hook (max ~120 characters), shown when I keep failing this word.
 - `spelling`: true if the spelling is worth practising separately — it does not follow from the sound, or has a common trap (desiccated, nuisance, verbatim, rhythm). false for words spelled as they sound (thud, limp). If true, add `"spelling_note"`: the trap in a few words ("one s, two c"; "ui is pronounced oo").
 - `note`: the longer usage note like in my vocabulary pages (synonyms, register, pitfalls, related words). May be "".
-- `tag`: null, or { "kind": "low-priority" | "seen-before" | "not-from-source", "text": "short reason" }.
+- `tag`: omit `tag` when there is none. Otherwise { "kind": "low-priority" | "seen-before" | "not-from-source", "text": "short reason" }, e.g. "tag": { "kind": "low-priority", "text": "too exotic" }.
   low-priority = not worth much effort (e.g. too exotic, technical, learn another word instead); seen-before = also appeared in an earlier book/source; not-from-source = I asked about it while reading this source but it does not occur in it.
+  When you re-export a word that had a tag, repeat the same tag; a word without `tag` keeps the tag my app already has.
 - `icon`: optional — one emoji, or a Lucide icon name. Omit if nothing fits.
 
 ## Sentences — the most important part
 - Never write `[[` or `]]` anywhere except around the target word. For omissions inside a quote use `…`, never `[…]`.
 - Every sentence marks the target word with [[double brackets]] — EXACTLY ONE marked span in `en` (the word in the form it appears, e.g. [[thudded]], [[poring over]]) and EXACTLY ONE in `cs` (the Czech words that translate it; if it is translated by a phrase, mark the whole phrase).
 - `cs` is a natural, fluent Czech translation of the whole sentence, not word-for-word.
-- Book words: 3–5 sentences QUOTED VERBATIM from the book in the project, with `"origin": "book"` and `location` (chapter, or page if there are no chapters).
+- Book words: 3–5 sentences QUOTED VERBATIM from the book in the project, with `"origin": "book"` and `location` (chapter, or page if there are no chapters, e.g. "Chapter 12" or "p. 214").
   - Only from the part I have already read (up to `reading_position`) — no spoilers.
   - Only sentences where the word has the meaning being taught. If the book uses a book-specific or unusual sense, teach the sense used in the book, say so in `note`, and add 1 example with the everyday sense marked `"origin": "example"`.
   - Prefer sentences that are understandable on their own (one sentence, 6–30 words, not too many other hard words). You may cut a very long sentence with "…" at the start or end, but never change words inside.
   - If the book has fewer than 3 suitable sentences, add your own examples (`"origin": "example"`, no `location`) to reach 3.
 - Words from films, series, articles or general vocabulary: 3 example sentences written by you (`"origin": "example"`); for articles you may quote the article (`"origin": "source"`).
+
+## Converting my old pages
+The word objects in my old HTML pages (`const words = [...]`) use these keys. Convert every word and keep everything it says:
+- `w` → `headword`.
+- `m` → `meaning` (the English explanation). If a word has no `m`, write the meaning yourself.
+- `cz` → `czech`: the old value is one text that may list several equivalents separated by `,` or `;` — make each equivalent its own array item, most common first.
+- `forms` → `forms`: the old value is free text; turn it into the list of { "form", "common" } objects.
+- `s` → `pronunciation` (the respelling, e.g. "STRAY-tum").
+- `say` → `speak` (text for text-to-speech; if absent, use the headword).
+- `u` → the old example sentences (a list of plain strings). Use each as a sentence with `"origin": "example"`: mark the target with [[…]] and add the Czech translation. If an entry of `u` is a usage remark rather than a sentence, keep its text in `note`.
+- `n` → `note` (the usage note), unchanged.
+- `ux` → `usefulness` (1–10).
+- `ic` or `em` → `icon` (`ic` is an icon name, `em` an emoji; if both exist, use the emoji).
+- `seq` → `seq` (integer, unchanged), so the original order is preserved.
+- `tag` + `tagtext` → `tag`: `skip` → { "kind": "low-priority" }, `rep` → { "kind": "seen-before" }, `late` → { "kind": "not-from-source" }; `tagtext` becomes the tag's `"text"`. No `tag` on the old word → omit `tag`.
+- The old pages have no `grammar`, `goal`, `accepted`, `confusables`, `hint` or `spelling`: fill these in as for any new word.
+- Add sentences as described above (for a book: quoted from the book in the project, up to my reading position).
+- Never drop information. If you are unsure where something from the old page belongs, or what a key means, keep the text in `note`.

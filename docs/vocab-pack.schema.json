@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/kadledav/vocabulary-training/docs/vocab-pack.schema.json",
   "title": "Vocabulary pack, format_version 1",
-  "description": "Exchange format produced by Claude (see docs/claude-project-instructions.txt) and imported by the vocabulary training app. The app's importer (crate vocab-pack) is the authoritative validator; this schema states the same contract. Rules a JSON Schema cannot express, and how errors are scoped (pack / word / sentence), are listed in docs/design/architecture.md, section 'Import'. A pack valid against this schema is accepted in full by the importer, except for the few rules a schema cannot express (a headword repeated within one pack, control characters in text, a Czech translation without any letter; see architecture.md section 5.2). The importer is deliberately more lenient in one respect only: unknown properties are reported as warnings and ignored instead of rejecting the word.",
+  "description": "Exchange format produced by Claude (see docs/claude-project-instructions.txt) and imported by the vocabulary training app. The app's importer (crate vocab-pack) is the authoritative validator; this schema states the same contract. Rules a JSON Schema cannot express, and how errors are scoped (pack / word / sentence), are listed in docs/design/architecture.md, section 'Import'. A pack valid against this schema is accepted in full by the importer, except for the few rules a schema cannot express (a headword repeated within one pack, control characters in text, a Czech translation without any letter, part.index greater than part.total, an exported_at that is not a real calendar date; see architecture.md section 5.2). The importer is deliberately more lenient in one respect only: unknown properties are reported as warnings and ignored instead of rejecting the word. For every optional property null means 'not given'. Line breaks may be written as \\n, \\r\\n or \\r; the importer stores \\n.",
   "type": "object",
   "additionalProperties": false,
   "required": ["format", "format_version", "pack_id", "source", "words"],
@@ -21,13 +21,13 @@
       "pattern": "^[a-z0-9]+(-[a-z0-9]+)*--[0-9]{4}-[0-9]{2}-[0-9]{2}--[1-9][0-9]{0,3}$"
     },
     "exported_at": {
-      "description": "Export date (YYYY-MM-DD). Used to decide which pack's reading_position is the newest.",
-      "type": "string",
+      "description": "Export date (YYYY-MM-DD), a real calendar date. Used to decide which pack's reading_position is the newest; without it the day of the import is used.",
+      "type": ["string", "null"],
       "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$"
     },
     "part": {
       "description": "Position of this pack in a multi-pack export. Defaults to 1 of 1 when omitted.",
-      "type": "object",
+      "type": ["object", "null"],
       "additionalProperties": false,
       "required": ["index", "total"],
       "properties": {
@@ -50,8 +50,13 @@
   },
   "$defs": {
     "optionalText": {
-      "description": "Optional free text. null is treated as absent.",
+      "description": "Optional free text. null and blank text are treated as absent.",
       "type": ["string", "null"]
+    },
+    "visibleText": {
+      "description": "Text with at least one visible character: not only whitespace and invisible characters (zero-width space/joiners, word joiner, byte order mark, soft hyphen).",
+      "type": "string",
+      "pattern": "[^\\s\\u0085\\u00A0\\u00AD\\u200B-\\u200D\\u2060\\uFEFF]"
     },
     "source": {
       "type": "object",
@@ -66,19 +71,24 @@
         },
         "type": { "enum": ["book", "film", "series", "article", "general"] },
         "title": {
-          "description": "Title of the book/film/article; for general vocabulary \"General Vocabulary\". Optional: an existing source keeps its title; a new source without one is named \"General Vocabulary\" (type general) or after its id, with a warning.",
-          "type": "string",
+          "description": "Title of the book/film/article; for general vocabulary \"General Vocabulary\". Optional (null = not given): an existing source keeps its title; a new source without one is named \"General Vocabulary\" (type general) or after its id, with a warning, until a later pack brings a title.",
+          "type": ["string", "null"],
           "minLength": 1,
           "maxLength": 300
         },
         "author": { "$ref": "#/$defs/optionalText", "maxLength": 300 },
         "series": { "$ref": "#/$defs/optionalText", "maxLength": 300 },
         "series_number": { "type": ["integer", "null"], "minimum": 1, "maximum": 9999 },
-        "url": { "$ref": "#/$defs/optionalText", "maxLength": 2000 }
+        "url": {
+          "$ref": "#/$defs/optionalText",
+          "maxLength": 2000,
+          "description": "Web address of an article: http:// or https:// only.",
+          "pattern": "^\\s*$|^[hH][tT][tT][pP][sS]?://"
+        }
       }
     },
     "markedText": {
-      "description": "Text with EXACTLY ONE target span marked as [[...]]. The span is non-empty and does not start or end with whitespace. No other '[[' or ']]' may appear (no nesting, no second span). The pattern needs ECMA-262 lookahead/lookbehind; the importer implements the same rule with a hand-written scanner (first '[[', then the first ']]' after it, then no further '[[' or ']]' in the text).",
+      "description": "Text with EXACTLY ONE target span marked as [[...]]. The span is non-empty, does not start or end with whitespace and does not start with ']'. No other '[[' or ']]' may appear (no nesting, no second span). The pattern needs ECMA-262 lookahead/lookbehind; the importer implements the same rule with a hand-written scanner (first '[[', then the first ']]' after it, then no further '[[' or ']]' in the text).",
       "type": "string",
       "minLength": 5,
       "maxLength": 600,
@@ -102,9 +112,9 @@
           "enum": ["book", "source", "example"]
         },
         "location": {
-          "$ref": "#/$defs/optionalText",
+          "type": ["string", "number", "null"],
           "maxLength": 100,
-          "description": "Chapter or page for quoted sentences; omitted for examples."
+          "description": "Chapter or page for quoted sentences; omitted for examples. A bare page number may be a JSON number; it is stored as text."
         }
       }
     },
@@ -127,7 +137,8 @@
       }
     },
     "shortList": {
-      "type": "array",
+      "description": "A list of short texts; null is treated as absent.",
+      "type": ["array", "null"],
       "maxItems": 50,
       "items": { "type": "string", "minLength": 1, "maxLength": 200 }
     },
@@ -141,12 +152,12 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 100,
-          "pattern": "\\S"
+          "$ref": "#/$defs/visibleText"
         },
         "grammar": { "$ref": "#/$defs/optionalText", "maxLength": 200 },
         "forms": {
-          "description": "Forms in THIS meaning; [] if not relevant.",
-          "type": "array",
+          "description": "Forms in THIS meaning; [] (or null) if not relevant.",
+          "type": ["array", "null"],
           "maxItems": 50,
           "items": { "$ref": "#/$defs/form" }
         },
@@ -156,16 +167,17 @@
           "maxLength": 200,
           "description": "Text for text-to-speech; defaults to the headword."
         },
-        "meaning": { "type": "string", "minLength": 1, "maxLength": 1500 },
+        "meaning": { "$ref": "#/$defs/visibleText", "minLength": 1, "maxLength": 1500 },
         "czech": {
           "description": "Czech equivalents, most common first, one per item.",
           "$ref": "#/$defs/shortList",
+          "type": "array",
           "minItems": 1
         },
         "usefulness": { "type": "integer", "minimum": 1, "maximum": 10 },
         "goal": {
           "description": "Default when omitted: active for usefulness >= 6, otherwise recognise (R-15).",
-          "enum": ["recognise", "active"]
+          "enum": ["recognise", "active", null]
         },
         "accepted": {
           "description": "English answers accepted in the Produce card (exact match after mechanical normalisation).",
@@ -180,10 +192,11 @@
           "maxLength": 300,
           "description": "Short memory hook shown for problem words (instructions ask for ~120 characters)."
         },
-        "spelling": { "type": "boolean", "description": "Worth a separate Spelling card (R-58). Default false." },
+        "spelling": { "type": ["boolean", "null"], "description": "Worth a separate Spelling card (R-58). Default false." },
         "spelling_note": { "$ref": "#/$defs/optionalText", "maxLength": 200 },
         "note": { "$ref": "#/$defs/optionalText", "maxLength": 6000 },
         "tag": {
+          "description": "Leave it out (or null) when the word has no tag for this source; on a re-export that keeps the tag the app already has.",
           "oneOf": [
             { "type": "null" },
             { "$ref": "#/$defs/tag" }
@@ -196,13 +209,13 @@
         },
         "seq": {
           "description": "Optional order of the word within its source (P-1), e.g. the seq of a converted old vocabulary page. Used only when the word is first linked to the source; later packs never change an existing word's order. Without it the word goes after the source's highest seq (order of import and of the words array).",
-          "type": "integer",
+          "type": ["integer", "null"],
           "minimum": 1,
           "maximum": 1000000
         },
         "sentences": {
-          "description": "Practice sentences (target 3-5). Fewer than 3 visible sentences means the Understand card uses the word-only format.",
-          "type": "array",
+          "description": "Practice sentences (target 3-5); null = none. Fewer than 3 visible sentences means the Understand card uses the word-only format (it switches to the sentence format once the word has 3).",
+          "type": ["array", "null"],
           "maxItems": 20,
           "items": { "$ref": "#/$defs/sentence" }
         }

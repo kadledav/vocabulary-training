@@ -115,6 +115,10 @@ pub enum PackStatus {
     Rejected,
     /// Not readable as JSON, or over a paste limit.
     Unreadable,
+    /// Valid, but importing it failed (an unexpected error, or a hard cap
+    /// of the app); nothing of this pack was stored. Other packs of the
+    /// paste are not affected.
+    Failed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -172,6 +176,8 @@ pub struct ReadingPositionRef {
     pub value: String,
     /// The source's reading position is (or would be) set from this pack.
     pub updated: bool,
+    /// Why it was not applied (`None` when it was).
+    pub reason: Option<String>,
 }
 
 /// Counts for one pack or the whole paste.
@@ -184,6 +190,8 @@ pub struct Summary {
     pub invalid_words: u32,
     pub new_sentences: u32,
     pub words_with_new_sentences: u32,
+    /// Known sentences whose text was corrected by the pack (R-22).
+    pub updated_sentences: u32,
     /// Newly recorded field conflicts (existing open ones not counted).
     pub conflicts: u32,
     pub sentence_errors: u32,
@@ -199,6 +207,7 @@ impl Summary {
         self.invalid_words += other.invalid_words;
         self.new_sentences += other.new_sentences;
         self.words_with_new_sentences += other.words_with_new_sentences;
+        self.updated_sentences += other.updated_sentences;
         self.conflicts += other.conflicts;
         self.sentence_errors += other.sentence_errors;
         self.warnings += other.warnings;
@@ -291,6 +300,7 @@ impl PackReport {
                         .map(|value| ReadingPositionRef {
                             value,
                             updated: false,
+                            reason: None,
                         });
             }
             Err(errors) => {
@@ -355,10 +365,31 @@ impl PackReport {
         self.finish();
     }
 
-    pub fn set_reading_position_updated(&mut self, updated: bool) {
+    /// Whether the pack's reading position was applied, and if not, why.
+    pub fn set_reading_position(&mut self, updated: bool, reason: Option<String>) {
         if let Some(reading) = &mut self.reading_position {
             reading.updated = updated;
+            reading.reason = reason;
         }
+    }
+
+    /// Importing the pack failed and nothing of it was stored: the report
+    /// goes back to what validation found, with `message` as its error.
+    pub fn set_failed(&mut self, code: &'static str, message: impl Into<String>) {
+        for word in &mut self.words {
+            if word.outcome != WordOutcome::Invalid {
+                word.outcome = WordOutcome::NotImported;
+            }
+            word.merge = None;
+            word.note = None;
+        }
+        self.set_reading_position(false, None);
+        self.errors.push(IssueView {
+            pointer: String::new(),
+            code,
+            message: message.into(),
+        });
+        self.set_status(PackStatus::Failed);
     }
 
     /// Record the merge result of the word at `index` of the pack.
@@ -398,6 +429,7 @@ impl PackReport {
                 if merge.sentences_added > 0 {
                     s.words_with_new_sentences += 1;
                 }
+                s.updated_sentences += merge.sentences_updated;
                 s.conflicts += count(merge.conflicts.iter().filter(|c| !c.already_open).count());
             }
         }
@@ -416,6 +448,7 @@ impl PackReport {
                     "headword": w.headword,
                     "outcome": w.outcome,
                     "sentences_added": w.merge.as_ref().map_or(0, |m| m.sentences_added),
+                    "sentences_updated": w.merge.as_ref().map_or(0, |m| m.sentences_updated),
                     "conflict_fields": w.merge.as_ref().map(|m| {
                         m.conflicts.iter().filter(|c| !c.already_open).map(|c| c.field).collect::<Vec<_>>()
                     }),

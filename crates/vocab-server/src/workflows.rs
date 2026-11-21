@@ -15,6 +15,11 @@
 //! is always rolled back, so it reports what the commit will do (including
 //! several packs of one paste touching the same word) and stores nothing.
 //!
+//! A pack whose import fails (an unexpected database error, or a hard cap
+//! of the catalog) is reported as `failed` in the normal report; its
+//! transaction is rolled back and the other packs of the paste are imported
+//! as usual (R-23: never a bare error for a paste that was partly stored).
+//!
 //! Every merged word gets its cards in the same transaction
 //! (`scheduler::ensure_cards`, design §5.1 step 4); [`ensure_all_cards`]
 //! does the same for every stored word at startup, so databases imported
@@ -24,8 +29,8 @@ use rusqlite::Transaction;
 use vocab_pack::paste::PasteError;
 use vocab_pack::types::WordResult;
 
-use crate::catalog::{self, ImportLink, ReadingUpdate};
-use crate::clock::{Moment, utc_date};
+use crate::catalog::{self, CapacityError, ImportLink, ReadingUpdate};
+use crate::clock::Moment;
 use crate::db::{Db, DbError};
 use crate::importer::{
     self, ImportLogRow, ImportReport, Mode, PACK_ID_REUSED, PackReport, PackStatus, PreparedPack,
@@ -45,6 +50,29 @@ pub enum WorkflowError {
     Paste(#[from] PasteError),
     #[error("import task failed: {0}")]
     Task(String),
+    /// Importing the pack would pass a hard cap of the catalog.
+    #[error(transparent)]
+    Capacity(#[from] CapacityError),
+}
+
+/// What the owner is told when a pack could not be imported.
+const PACK_FAILED: &str = "This pack could not be imported because of an unexpected error; \
+     nothing of it was stored. Importing it again is safe.";
+
+/// Mark `report` as failed because of `err` (which is logged, not shown:
+/// it may quote pack text).
+fn failed(mut report: PackReport, err: &WorkflowError) -> PackReport {
+    match err {
+        WorkflowError::Capacity(cap) => report.set_failed(
+            "capacity",
+            format!("This pack was not imported: {cap}. Nothing of it was stored."),
+        ),
+        other => {
+            tracing::error!(error = %other, position = report.position, "pack import failed");
+            report.set_failed("import_failed", PACK_FAILED);
+        }
+    }
+    report
 }
 
 /// Time-dependent values shared by every pack of one import.
@@ -55,8 +83,6 @@ struct ImportContext {
     moment: Moment,
     /// RFC 3339 timestamp of the import.
     now: String,
-    /// Import date; stands in for a missing `exported_at`.
-    today: String,
 }
 
 impl ImportContext {
@@ -65,7 +91,6 @@ impl ImportContext {
             via,
             moment,
             now: moment.stamp(),
-            today: utc_date(moment.at),
         }
     }
 }
@@ -83,10 +108,22 @@ pub async fn preview_import(
         .dry_run(move |tx| {
             let mut reports: Vec<PackReport> = packs.iter().map(PackReport::new).collect();
             for index in importer::commit_order(&packs) {
-                let mut report = import_pack(tx, &packs[index], reports[index].clone(), &ctx)?;
-                if report.status == PackStatus::Imported {
-                    report.set_status(PackStatus::Ready);
-                }
+                // A savepoint per pack: a pack that fails leaves nothing
+                // behind for the packs after it, as in the real commit.
+                tx.execute_batch("SAVEPOINT preview_pack")?;
+                let report = match import_pack(tx, &packs[index], reports[index].clone(), &ctx) {
+                    Ok(mut report) => {
+                        if report.status == PackStatus::Imported {
+                            report.set_status(PackStatus::Ready);
+                        }
+                        report
+                    }
+                    Err(err) => {
+                        tx.execute_batch("ROLLBACK TO preview_pack")?;
+                        failed(reports[index].clone(), &err)
+                    }
+                };
+                tx.execute_batch("RELEASE preview_pack")?;
                 reports[index] = report;
             }
             Ok::<_, WorkflowError>(reports)
@@ -122,9 +159,15 @@ async fn commit_packs(
         let pack = packs[index].clone();
         let report = reports[index].clone();
         let ctx = ctx.clone();
-        reports[index] = db
+        let outcome = db
             .write(move |tx| import_pack(tx, &pack, report, &ctx))
-            .await?;
+            .await;
+        reports[index] = match outcome {
+            Ok(report) => report,
+            // Rolled back as a whole; the packs before it stay imported and
+            // the ones after it are still tried.
+            Err(err) => failed(reports[index].clone(), &err),
+        };
     }
     Ok(ImportReport::new(Mode::Commit, reports))
 }
@@ -150,20 +193,48 @@ fn import_pack(
         report.add_note(PACK_ID_REUSED);
     }
     let import_id = importer::begin_import(tx, header, sha, ctx.via, &ctx.now)?;
+    // The date the reading position counts for (R-59): the export date,
+    // but never later than tomorrow's study day (a typo like next year's
+    // date would otherwise block every later position), and the study day
+    // of the import when the pack has none.
+    let today = ctx.moment.day.to_string();
+    let latest = ctx.moment.day.add_days(1).to_string();
+    let effective_date = match &header.exported_at {
+        Some(date) if *date > latest => {
+            report.add_warning(
+                "/exported_at",
+                format!(
+                    "exported_at ({date}) is in the future; the reading position is dated today ({today}) instead."
+                ),
+            );
+            today
+        }
+        Some(date) => date.clone(),
+        None => today,
+    };
     let reading = ReadingUpdate {
         position: header.reading_position.clone(),
-        effective_date: header
-            .exported_at
-            .clone()
-            .unwrap_or_else(|| ctx.today.clone()),
+        effective_date,
     };
     let source = catalog::upsert_source(tx, &header.source, &reading, &ctx.now)?;
-    report.set_reading_position_updated(source.reading_position_updated);
+    let not_applied = source.reading_position_newer.as_ref().map(|stored| {
+        format!(
+            "Not applied: the source already has a reading position dated {stored}, which is \
+             newer than this pack's ({}).",
+            reading.effective_date
+        )
+    });
+    report.set_reading_position(source.reading_position_updated, not_applied);
     if let Some(title) = &source.default_title {
         report.add_warning(
             "/source/title",
-            format!("Source title missing; using \"{title}\"."),
+            format!("Source title missing; using \"{title}\" until a pack brings one."),
         );
+    }
+    if source.title_replaced
+        && let Some(title) = &header.source.title
+    {
+        report.add_note(format!("The source is now titled \"{title}\"."));
     }
     if let Some(stored) = &source.kept_type {
         report.add_warning(
@@ -192,6 +263,7 @@ fn import_pack(
             report.record_merge(word.index, merge, None);
         }
     }
+    catalog::check_capacity(tx)??;
     report.set_status(PackStatus::Imported);
     importer::finish_import(tx, import_id, &report)?;
     let s = report.summary;
@@ -202,6 +274,7 @@ fn import_pack(
         unchanged_words = s.unchanged_words,
         invalid_words = s.invalid_words,
         new_sentences = s.new_sentences,
+        updated_sentences = s.updated_sentences,
         conflicts = s.conflicts,
         "pack imported"
     );

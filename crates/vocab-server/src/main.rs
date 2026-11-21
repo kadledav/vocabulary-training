@@ -7,30 +7,41 @@
 //! * `check`: open the existing database, run `quick_check` and migrations,
 //!   exit.
 //! * `reset-password`: with the app stopped, clear the password, every
-//!   session and the connector token; the next start is in setup state.
+//!   session, the connector token and the failed-login counters; the next
+//!   start is in setup state.
+//! * `logout-all`: with the app stopped, end every session (the password
+//!   and the connector token stay). A running app has the same as
+//!   "Log out everywhere" in Settings.
 //!
-//! `serve`, `check` and `reset-password` lock the data directory, so the
-//! last two refuse to run next to a running server.
+//! `serve`, `check`, `reset-password` and `logout-all` lock the data
+//! directory, so the last three refuse to run next to a running server.
 
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use vocab_server::auth::{self, Auth, SetupCode};
+use vocab_server::auth::{self, Auth, SessionLifetime, SetupCode};
 use vocab_server::clock::{Moment, Timestamp};
 use vocab_server::config::Config;
 use vocab_server::db::{DataDirLock, Db, DbError};
 use vocab_server::http::{self, AppState};
 use vocab_server::workflows;
 
-const USAGE: &str = "usage: vocab-server [serve | healthcheck | check | reset-password]
+/// While the app waits to be set up, the setup code is logged again this
+/// often, so it is still in the log after the log has rotated.
+const SETUP_REMINDER_EVERY: Duration = Duration::from_secs(60 * 60);
+
+const USAGE: &str =
+    "usage: vocab-server [serve | healthcheck | check | reset-password | logout-all]
 
   serve           open the database (integrity check + migrations) and serve HTTP (default)
   healthcheck     GET /healthz on the local listener; exit code 0 when healthy
   check           open the existing database (integrity check + migrations) and exit
-  reset-password  with the app stopped: clear the password, every session and the
-                  connector token; the next start asks for a new password (setup
-                  code in the log)
+  reset-password  with the app stopped: clear the password, every session, the
+                  connector token and the failed-login counters; the next start
+                  asks for a new password (setup code in the log)
+  logout-all      with the app stopped: end every session; the password and the
+                  connector token stay
 
 Configuration (environment): $VOCAB_PUBLIC_ORIGIN (required), $VOCAB_TIMEZONE
 (default Europe/Prague), $VOCAB_DAY_ROLLOVER_HOUR (default 4), $VOCAB_LOG_LEVEL
@@ -54,6 +65,7 @@ fn main() -> ExitCode {
         ["healthcheck"] => healthcheck(),
         ["check"] => check(),
         ["reset-password"] => reset_password(),
+        ["logout-all"] => logout_all(),
         ["help" | "-h" | "--help"] => {
             println!("{USAGE}");
             ExitCode::SUCCESS
@@ -90,8 +102,8 @@ fn init_logging(config: &Config) {
 enum Open {
     /// `serve`: create the directories and the database when missing.
     Create,
-    /// `check`, `reset-password`: only an existing database (a wrong mount
-    /// must not look like success).
+    /// `check`, `reset-password`, `logout-all`: only an existing database
+    /// (a wrong mount must not look like success).
     Existing,
 }
 
@@ -153,24 +165,32 @@ fn healthcheck() -> ExitCode {
     }
 }
 
-/// Back to setup state (deploy/README.md: run it with the stack stopped).
-fn reset_password() -> ExitCode {
-    let (_lock, db) = match load_config().and_then(|config| {
+/// Run one maintenance operation on the database of a stopped app: the
+/// data directory is locked for the duration, so it is refused next to a
+/// running server.
+fn offline<T, F>(command: &str, work: impl FnOnce(Db) -> F) -> Result<T, ExitCode>
+where
+    F: std::future::Future<Output = Result<T, DbError>>,
+{
+    let (_lock, db) = load_config().and_then(|config| {
         init_logging(&config);
         open_db(&config, Open::Existing)
-    }) {
-        Ok(opened) => opened,
-        Err(code) => return code,
-    };
-    let result = tokio::runtime::Builder::new_current_thread()
+    })?;
+    tokio::runtime::Builder::new_current_thread()
         .build()
         .map_err(|err| err.to_string())
-        .and_then(|runtime| {
-            runtime
-                .block_on(auth::reset_password(&db))
-                .map_err(|err| err.to_string())
-        });
-    match result {
+        .and_then(|runtime| runtime.block_on(work(db)).map_err(|err| err.to_string()))
+        .map_err(|err| {
+            eprintln!("vocab-server {command}: {err}");
+            ExitCode::FAILURE
+        })
+}
+
+/// Back to setup state (deploy/README.md: run it with the stack stopped).
+fn reset_password() -> ExitCode {
+    match offline("reset-password", |db| async move {
+        auth::reset_password(&db).await
+    }) {
         Ok(()) => {
             println!(
                 "The password, every session and the connector token are cleared. The next \
@@ -179,10 +199,23 @@ fn reset_password() -> ExitCode {
             );
             ExitCode::SUCCESS
         }
-        Err(err) => {
-            eprintln!("vocab-server reset-password: {err}");
-            ExitCode::FAILURE
+        Err(code) => code,
+    }
+}
+
+/// End every session (run it with the stack stopped).
+fn logout_all() -> ExitCode {
+    match offline("logout-all", |db| async move {
+        auth::logout_everywhere(&db).await
+    }) {
+        Ok(ended) => {
+            println!(
+                "Every session is ended ({ended} in all): each device has to log in again. \
+                 The password and the connector token are unchanged."
+            );
+            ExitCode::SUCCESS
         }
+        Err(code) => code,
     }
 }
 
@@ -192,7 +225,11 @@ fn serve() -> ExitCode {
         Err(code) => return code,
     };
     init_logging(&config);
-    let (auth, setup_code) = match Auth::new(&config.public_origin, config.session_days) {
+    let lifetime = SessionLifetime {
+        sliding_days: config.session_days,
+        max_days: config.session_max_days,
+    };
+    let (auth, setup_code) = match Auth::new(&config.public_origin, lifetime) {
         Ok(auth) => auth,
         Err(err) => {
             tracing::error!(error = %err, "cannot make the setup code");
@@ -236,10 +273,16 @@ async fn run_server(
         .setup_required(&db)
         .await
         .map_err(|err| std::io::Error::other(format!("cannot read the owner's password: {err}")))?;
+    let auth = Arc::new(auth);
     if setup_required {
         announce_setup(&setup_code);
+        // Said again every hour until a password is set.
+        let (auth, db) = (Arc::clone(&auth), db.clone());
+        tokio::spawn(async move {
+            auth.remind_setup(&db, SETUP_REMINDER_EVERY, || announce_setup(&setup_code))
+                .await;
+        });
     }
-    drop(setup_code);
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     tracing::info!(
         listen = %listener.local_addr()?,
@@ -257,14 +300,15 @@ async fn run_server(
         }
     }
     let app = http::app(
-        AppState::new(db, config.day_rule.clone(), Arc::new(auth)),
+        AppState::new(db, config.day_rule.clone(), auth),
         &config.limits,
     );
     http::serve(listener, app, &config.limits, shutdown_signal()).await
 }
 
 /// The one place the setup code is shown: a WARN line of the log (also on
-/// stderr when the log level hides warnings, so it can never be lost).
+/// stderr when the log level hides warnings, so it can never be lost),
+/// written at the start and then hourly while the app waits to be set up.
 fn announce_setup(code: &SetupCode) {
     let line = format!("Setup required: open the app and enter setup code {code}");
     if tracing::enabled!(tracing::Level::WARN) {

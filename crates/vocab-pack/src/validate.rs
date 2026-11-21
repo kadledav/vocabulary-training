@@ -5,8 +5,12 @@
 //! is dropped silently: every finding is returned with its JSON pointer.
 //! The rules are those of `docs/vocab-pack.schema.json` plus the few a schema
 //! cannot express (a headword repeated within the pack, control characters,
-//! a Czech translation without a letter, `part.index > part.total`). Unknown
-//! properties are warnings here, not errors (the one documented leniency).
+//! a Czech translation without a letter, `part.index > part.total`, an
+//! `exported_at` that is no calendar date). Unknown properties are warnings
+//! here, not errors (the one documented leniency).
+//!
+//! Two things are the same for every optional property: `null` means "not
+//! given", and line breaks written as `\r\n` or `\r` are read as `\n`.
 
 use std::collections::HashSet;
 
@@ -17,7 +21,7 @@ use crate::marked::{self, strip_markers};
 use crate::types::{
     FORMAT, Goal, InvalidWord, Issue, IssueCode, KNOWN_FORMAT_VERSIONS, Origin, PackForm,
     PackHeader, PackSentence, PackSource, PackTag, PackValidation, PackWord, Part, SourceType,
-    TagField, TagKind, WordResult,
+    TagKind, WordResult,
 };
 
 /// Most words in one pack.
@@ -156,8 +160,16 @@ pub fn validate(value: &Value) -> PackValidation {
     });
 
     let exported_at = match obj.get("exported_at") {
-        None => None,
+        None | Some(Value::Null) => None,
         Some(Value::String(s)) if is_date(s) => Some(s.clone()),
+        Some(Value::String(s)) if is_date_shaped(s) => {
+            pack.error(
+                "/exported_at",
+                IssueCode::Invalid,
+                "exported_at is not a real calendar date (check the day of the month).",
+            );
+            None
+        }
         Some(_) => {
             pack.error(
                 "/exported_at",
@@ -169,7 +181,7 @@ pub fn validate(value: &Value) -> PackValidation {
     };
 
     let part = match obj.get("part") {
-        None => {
+        None | Some(Value::Null) => {
             pack.warn(
                 "/part",
                 IssueCode::Advice,
@@ -345,6 +357,7 @@ fn source(pack: &mut Findings, s: &Map<String, Value>) -> Option<PackSource> {
             pack.error("/source/title", IssueCode::Invalid, "title is empty.");
             None
         }
+        // `null` and a blank title mean "no title given".
         _ => pack.optional_text(s, BASE, "title", 300),
     };
     let author = pack.optional_text(s, BASE, "author", 300);
@@ -363,7 +376,18 @@ fn source(pack: &mut Findings, s: &Map<String, Value>) -> Option<PackSource> {
             }
         },
     };
-    let url = pack.optional_text(s, BASE, "url", 2000);
+    // Only web addresses: the app shows the URL as a link.
+    let url = pack.optional_text(s, BASE, "url", 2000).filter(|url| {
+        let ok = is_web_url(url);
+        if !ok {
+            pack.error(
+                "/source/url",
+                IssueCode::Invalid,
+                "source.url must start with http:// or https://.",
+            );
+        }
+        ok
+    });
     Some(PackSource {
         id: id?,
         kind: kind?,
@@ -417,16 +441,18 @@ fn word(index: usize, value: &Value) -> WordResult {
     };
     f.unknown(w, &base, WORD_KEYS);
 
+    // Blank also when only invisible characters are left: such a headword
+    // has an empty identity key and would merge with every other one.
     let headword = f
         .required_text(w, &base, "headword", 1, 100)
         .map(|h| h.trim().to_owned())
         .filter(|h| {
-            let ok = !h.is_empty();
+            let ok = !headword_key(h).is_empty();
             if !ok {
                 f.error(
                     format!("{base}/headword"),
                     IssueCode::Invalid,
-                    "headword is blank.",
+                    "headword is blank (it has no visible character).",
                 );
             }
             ok
@@ -435,7 +461,17 @@ fn word(index: usize, value: &Value) -> WordResult {
     let forms = forms(&mut f, w, &base);
     let pronunciation = f.optional_text(w, &base, "pronunciation", 200);
     let speak = f.optional_text(w, &base, "speak", 200);
-    let meaning = f.required_text(w, &base, "meaning", 1, 1500);
+    let meaning = f.required_text(w, &base, "meaning", 1, 1500).filter(|m| {
+        let ok = !is_blank(m);
+        if !ok {
+            f.error(
+                format!("{base}/meaning"),
+                IssueCode::Invalid,
+                "meaning is blank (it has no visible character).",
+            );
+        }
+        ok
+    });
     let czech = f.text_list(w, &base, "czech", true);
     if czech.as_ref().is_some_and(Vec::is_empty) {
         f.error(
@@ -446,7 +482,7 @@ fn word(index: usize, value: &Value) -> WordResult {
     }
     let usefulness = f.required_int(w, &base, "usefulness", 1, 10);
     let goal = match w.get("goal") {
-        None => None,
+        None | Some(Value::Null) => None,
         Some(Value::String(g)) if Goal::parse(g).is_some() => Goal::parse(g),
         Some(_) => {
             f.error(
@@ -473,13 +509,13 @@ fn word(index: usize, value: &Value) -> WordResult {
         );
     }
     let spelling = match w.get("spelling") {
-        None => None,
+        None | Some(Value::Null) => None,
         Some(Value::Bool(b)) => Some(*b),
         Some(_) => {
             f.error(
                 format!("{base}/spelling"),
                 IssueCode::Invalid,
-                "spelling must be true or false.",
+                "spelling must be true, false or null.",
             );
             None
         }
@@ -496,7 +532,7 @@ fn word(index: usize, value: &Value) -> WordResult {
     let tag = tag(&mut f, w, &base);
     let icon = f.optional_text(w, &base, "icon", 40);
     let seq = match w.get("seq") {
-        None => None,
+        None | Some(Value::Null) => None,
         Some(v) => match integer(v) {
             Some(n) if (1..=MAX_SEQ).contains(&n) => Some(as_u32(n)),
             _ => {
@@ -513,7 +549,7 @@ fn word(index: usize, value: &Value) -> WordResult {
     let mut sentence_errors = Vec::new();
     let mut sentences: Vec<PackSentence> = Vec::new();
     match w.get("sentences") {
-        None => {}
+        None | Some(Value::Null) => {}
         Some(Value::Array(items)) if items.len() > MAX_SENTENCES => f.error(
             format!("{base}/sentences"),
             IssueCode::Invalid,
@@ -607,7 +643,7 @@ fn word(index: usize, value: &Value) -> WordResult {
 fn forms(f: &mut Findings, w: &Map<String, Value>, base: &str) -> Option<Vec<PackForm>> {
     let pointer = format!("{base}/forms");
     let items = match w.get("forms") {
-        None => return Some(Vec::new()),
+        None | Some(Value::Null) => return Some(Vec::new()),
         Some(Value::Array(items)) => items,
         Some(_) => {
             f.error(pointer, IssueCode::Invalid, "forms must be an array.");
@@ -674,11 +710,12 @@ fn forms(f: &mut Findings, w: &Map<String, Value>, base: &str) -> Option<Vec<Pac
     (f.errors.len() == before).then_some(out)
 }
 
-fn tag(f: &mut Findings, w: &Map<String, Value>, base: &str) -> TagField {
+/// The word's `tag`. Leaving it out and `null` both say nothing about the
+/// tag (an existing one stays, R-03); only a tag object sets one.
+fn tag(f: &mut Findings, w: &Map<String, Value>, base: &str) -> Option<PackTag> {
     let pointer = format!("{base}/tag");
     match w.get("tag") {
-        None => TagField::Absent,
-        Some(Value::Null) => TagField::Null,
+        None | Some(Value::Null) => None,
         Some(Value::Object(t)) => {
             f.unknown(t, &pointer, TAG_KEYS);
             let kind = match t.get("kind") {
@@ -701,10 +738,8 @@ fn tag(f: &mut Findings, w: &Map<String, Value>, base: &str) -> TagField {
                 }
             };
             let text = f.optional_text(t, &pointer, "text", 300);
-            // On an error the word is dropped, so the fallback is never used.
-            kind.map_or(TagField::Absent, |kind| {
-                TagField::Tag(PackTag { kind, text })
-            })
+            // On an error the word is dropped, so `None` is never used.
+            kind.map(|kind| PackTag { kind, text })
         }
         Some(_) => {
             f.error(
@@ -712,7 +747,7 @@ fn tag(f: &mut Findings, w: &Map<String, Value>, base: &str) -> TagField {
                 IssueCode::Invalid,
                 "tag must be null or an object {\"kind\": …, \"text\": …}.",
             );
-            TagField::Absent
+            None
         }
     }
 }
@@ -757,7 +792,11 @@ fn sentence(f: &mut Findings, value: &Value, base: &str) -> Option<PackSentence>
             None
         }
     };
-    let location = f.optional_text(s, base, "location", 100);
+    // A page number may arrive as a JSON number; it is kept as its text.
+    let location = match s.get("location") {
+        Some(Value::Number(n)) => Some(n.to_string()),
+        _ => f.optional_text(s, base, "location", 100),
+    };
     if !f.errors.is_empty() {
         return None;
     }
@@ -891,6 +930,8 @@ impl Findings {
         }
     }
 
+    /// One text value: its length is counted as written (like the schema
+    /// does), then line breaks are unified and the text NFC-normalised.
     fn text(
         &mut self,
         s: &str,
@@ -899,6 +940,14 @@ impl Findings {
         min: usize,
         max: usize,
     ) -> Option<String> {
+        let chars = s.chars().count();
+        let unified;
+        let s = if s.contains('\r') {
+            unified = s.replace("\r\n", "\n").replace('\r', "\n");
+            unified.as_str()
+        } else {
+            s
+        };
         if s.chars().any(is_forbidden_control) {
             self.error(
                 pointer,
@@ -909,7 +958,6 @@ impl Findings {
             );
             return None;
         }
-        let chars = s.chars().count();
         if chars < min {
             self.error(pointer, IssueCode::Invalid, format!("{key} is empty."));
             return None;
@@ -937,7 +985,7 @@ impl Findings {
     ) -> Option<Vec<String>> {
         let pointer = format!("{base}/{key}");
         let items = match obj.get(key) {
-            None => {
+            None | Some(Value::Null) => {
                 if required {
                     self.error(pointer, IssueCode::Missing, format!("{key} is missing."));
                 }
@@ -1047,19 +1095,52 @@ fn is_slug(text: &str) -> bool {
         })
 }
 
-/// `^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$` (the schema's pattern).
-fn is_date(text: &str) -> bool {
+/// Whitespace-only, or nothing but whitespace and the invisible characters
+/// the identity keys drop.
+fn is_blank(text: &str) -> bool {
+    headword_key(text).is_empty()
+}
+
+/// `http://…` or `https://…` (scheme in any case).
+fn is_web_url(url: &str) -> bool {
+    ["http://", "https://"].iter().any(|scheme| {
+        url.get(..scheme.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(scheme))
+    })
+}
+
+/// Year, month and day of a text shaped like the schema's date pattern
+/// `^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$`.
+fn date_parts(text: &str) -> Option<(u32, u32, u32)> {
     let b = text.as_bytes();
     if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
-        return false;
+        return None;
     }
-    let digits = |r: std::ops::Range<usize>| b[r].iter().all(u8::is_ascii_digit);
-    if !(digits(0..4) && digits(5..7) && digits(8..10)) {
-        return false;
-    }
-    let month = (b[5] - b'0') * 10 + (b[6] - b'0');
-    let day = (b[8] - b'0') * 10 + (b[9] - b'0');
-    (1..=12).contains(&month) && (1..=31).contains(&day)
+    let number = |r: std::ops::Range<usize>| {
+        b[r].iter().try_fold(0u32, |n, d| {
+            d.is_ascii_digit().then(|| n * 10 + u32::from(d - b'0'))
+        })
+    };
+    let (year, month, day) = (number(0..4)?, number(5..7)?, number(8..10)?);
+    ((1..=12).contains(&month) && (1..=31).contains(&day)).then_some((year, month, day))
+}
+
+fn is_date_shaped(text: &str) -> bool {
+    date_parts(text).is_some()
+}
+
+/// A real calendar date written as `YYYY-MM-DD` (30 February is none).
+fn is_date(text: &str) -> bool {
+    date_parts(text).is_some_and(|(year, month, day)| {
+        let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+        let days = match month {
+            4 | 6 | 9 | 11 => 30,
+            2 if leap => 29,
+            2 => 28,
+            _ => 31,
+        };
+        day <= days
+    })
 }
 
 /// `<slug>--<digits YYYY-MM-DD>--<n>` with n = `[1-9][0-9]{0,3}` (the
@@ -1134,6 +1215,26 @@ mod tests {
         assert!(!is_date("2026-11-32"));
         assert!(!is_date("2026-11-1"));
         assert!(!is_date("2026/11/17"));
+        // A7: shaped like a date is not enough.
+        for (text, real) in [
+            ("2026-02-28", true),
+            ("2026-02-29", false),
+            ("2028-02-29", true),
+            ("2100-02-29", false),
+            ("2000-02-29", true),
+            ("2026-04-31", false),
+            ("2026-12-31", true),
+        ] {
+            assert!(is_date_shaped(text), "{text}");
+            assert_eq!(is_date(text), real, "{text}");
+        }
+        assert!(is_web_url("https://test.example/a"));
+        assert!(is_web_url("HTTP://test.example"));
+        assert!(!is_web_url("javascript:alert(1)"));
+        assert!(!is_web_url("ftp://test.example"));
+        assert!(!is_web_url("test.example"));
+        assert!(is_blank(" \u{a0}\u{200b}\u{feff}"));
+        assert!(!is_blank(" a "));
         assert!(is_slug("test-a1"));
         assert!(!is_slug("test--a"));
         assert!(!is_slug("test-"));

@@ -775,8 +775,9 @@ async fn r22_update_the_sentences_reexport_merges_and_keeps_learning_state() {
     let before = learning(&app);
 
     // "I'm now at chapter 20, update the sentences": same words, earlier
-    // sentences repeated (cut and typed slightly differently), new ones
-    // added, and one scalar rephrased by Claude.
+    // sentences repeated (one cut and typed slightly differently, one with
+    // a corrected translation and span), new ones added, and one scalar
+    // rephrased by Claude.
     let mut hum = word("hum", 6, vec![]);
     hum["meaning"] = json!("A rephrased invented meaning of hum.");
     hum["czech"] = json!(["hum-cz", "brumendo"]);
@@ -821,7 +822,15 @@ async fn r22_update_the_sentences_reexport_merges_and_keeps_learning_state() {
     assert_eq!(totals["words_with_new_sentences"], 1);
     assert_eq!(totals["conflicts"], 1);
     let merge = &report["packs"][0]["words"][0]["merge"];
-    assert_eq!(merge["sentences_known"], 2);
+    assert_eq!(
+        merge["sentences_known"], 1,
+        "cut differently: not a correction"
+    );
+    assert_eq!(
+        merge["sentences_updated"], 1,
+        "R-22: translation and span corrected"
+    );
+    assert_eq!(totals["updated_sentences"], 1);
     assert_eq!(merge["items_added"]["czech"], 1);
     assert_eq!(merge["conflicts"][0]["field"], "meaning");
     assert_eq!(
@@ -841,8 +850,11 @@ async fn r22_update_the_sentences_reexport_merges_and_keeps_learning_state() {
     assert_eq!(view["czech"], json!(["hum-cz", "brumendo"]));
     let sentences = view["sentences"].as_array().expect("sentences");
     assert_eq!(sentences.len(), 5);
-    // Existing sentences unchanged (even where the re-export marked another span).
-    assert_eq!(sentences[1]["en"]["target"], "hum");
+    // The first sentence keeps its original text (the re-export only cut it
+    // differently); the second is the pack's corrected version, in place.
+    assert_eq!(sentences[0]["en"]["pre"], "The old fridge ");
+    assert_eq!(sentences[1]["en"]["target"], "room");
+    assert_eq!(sentences[1]["cs"]["target"], "jinak");
     assert_eq!(sentences[3]["en"]["target"], "hummed");
     assert_eq!(sentences[3]["cs"]["target"], "bzučely");
     assert_eq!(view["conflicts"][0]["field"], "meaning");
@@ -1100,6 +1112,43 @@ async fn r22_hidden_and_edited_sentences_are_kept_as_they_are() {
     let view = app.word("hum").await;
     assert_eq!(view["sentences"][0]["hidden"], true);
     assert_eq!(view["sentences"][1]["cs"]["target"], "překlad");
+    assert_eq!(view["sentences"].as_array().expect("s").len(), 3);
+
+    // A4 (R-22): a pack that corrects all three sentences changes only the
+    // one the owner neither hid nor edited.
+    let corrected: Vec<Value> = hum_sentences()
+        .into_iter()
+        .map(|mut s| {
+            s["cs"] = json!("Opravený [[překlad od Clauda]].");
+            s
+        })
+        .collect();
+    let report = app
+        .commit(&paste(&[pack(
+            "test-novel",
+            "2026-11-19",
+            1,
+            (1, 1),
+            vec![word("hum", 6, corrected)],
+        )]))
+        .await;
+    let merge = &report["packs"][0]["words"][0]["merge"];
+    assert_eq!(merge["sentences_updated"], 1);
+    assert_eq!(merge["sentences_known"], 2);
+    assert_eq!(merge["sentences_added"], 0);
+    assert_eq!(report["packs"][0]["words"][0]["outcome"], "merged");
+    assert_eq!(report["totals"]["updated_sentences"], 1);
+    let view = app.word("hum").await;
+    assert_eq!(view["sentences"][0]["hidden"], true);
+    assert_eq!(
+        view["sentences"][0]["cs"]["target"], "bzučela",
+        "hidden: kept"
+    );
+    assert_eq!(
+        view["sentences"][1]["cs"]["target"], "překlad",
+        "edited: kept"
+    );
+    assert_eq!(view["sentences"][2]["cs"]["target"], "překlad od Clauda");
     assert_eq!(view["sentences"].as_array().expect("s").len(), 3);
 }
 
@@ -1823,8 +1872,10 @@ async fn r11_a_timed_out_commit_still_imports_every_pack() {
     );
 }
 
+/// A1 (R-03/R-51, review probe H): a re-export that copies the template's
+/// `"tag": null` must not un-skip a low-priority word.
 #[tokio::test]
-async fn r01_absent_tag_keeps_the_tag_and_null_clears_it() {
+async fn r03_absent_and_null_tag_keep_the_tag_and_only_a_tag_replaces_it() {
     // F6
     let app = app();
     let mut tagged = word("loiter", 5, vec![]);
@@ -1858,22 +1909,40 @@ async fn r01_absent_tag_keeps_the_tag_and_null_clears_it() {
     let view = app.word("loiter").await;
     assert_eq!(view["low_priority"], true);
     assert_eq!(view_sources(&view)[0].2, "low-priority");
-    // Explicit null clears it.
-    let mut cleared = word("loiter", 5, vec![]);
-    cleared["tag"] = Value::Null;
+    // An explicit null says nothing either: tag and low priority stay.
+    let mut null_tag = word("loiter", 5, vec![]);
+    null_tag["tag"] = Value::Null;
     let report = app
         .commit(&paste(&[pack(
             "test-novel",
             "2026-11-19",
             1,
             (1, 1),
-            vec![cleared],
+            vec![null_tag],
+        )]))
+        .await;
+    let merged = &report["packs"][0]["words"][0];
+    assert_eq!(merged["merge"]["tag_changed"], false);
+    assert_eq!(merged["outcome"], "unchanged");
+    let view = app.word("loiter").await;
+    assert_eq!(view["low_priority"], true);
+    assert_eq!(view_sources(&view)[0].2, "low-priority");
+    // Only another tag replaces it (and then the word is no longer skipped).
+    let mut retagged = word("loiter", 5, vec![]);
+    retagged["tag"] = json!({ "kind": "seen-before", "text": "also in test-novel-1" });
+    let report = app
+        .commit(&paste(&[pack(
+            "test-novel",
+            "2026-11-20",
+            1,
+            (1, 1),
+            vec![retagged],
         )]))
         .await;
     assert_eq!(report["packs"][0]["words"][0]["merge"]["tag_changed"], true);
     let view = app.word("loiter").await;
     assert_eq!(view["low_priority"], false);
-    assert_eq!(view_sources(&view)[0].2, Value::Null);
+    assert_eq!(view_sources(&view)[0].2, "seen-before");
 }
 
 #[tokio::test]
@@ -2071,4 +2140,362 @@ async fn r02_a_source_without_title_gets_a_default_title() {
 
 fn prague() -> vocab_server::clock::DayRule {
     vocab_server::clock::DayRule::new("Europe/Prague", 4).expect("bundled tzdb")
+}
+
+// ── fix round R1 (review probes B, I, K; caps) ──────────────────────────────
+
+/// A6 (R-02, review probe B): a title the app made up because the first
+/// pack had none is replaced by the first real title; a real title is
+/// never overwritten.
+#[tokio::test]
+async fn r02_a_defaulted_source_title_is_replaced_by_the_first_real_title() {
+    let app = app();
+    let with_source = |date: &str, source: Value, headword: &str| {
+        let mut p = pack(
+            "test-book-3",
+            date,
+            1,
+            (1, 1),
+            vec![word(headword, 5, vec![])],
+        );
+        p["source"] = source;
+        p
+    };
+    let untitled = json!({ "id": "test-book-3", "type": "book" });
+    app.commit(&paste(&[with_source(
+        "2026-11-17",
+        untitled.clone(),
+        "one",
+    )]))
+    .await;
+    assert_eq!(
+        app.text("SELECT title FROM source").as_deref(),
+        Some("test-book-3")
+    );
+    assert_eq!(app.int("SELECT title_defaulted FROM source"), 1);
+    // `"title": null` is "no title" too: the stand-in stays, still marked.
+    let null_title = json!({ "id": "test-book-3", "type": "book", "title": null });
+    let report = app
+        .commit(&paste(&[with_source("2026-11-18", null_title, "two")]))
+        .await;
+    assert_eq!(statuses(&report), ["imported"]);
+    assert_eq!(app.int("SELECT title_defaulted FROM source"), 1);
+
+    let titled = json!({ "id": "test-book-3", "type": "book", "title": "The Real Title", "author": "A. Writer" });
+    let preview = app
+        .preview(&paste(&[with_source(
+            "2026-11-19",
+            titled.clone(),
+            "three",
+        )]))
+        .await;
+    assert!(
+        preview["packs"][0]["notes"]
+            .to_string()
+            .contains("now titled \\\"The Real Title\\\""),
+        "{}",
+        preview["packs"][0]
+    );
+    assert_eq!(
+        app.int("SELECT title_defaulted FROM source"),
+        1,
+        "preview stores nothing"
+    );
+    let report = app
+        .commit(&paste(&[with_source("2026-11-19", titled, "three")]))
+        .await;
+    assert!(
+        report["packs"][0]["notes"]
+            .to_string()
+            .contains("The Real Title")
+    );
+    assert_eq!(
+        app.text("SELECT title || ' / ' || author FROM source")
+            .as_deref(),
+        Some("The Real Title / A. Writer")
+    );
+    assert_eq!(app.int("SELECT title_defaulted FROM source"), 0);
+    let (_, sources) = app.get("/api/sources").await;
+    assert_eq!(sources[0]["title"], "The Real Title");
+
+    // A real title is never replaced by another pack's.
+    let other = json!({ "id": "test-book-3", "type": "book", "title": "Another Title" });
+    let report = app
+        .commit(&paste(&[with_source("2026-11-20", other, "four")]))
+        .await;
+    assert_eq!(report["packs"][0]["notes"], json!([]));
+    assert_eq!(
+        app.text("SELECT title FROM source").as_deref(),
+        Some("The Real Title")
+    );
+}
+
+/// A7 (R-59, review probe I and security probe p7): an `exported_at` in the
+/// future cannot block later reading positions; a pack without one counts
+/// for the local study day of the import; a position that is not applied
+/// says why.
+#[tokio::test]
+async fn r59_reading_position_dates_are_sane_and_refusals_are_explained() {
+    let app = app();
+    let at = |date: Option<&str>, n: u32, position: &str| {
+        let mut p = pack(
+            "test-novel",
+            "2026-11-20",
+            n,
+            (1, 1),
+            vec![word(&format!("w{n}"), 5, vec![])],
+        );
+        p["reading_position"] = json!(position);
+        match date {
+            Some(date) => p["exported_at"] = json!(date),
+            None => {
+                p.as_object_mut().expect("pack").remove("exported_at");
+            }
+        }
+        p
+    };
+    let stored = |app: &TestApp| {
+        app.text("SELECT reading_position || ' @ ' || reading_position_exported_at FROM source")
+    };
+    // 00:30 in Prague on the 21st: the study day is still the 20th, while
+    // Claude dates its export the 21st. One day ahead is accepted as it is.
+    app.clock.set(ts("2026-11-20T23:30:00Z"));
+    let report = app
+        .commit(&paste(&[at(Some("2026-11-21"), 1, "Chapter 14")]))
+        .await;
+    assert_eq!(report["packs"][0]["warnings"], json!([]));
+    assert_eq!(report["packs"][0]["reading_position"]["updated"], true);
+    assert_eq!(
+        report["packs"][0]["reading_position"]["reason"],
+        Value::Null
+    );
+    assert_eq!(stored(&app).as_deref(), Some("Chapter 14 @ 2026-11-21"));
+
+    // No exported_at minutes later: dated the study day (the 20th, not the
+    // UTC date), so it is older than the stored one; the report says why.
+    let report = app.commit(&paste(&[at(None, 2, "Chapter 15")])).await;
+    let reading = &report["packs"][0]["reading_position"];
+    assert_eq!(reading["updated"], false);
+    let reason = reading["reason"].as_str().expect("reason");
+    assert!(
+        reason.contains("2026-11-21") && reason.contains("2026-11-20"),
+        "{reason}"
+    );
+    assert_eq!(stored(&app).as_deref(), Some("Chapter 14 @ 2026-11-21"));
+
+    // In the afternoon (study day 21st) an undated pack is applied: on the
+    // same date the later import wins.
+    app.clock.set(ts("2026-11-21T15:00:00Z"));
+    let report = app.commit(&paste(&[at(None, 3, "Chapter 16")])).await;
+    assert_eq!(report["packs"][0]["reading_position"]["updated"], true);
+    assert_eq!(stored(&app).as_deref(), Some("Chapter 16 @ 2026-11-21"));
+
+    // A typo year (and the far future): dated today instead, with a warning.
+    for (n, date) in [(4, "2027-11-22"), (5, "9999-12-31")] {
+        let report = app
+            .commit(&paste(&[at(Some(date), n, &format!("Chapter {n}0"))]))
+            .await;
+        let warnings = report["packs"][0]["warnings"].to_string();
+        assert!(
+            warnings.contains("/exported_at") && warnings.contains("in the future"),
+            "{warnings}"
+        );
+        assert_eq!(report["packs"][0]["reading_position"]["updated"], true);
+        assert_eq!(
+            stored(&app),
+            Some(format!("Chapter {n}0 @ 2026-11-21")),
+            "{date}"
+        );
+    }
+    // … so a correctly dated pack a month later still moves the position.
+    app.clock.set(ts("2026-12-20T09:00:00Z"));
+    let report = app
+        .commit(&paste(&[at(Some("2026-12-20"), 6, "Chapter 30")]))
+        .await;
+    assert_eq!(report["packs"][0]["reading_position"]["updated"], true);
+    assert_eq!(stored(&app).as_deref(), Some("Chapter 30 @ 2026-12-20"));
+    // An older export imported late: not applied, with the reason (the
+    // preview says the same).
+    let late = paste(&[at(Some("2026-12-01"), 7, "Chapter 20")]);
+    for report in [app.preview(&late).await, app.commit(&late).await] {
+        let reading = &report["packs"][0]["reading_position"];
+        assert_eq!(reading["updated"], false);
+        assert!(
+            reading["reason"].as_str().expect("reason").starts_with(
+                "Not applied: the source already has a reading position dated 2026-12-20"
+            ),
+            "{reading}"
+        );
+    }
+    // Not a calendar date: the pack is rejected.
+    let report = app
+        .commit(&paste(&[at(Some("2026-02-30"), 8, "Chapter 99")]))
+        .await;
+    assert_eq!(statuses(&report), ["rejected"]);
+    assert_eq!(stored(&app).as_deref(), Some("Chapter 30 @ 2026-12-20"));
+}
+
+/// A9 (R-23, review probe K): when a pack of a paste fails unexpectedly,
+/// the answer is the normal report: the failed pack is marked `failed` and
+/// left nothing behind, the other packs are imported.
+#[tokio::test]
+async fn r23_a_pack_that_fails_unexpectedly_is_reported_and_the_others_are_imported() {
+    let app = app();
+    app.commit(&paste(&[pack(
+        "test-a",
+        "2026-11-17",
+        1,
+        (1, 1),
+        vec![word("keep", 8, three_sentences("keep"))],
+    )]))
+    .await;
+    // Stands in for "something unexpected" in the middle of a pack.
+    app.sql()
+        .execute_batch(
+            "CREATE TRIGGER test_boom BEFORE INSERT ON word WHEN NEW.headword = 'w3' \
+             BEGIN SELECT RAISE(ABORT, 'test boom'); END;",
+        )
+        .expect("trigger");
+    let text = paste(&[
+        pack(
+            "test-b",
+            "2026-11-18",
+            1,
+            (1, 1),
+            vec![word("w0", 5, three_sentences("w0"))],
+        ),
+        pack(
+            "test-c",
+            "2026-11-18",
+            1,
+            (1, 1),
+            vec![
+                word("w1", 5, three_sentences("w1")),
+                word("w2", 5, three_sentences("w2")),
+                word("w3", 5, three_sentences("w3")),
+                word("w4", 5, three_sentences("w4")),
+            ],
+        ),
+        pack(
+            "test-d",
+            "2026-11-18",
+            1,
+            (1, 1),
+            vec![word("w5", 5, three_sentences("w5"))],
+        ),
+    ]);
+    let before = app.dump();
+    let preview = app.preview(&text).await;
+    assert_eq!(statuses(&preview), ["ready", "failed", "ready"]);
+    assert_eq!(app.dump(), before, "preview stores nothing");
+
+    let report = app.commit(&text).await;
+    assert_eq!(statuses(&report), ["imported", "failed", "imported"]);
+    let failed = &report["packs"][1];
+    assert_eq!(failed["errors"][0]["code"], "import_failed");
+    let message = failed["errors"][0]["message"].as_str().expect("message");
+    assert!(message.contains("nothing of it was stored"), "{message}");
+    assert!(!message.contains("boom"), "internals are logged, not shown");
+    assert_eq!(failed["summary"]["new_words"], 0);
+    assert!(
+        failed["words"]
+            .as_array()
+            .expect("words")
+            .iter()
+            .all(|w| w["outcome"] == "not_imported" && w["merge"].is_null())
+    );
+    assert_eq!(report["totals"]["new_words"], 2);
+    // Nothing of the failed pack is there; the other two are complete.
+    assert_eq!(
+        app.int("SELECT COUNT(*) FROM word WHERE headword IN ('w1','w2','w3','w4')"),
+        0
+    );
+    assert_eq!(
+        app.int("SELECT COUNT(*) FROM source WHERE slug = 'test-c'"),
+        0
+    );
+    assert_eq!(
+        app.int("SELECT COUNT(*) FROM pack_import WHERE source_slug = 'test-c'"),
+        0
+    );
+    assert_eq!(app.int("SELECT COUNT(*) FROM word"), 3);
+    assert_eq!(app.int("SELECT COUNT(*) FROM card"), 3);
+    assert_eq!(app.int("SELECT COUNT(*) FROM sentence"), 9);
+
+    // Once the cause is gone, pasting the same text again imports the rest.
+    app.sql()
+        .execute_batch("DROP TRIGGER test_boom")
+        .expect("drop");
+    let report = app.commit(&text).await;
+    assert_eq!(
+        statuses(&report),
+        ["already_imported", "imported", "already_imported"]
+    );
+    assert_eq!(app.int("SELECT COUNT(*) FROM word"), 7);
+}
+
+/// B5 (R-84): the catalog has hard caps; a pack that would pass one is not
+/// imported at all and says so.
+#[tokio::test]
+async fn r84_a_pack_that_would_pass_a_hard_cap_is_refused_as_a_whole() {
+    use vocab_server::catalog::{MAX_SENTENCES, MAX_WORDS};
+    assert_eq!((MAX_WORDS, MAX_SENTENCES), (20_000, 200_000));
+    let app = app();
+    app.commit(&paste(&[pack(
+        "test-a",
+        "2026-11-17",
+        1,
+        (1, 1),
+        vec![word("keep", 8, three_sentences("keep"))],
+    )]))
+    .await;
+    // Fill the catalog to exactly the word cap with synthetic rows.
+    app.sql()
+        .execute(
+            "WITH RECURSIVE n(i) AS (SELECT 2 UNION ALL SELECT i + 1 FROM n WHERE i < ?1) \
+             INSERT INTO word (headword, headword_key, meaning, usefulness, created_at, updated_at) \
+             SELECT 'test-filler-' || i, 'test-filler-' || i, 'filler', 1, 'x', 'x' FROM n",
+            [MAX_WORDS],
+        )
+        .expect("fill");
+    assert_eq!(app.int("SELECT COUNT(*) FROM word"), MAX_WORDS);
+    let text = paste(&[
+        // Only merges into an existing word: still fine at the cap.
+        pack(
+            "test-a",
+            "2026-11-18",
+            1,
+            (1, 1),
+            vec![word("keep", 8, three_sentences("more"))],
+        ),
+        pack(
+            "test-b",
+            "2026-11-18",
+            1,
+            (1, 1),
+            vec![
+                word("keep", 8, vec![]),
+                word("one-too-many", 5, three_sentences("x")),
+            ],
+        ),
+    ]);
+    let preview = app.preview(&text).await;
+    assert_eq!(statuses(&preview), ["ready", "failed"]);
+    let report = app.commit(&text).await;
+    assert_eq!(statuses(&report), ["imported", "failed"]);
+    let error = &report["packs"][1]["errors"][0];
+    assert_eq!(error["code"], "capacity");
+    assert!(
+        error["message"]
+            .as_str()
+            .expect("message")
+            .contains("at most 20000 words"),
+        "{error}"
+    );
+    assert_eq!(app.int("SELECT COUNT(*) FROM word"), MAX_WORDS);
+    assert_eq!(
+        app.int("SELECT COUNT(*) FROM source WHERE slug = 'test-b'"),
+        0
+    );
+    assert_eq!(app.int("SELECT COUNT(*) FROM sentence"), 6);
 }

@@ -18,8 +18,9 @@ const GENERAL_TITLE: &str = "General Vocabulary";
 pub struct ReadingUpdate {
     /// The pack's `reading_position` (`None`: the pack says nothing).
     pub position: Option<String>,
-    /// The pack's `exported_at`, or the import date when it has none
-    /// (`YYYY-MM-DD`).
+    /// The date the position counts for (`YYYY-MM-DD`): the pack's
+    /// `exported_at`, or the study day of the import when it has none or
+    /// lies in the future (decided by the caller).
     pub effective_date: String,
 }
 
@@ -29,8 +30,13 @@ pub struct SourceUpsert {
     pub id: SourceId,
     pub created: bool,
     pub reading_position_updated: bool,
+    /// The pack's reading position was not applied because the stored one
+    /// counts for this later date.
+    pub reading_position_newer: Option<String>,
     /// A new source had no title; this one was used.
     pub default_title: Option<String>,
+    /// The stand-in title of the source was replaced by the pack's title.
+    pub title_replaced: bool,
     /// The pack gave another `type` than the stored one, which was kept.
     pub kept_type: Option<String>,
 }
@@ -39,6 +45,8 @@ struct Existing {
     id: SourceId,
     kind: String,
     title: String,
+    /// The title is a stand-in chosen by the app (R-02).
+    title_defaulted: bool,
     author: Option<String>,
     series: Option<String>,
     series_number: Option<i64>,
@@ -50,7 +58,7 @@ struct Existing {
 fn find(conn: &Connection, slug: &str) -> rusqlite::Result<Option<Existing>> {
     conn.query_row(
         "SELECT id, type, title, author, series, series_number, url, reading_position, \
-         reading_position_exported_at FROM source WHERE slug = ?1",
+         reading_position_exported_at, title_defaulted FROM source WHERE slug = ?1",
         [slug],
         |row| {
             Ok(Existing {
@@ -63,6 +71,7 @@ fn find(conn: &Connection, slug: &str) -> rusqlite::Result<Option<Existing>> {
                 url: row.get(6)?,
                 reading_position: row.get(7)?,
                 reading_position_exported_at: row.get(8)?,
+                title_defaulted: row.get(9)?,
             })
         },
     )
@@ -81,7 +90,8 @@ fn reading_wins(existing: Option<&Existing>, reading: &ReadingUpdate) -> bool {
 /// Create the source, or fill its empty fields (non-empty ones are never
 /// overwritten; the type never changes), and apply the reading position.
 /// A new source without a title is named "General Vocabulary" (type
-/// `general`) or after its id.
+/// `general`) or after its id; that stand-in is remembered as such and the
+/// first later pack with a title replaces it (R-02).
 pub fn upsert_source(
     tx: &Transaction<'_>,
     source: &PackSource,
@@ -90,6 +100,13 @@ pub fn upsert_source(
 ) -> rusqlite::Result<SourceUpsert> {
     let existing = find(tx, &source.id)?;
     let reading_updated = reading_wins(existing.as_ref(), reading);
+    let reading_position_newer = (reading.position.is_some() && !reading_updated)
+        .then(|| {
+            existing
+                .as_ref()
+                .and_then(|e| e.reading_position_exported_at.clone())
+        })
+        .flatten();
     let (position, position_date) = if reading_updated {
         (
             reading.position.clone(),
@@ -113,8 +130,8 @@ pub fn upsert_source(
         };
         tx.execute(
             "INSERT INTO source (slug, type, title, author, series, series_number, url, \
-             reading_position, reading_position_exported_at, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+             reading_position, reading_position_exported_at, created_at, updated_at, \
+             title_defaulted) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11)",
             params![
                 source.id,
                 source.kind.as_str(),
@@ -126,13 +143,16 @@ pub fn upsert_source(
                 position,
                 position_date,
                 now,
+                default_title.is_some(),
             ],
         )?;
         return Ok(SourceUpsert {
             id: SourceId(tx.last_insert_rowid()),
             created: true,
             reading_position_updated: reading_updated,
+            reading_position_newer,
             default_title,
+            title_replaced: false,
             kept_type: None,
         });
     };
@@ -141,10 +161,13 @@ pub fn upsert_source(
         current.or_else(|| incoming.cloned())
     }
     let blank_to_none = |s: Option<String>| s.filter(|v| !v.trim().is_empty());
-    let title = match &source.title {
-        Some(incoming) if existing.title.trim().is_empty() => incoming.clone(),
-        _ => existing.title.clone(),
+    let (title, title_defaulted) = match &source.title {
+        Some(incoming) if existing.title_defaulted || existing.title.trim().is_empty() => {
+            (incoming.clone(), false)
+        }
+        _ => (existing.title.clone(), existing.title_defaulted),
     };
+    let title_replaced = existing.title_defaulted && !title_defaulted;
     let author = fill(
         blank_to_none(existing.author.clone()),
         source.author.as_ref(),
@@ -164,6 +187,7 @@ pub fn upsert_source(
         )
     };
     let changed = title != existing.title
+        || title_defaulted != existing.title_defaulted
         || author != existing.author
         || series != existing.series
         || series_number != existing.series_number
@@ -173,7 +197,8 @@ pub fn upsert_source(
     if changed {
         tx.execute(
             "UPDATE source SET title = ?2, author = ?3, series = ?4, series_number = ?5, url = ?6, \
-             reading_position = ?7, reading_position_exported_at = ?8, updated_at = ?9 WHERE id = ?1",
+             reading_position = ?7, reading_position_exported_at = ?8, updated_at = ?9, \
+             title_defaulted = ?10 WHERE id = ?1",
             params![
                 existing.id.0,
                 title,
@@ -184,6 +209,7 @@ pub fn upsert_source(
                 position,
                 position_date,
                 now,
+                title_defaulted,
             ],
         )?;
     }
@@ -192,7 +218,9 @@ pub fn upsert_source(
         id: existing.id,
         created: false,
         reading_position_updated: reading_updated,
+        reading_position_newer,
         default_title: None,
+        title_replaced,
         kept_type,
     })
 }

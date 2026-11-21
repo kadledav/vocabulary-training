@@ -6,7 +6,17 @@
 //! them is ignored. Without fences the whole paste must be JSON. Each block
 //! (or the whole paste) is read as a stream of JSON values; every value
 //! becomes one [`RawPack`] with its content hash.
+//!
+//! The paste is untrusted and may be hostile (R-84): a JSON value is first
+//! only *measured* (its length in bytes, how many values it holds, how deep
+//! it nests) without building anything, and is turned into a
+//! [`serde_json::Value`] only when it is within the limits below. Two
+//! megabytes of `[0,0,0,…]` therefore cost a scan, not tens of megabytes of
+//! memory.
 
+use std::fmt;
+
+use serde::de::{Deserialize, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::{Deserializer, Value};
 
 use crate::hash::content_sha256;
@@ -17,6 +27,15 @@ pub const MAX_PASTE_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_PACK_BYTES: usize = 1024 * 1024;
 /// Most packs read from one paste.
 pub const MAX_PACKS: usize = 20;
+/// Most JSON values (objects, arrays, strings, numbers, …; keys not counted)
+/// in one pack. The largest pack the format allows (100 words with every
+/// list full) has about 45 000.
+pub const MAX_PACK_VALUES: usize = 60_000;
+/// Most JSON values in all packs of one paste together.
+pub const MAX_PASTE_VALUES: usize = 200_000;
+/// Deepest nesting of a pack (pack → words → word → sentences → sentence →
+/// text is 6).
+pub const MAX_PACK_DEPTH: usize = 8;
 
 /// One JSON value found in the paste.
 #[derive(Debug, Clone, PartialEq)]
@@ -44,6 +63,8 @@ pub enum PasteError {
     /// over the limit, so a paste of many tiny values (`1 1 1 …`) can never
     /// turn into a huge report.
     TooManyPacks,
+    /// More than [`MAX_PASTE_VALUES`] JSON values in all packs together.
+    TooManyValues,
 }
 
 impl std::error::Error for PasteError {}
@@ -59,6 +80,10 @@ impl std::fmt::Display for PasteError {
             Self::TooManyPacks => write!(
                 f,
                 "The paste holds more than {MAX_PACKS} packs (JSON values). Import at most {MAX_PACKS} at a time."
+            ),
+            Self::TooManyValues => write!(
+                f,
+                "The paste holds more than {MAX_PASTE_VALUES} JSON values. Import fewer packs at a time."
             ),
         }
     }
@@ -77,8 +102,9 @@ pub fn split_paste(text: &str) -> Result<Vec<Result<RawPack, PasteItemError>>, P
         }],
     };
     let mut items = Vec::new();
+    let mut values_left = MAX_PASTE_VALUES;
     for segment in &segments {
-        read_values(segment, &mut items)?;
+        read_values(segment, &mut items, &mut values_left)?;
     }
     if items.is_empty() {
         return Err(PasteError::Empty);
@@ -142,13 +168,94 @@ fn fence_of(trimmed_line: &str) -> Option<(char, usize)> {
     (len >= 3).then_some((first, len))
 }
 
+/// Size of one JSON value, measured while skipping over it: nothing is
+/// built, whatever the value holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Shape {
+    /// Values in it, itself included (object keys are not counted).
+    values: usize,
+    /// 1 for a scalar or an empty container.
+    depth: usize,
+}
+
+impl Shape {
+    const SCALAR: Self = Self {
+        values: 1,
+        depth: 1,
+    };
+
+    fn hold(&mut self, child: Self) {
+        self.values = self.values.saturating_add(child.values);
+        self.depth = self.depth.max(child.depth.saturating_add(1));
+    }
+}
+
+impl<'de> Deserialize<'de> for Shape {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(ShapeVisitor)
+    }
+}
+
+struct ShapeVisitor;
+
+impl<'de> Visitor<'de> for ShapeVisitor {
+    type Value = Shape;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("any JSON value")
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<Shape, E> {
+        Ok(Shape::SCALAR)
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<Shape, E> {
+        Ok(Shape::SCALAR)
+    }
+
+    fn visit_u64<E>(self, _: u64) -> Result<Shape, E> {
+        Ok(Shape::SCALAR)
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<Shape, E> {
+        Ok(Shape::SCALAR)
+    }
+
+    fn visit_str<E>(self, _: &str) -> Result<Shape, E> {
+        Ok(Shape::SCALAR)
+    }
+
+    fn visit_unit<E>(self) -> Result<Shape, E> {
+        Ok(Shape::SCALAR)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Shape, A::Error> {
+        let mut shape = Shape::SCALAR;
+        while let Some(child) = seq.next_element::<Shape>()? {
+            shape.hold(child);
+        }
+        Ok(shape)
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Shape, A::Error> {
+        let mut shape = Shape::SCALAR;
+        while map.next_key::<IgnoredAny>()?.is_some() {
+            shape.hold(map.next_value::<Shape>()?);
+        }
+        Ok(shape)
+    }
+}
+
 /// Append the values of `segment` to `items`; fails as soon as the paste
-/// holds more than [`MAX_PACKS`] values.
+/// holds more than [`MAX_PACKS`] values, or its packs together more than
+/// `values_left` JSON values. A value is only built when it is within the
+/// per-pack limits; otherwise it is reported in place.
 fn read_values(
     segment: &Segment<'_>,
     items: &mut Vec<Result<RawPack, PasteItemError>>,
+    values_left: &mut usize,
 ) -> Result<(), PasteError> {
-    let mut stream = Deserializer::from_str(segment.text).into_iter::<Value>();
+    let mut stream = Deserializer::from_str(segment.text).into_iter::<Shape>();
     let mut previous_end = 0;
     loop {
         let next = stream.next();
@@ -157,24 +264,11 @@ fn read_values(
         }
         match next {
             None => return Ok(()),
-            Some(Ok(value)) => {
+            Some(Ok(shape)) => {
                 let end = stream.byte_offset();
-                let bytes = end - previous_end;
+                let text = &segment.text[previous_end..end];
                 previous_end = end;
-                if bytes > MAX_PACK_BYTES {
-                    items.push(Err(PasteItemError {
-                        message: format!(
-                            "A pack in {} is too large ({bytes} bytes; at most {MAX_PACK_BYTES}).",
-                            segment.label
-                        ),
-                    }));
-                } else {
-                    let content_sha256 = content_sha256(&value);
-                    items.push(Ok(RawPack {
-                        value,
-                        content_sha256,
-                    }));
-                }
+                items.push(build(text, shape, &segment.label, values_left)?);
             }
             Some(Err(err)) => {
                 // The stream cannot resynchronise after a syntax error, so the
@@ -185,6 +279,48 @@ fn read_values(
                 return Ok(());
             }
         }
+    }
+}
+
+/// Turn the measured JSON `text` into a pack, or say why it is too big.
+fn build(
+    text: &str,
+    shape: Shape,
+    label: &str,
+    values_left: &mut usize,
+) -> Result<Result<RawPack, PasteItemError>, PasteError> {
+    let refuse = |message: String| Ok(Err(PasteItemError { message }));
+    let bytes = text.trim_start().len();
+    if bytes > MAX_PACK_BYTES {
+        return refuse(format!(
+            "A pack in {label} is too large ({bytes} bytes; at most {MAX_PACK_BYTES})."
+        ));
+    }
+    if shape.depth > MAX_PACK_DEPTH {
+        return refuse(format!(
+            "A JSON value in {label} is not a pack: it is nested {} levels deep (a pack has at most {MAX_PACK_DEPTH}).",
+            shape.depth
+        ));
+    }
+    if shape.values > MAX_PACK_VALUES {
+        return refuse(format!(
+            "A JSON value in {label} is not a pack: it holds {} values (a pack has at most {MAX_PACK_VALUES}).",
+            shape.values
+        ));
+    }
+    *values_left = values_left
+        .checked_sub(shape.values)
+        .ok_or(PasteError::TooManyValues)?;
+    match serde_json::from_str::<Value>(text) {
+        Ok(value) => {
+            let content_sha256 = content_sha256(&value);
+            Ok(Ok(RawPack {
+                value,
+                content_sha256,
+            }))
+        }
+        // Cannot happen: the same text was just read as JSON.
+        Err(err) => refuse(format!("{} is not valid JSON: {err}.", capitalise(label))),
     }
 }
 
@@ -296,6 +432,121 @@ mod tests {
         // Invalid JSON after the limit is not even looked at.
         let text = format!("{}{{oops", "{}\n".repeat(MAX_PACKS));
         assert_eq!(split_paste(&text), Err(PasteError::TooManyPacks));
+    }
+
+    /// B5 (R-84, review probes p5/p6): hostile JSON is measured, never
+    /// built. The assertions are on structure: what comes back holds no
+    /// `Value` for an oversized shape, whatever its byte length.
+    #[test]
+    fn r84_values_over_the_structure_limits_are_refused_before_being_built() {
+        // About 2 MiB of tiny values in one array: a million of them.
+        let unit_count = (MAX_PASTE_BYTES - 8) / 2;
+        let flat = format!("[{}0]", "0,".repeat(unit_count));
+        assert!(flat.len() <= MAX_PASTE_BYTES);
+        let got = values(&flat);
+        assert_eq!(got.len(), 1);
+        assert!(got[0].as_ref().expect_err("too big").contains("too large"));
+
+        // Under the byte limit of a pack, but far more values than a pack has.
+        let many = format!("[{}0]", "0,".repeat(MAX_PACK_VALUES));
+        assert!(many.len() < MAX_PACK_BYTES);
+        let got = values(&format!("{many}\n{{\"b\":1}}"));
+        let err = got[0].as_ref().expect_err("too many values");
+        assert!(
+            err.contains("not a pack") && err.contains("values"),
+            "{err}"
+        );
+        assert_eq!(
+            got[1],
+            Ok(serde_json::json!({"b": 1})),
+            "the next pack survives"
+        );
+        // Other shapes of the same trick; some are refused for their length.
+        for unit in ["{},", "[\"\"],", "{\"\":0},", "{\"\":{}},"] {
+            let text = format!("[{}0]", unit.repeat(MAX_PACK_VALUES));
+            assert!(values(&text)[0].is_err(), "{unit}");
+        }
+
+        // Exactly at the limit is fine (the array itself counts as one).
+        let at_limit = format!("[{}0]", "0,".repeat(MAX_PACK_VALUES - 2));
+        assert!(values(&at_limit)[0].is_ok());
+
+        // Deep nesting.
+        let deep = format!(
+            "{}{}",
+            "[".repeat(MAX_PACK_DEPTH + 1),
+            "]".repeat(MAX_PACK_DEPTH + 1)
+        );
+        let err = values(&deep).remove(0).expect_err("too deep");
+        assert!(err.contains("nested"), "{err}");
+        let ok = format!(
+            "{}{}",
+            "[".repeat(MAX_PACK_DEPTH),
+            "]".repeat(MAX_PACK_DEPTH)
+        );
+        assert!(values(&ok)[0].is_ok());
+        // Deeper than the parser's own limit is a syntax error, not a crash.
+        let abyss = format!("{}{}", "[".repeat(5000), "]".repeat(5000));
+        assert!(values(&abyss)[0].is_err());
+    }
+
+    #[test]
+    fn r84_all_packs_of_a_paste_share_one_value_budget() {
+        // Each pack is within the per-pack limits; together they are not.
+        let pack = format!("[{}0]", "0,".repeat(MAX_PACK_VALUES - 2));
+        let fitting = MAX_PASTE_VALUES / MAX_PACK_VALUES;
+        let paste = format!("{pack}\n").repeat(fitting);
+        assert_eq!(values(&paste).len(), fitting);
+        let paste = format!("{pack}\n").repeat(fitting + 1);
+        assert!(paste.len() <= MAX_PASTE_BYTES);
+        assert_eq!(split_paste(&paste), Err(PasteError::TooManyValues));
+    }
+
+    #[test]
+    fn r84_shape_counts_values_and_depth_without_building_them() {
+        let shape = |text: &str| serde_json::from_str::<Shape>(text).expect("json");
+        assert_eq!(
+            shape("1"),
+            Shape {
+                values: 1,
+                depth: 1
+            }
+        );
+        assert_eq!(
+            shape("\"a\\nb\""),
+            Shape {
+                values: 1,
+                depth: 1
+            }
+        );
+        assert_eq!(
+            shape("null"),
+            Shape {
+                values: 1,
+                depth: 1
+            }
+        );
+        assert_eq!(
+            shape("[]"),
+            Shape {
+                values: 1,
+                depth: 1
+            }
+        );
+        assert_eq!(
+            shape("[1, [2, 3], {\"a\": [true]}]"),
+            Shape {
+                values: 8,
+                depth: 4
+            }
+        );
+        assert_eq!(
+            shape("{\"a\": {\"b\": null}, \"c\": 1.5}"),
+            Shape {
+                values: 4,
+                depth: 3
+            }
+        );
     }
 
     #[test]

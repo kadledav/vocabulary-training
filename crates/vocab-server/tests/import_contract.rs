@@ -753,11 +753,15 @@ async fn r22_sentences_that_differ_only_in_typography_are_not_added_again() {
     assert_eq!(report["totals"]["new_sentences"], 1);
     assert_eq!(app.int("SELECT COUNT(*) FROM sentence"), 5);
 
-    // Existing sentences are kept unchanged, including their Czech and span.
+    // No sentence was added twice; the ones whose Czech the second pack
+    // changed carry the pack's version now (R-22: corrections reach the
+    // app), in the same rows.
+    assert_eq!(report["totals"]["updated_sentences"], 4);
     let view = app.word_by_key("hum").await;
-    assert_eq!(view["sentences"][0]["cs"]["target"], "Bzuč");
-    assert_eq!(view["sentences"][0]["en"]["pre"], "He said, \u{201c}");
-    assert_eq!(view["sentences"][1]["cs"]["target"], "bzukot");
+    assert_eq!(view["sentences"][0]["cs"]["target"], "Bzukej");
+    assert_eq!(view["sentences"][0]["en"]["pre"], "He said, \"");
+    assert_eq!(view["sentences"][1]["cs"]["target"], "hučení");
+    assert_eq!(view["sentences"][3]["cs"]["target"], "jiného");
     assert_eq!(view["sentences"][4]["en"]["target"], "ming");
 }
 
@@ -786,7 +790,9 @@ async fn r22_the_marked_span_position_does_not_make_a_sentence_new() {
     assert_eq!(report["totals"]["new_sentences"], 0);
     let view = app.word_by_key("hum").await;
     assert_eq!(view["sentences"].as_array().expect("s").len(), 1);
-    assert_eq!(view["sentences"][0]["en"]["target"], "hummed");
+    // The same sentence, with the span as the newer pack marks it (R-22).
+    assert_eq!(report["totals"]["updated_sentences"], 1);
+    assert_eq!(view["sentences"][0]["en"]["target"], "med");
 }
 
 #[tokio::test]

@@ -2,8 +2,9 @@
 //!
 //! A marked text contains exactly one target span: the scanner finds the
 //! first `[[`, then the first `]]` after it, and requires that no other `[[`
-//! or `]]` occurs anywhere in the text. The span must not be empty and must
-//! not start or end with whitespace. Text outside the markers may be empty.
+//! or `]]` occurs anywhere in the text. The span must not be empty, must
+//! not start or end with whitespace and must not start with `]` (`[[]x]]`
+//! is a typing slip, not a target). Text outside the markers may be empty.
 //! This is the same rule as the `markedText` pattern of the JSON Schema.
 
 use std::fmt;
@@ -37,6 +38,8 @@ pub enum MarkError {
     EmptySpan,
     /// `[[ word]]` or `[[word ]]`.
     SpanWhitespace,
+    /// `[[]word]]`.
+    SpanBracket,
 }
 
 impl fmt::Display for MarkError {
@@ -52,6 +55,7 @@ impl fmt::Display for MarkError {
             Self::SpanWhitespace => {
                 "the target span starts or ends with whitespace inside the brackets"
             }
+            Self::SpanBracket => "the target span starts with ] (write [[word]])",
         })
     }
 }
@@ -99,6 +103,9 @@ pub fn split(text: &str) -> Result<MarkedText, MarkError> {
     }
     if target.starts_with(char::is_whitespace) || target.ends_with(char::is_whitespace) {
         return Err(MarkError::SpanWhitespace);
+    }
+    if target.starts_with(']') {
+        return Err(MarkError::SpanBracket);
     }
     Ok(MarkedText {
         pre: pre.to_owned(),
@@ -160,6 +167,16 @@ mod tests {
         assert_eq!(split("a [[ word]] b"), Err(MarkError::SpanWhitespace));
         assert_eq!(split("a [[word ]] b"), Err(MarkError::SpanWhitespace));
         assert_eq!(split("a [[ ]] b"), Err(MarkError::SpanWhitespace));
+    }
+
+    /// A8 (review finding): the schema's pattern never allowed a span that
+    /// starts with `]`; the scanner agrees now.
+    #[test]
+    fn r23_span_starting_with_a_closing_bracket_is_rejected() {
+        assert_eq!(split("A loud [[]thud]] came."), Err(MarkError::SpanBracket));
+        assert_eq!(split("[[]x]]"), Err(MarkError::SpanBracket));
+        // A bracket elsewhere in the span is ordinary text.
+        assert_eq!(ok("[[x[]]"), (s(""), s("x["), s("")));
     }
 
     #[test]
@@ -224,6 +241,7 @@ mod tests {
         };
         let target = &chars[open + 2..close];
         if target.is_empty()
+            || target.first() == Some(&']')
             || target.first().is_some_and(|c| c.is_whitespace())
             || target.last().is_some_and(|c| c.is_whitespace())
         {

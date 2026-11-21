@@ -22,8 +22,8 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 pub use build::{
-    NewAllowance, choose_sentence, new_candidate_count, new_word_allowance, scheduled_in_scope,
-    start_block,
+    NewAllowance, choose_sentence, extra_available, new_candidate_count, new_word_allowance,
+    scheduled_in_scope, start_block,
 };
 pub use queue::{finish, rate, undo_last};
 pub use view::{
@@ -66,13 +66,54 @@ impl fmt::Display for SessionId {
     }
 }
 
-/// `start` (first block) or `continue` (Continue +20); both build a block
-/// the same way (design §6.7 step 5).
+/// `start` (first block) or `continue` (Continue +20) build a regular block
+/// the same way (design §6.7 step 5); `extra` builds an extra-practice block
+/// of cards that are not due (R-63, §6.9); `more_new` a block of new words
+/// only ("Learn more new words", §6.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StartKind {
     Start,
     Continue,
+    Extra,
+    MoreNew,
+}
+
+/// Most new words one "Learn more new words" block may ask for.
+pub const MORE_NEW_MAX: u32 = 50;
+/// Fewest new words a "Learn more new words" block gets by default (the
+/// default is the `new_per_day` setting, at least this).
+pub const MORE_NEW_DEFAULT_MIN: u32 = 5;
+
+/// What kind of block a stored block is (`practice_session.kind`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockKind {
+    /// Due cards with new words mixed in (`start`, `continue`).
+    Regular,
+    /// Extra practice of cards that are not due (R-63).
+    Extra,
+    /// New words only, beyond today's limit.
+    MoreNew,
+}
+
+impl BlockKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Regular => "regular",
+            Self::Extra => "extra",
+            Self::MoreNew => "more_new",
+        }
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        match text {
+            "regular" => Some(Self::Regular),
+            "extra" => Some(Self::Extra),
+            "more_new" => Some(Self::MoreNew),
+            _ => None,
+        }
+    }
 }
 
 /// What `POST /api/sessions` asks for.
@@ -84,6 +125,9 @@ pub struct StartRequest {
     /// "Add new words anyway (today)": overrides the backlog pause for the
     /// rest of the study day (design §6.6).
     pub add_new_anyway: bool,
+    /// `more_new` only: how many new words (1–[`MORE_NEW_MAX`]); `None` =
+    /// the `new_per_day` setting, at least [`MORE_NEW_DEFAULT_MIN`].
+    pub count: Option<u32>,
 }
 
 /// One rating posted by the client (design §8).

@@ -5,4 +5,5 @@ fn main() {
     println!("cargo::rerun-if-changed=../../web/index.html");
     println!("cargo::rerun-if-changed=../../web/css");
     println!("cargo::rerun-if-changed=../../web/js");
+    println!("cargo::rerun-if-changed=../../web/img");
 }

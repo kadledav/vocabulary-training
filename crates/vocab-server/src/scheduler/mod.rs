@@ -18,8 +18,8 @@ use std::fmt;
 use serde::Serialize;
 
 pub use cards::{
-    Card, card, cards_of_word, ensure_cards, introduced_words_on, new_cards, normal_load,
-    reviewed_cards_on, scheduled_cards, sentence_last_shown,
+    Card, card, cards_of_word, ensure_cards, introduced_words_on, latest_grades_on, new_cards,
+    normal_load, reviewed_cards_on, scheduled_cards, sentence_last_shown,
 };
 pub use model::{Model, Rating, desired_retention, model};
 pub use review::{

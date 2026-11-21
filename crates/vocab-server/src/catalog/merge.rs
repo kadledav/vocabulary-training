@@ -8,8 +8,8 @@
 //! | scalars | incoming absent → nothing; equal (trim) → nothing; owner override → keep + conflict; existing empty → take incoming; else keep + conflict (not again when the owner dismissed the same suggestion) |
 //! | `czech`, `accepted`, `confusables` | union by item key; owner-removed items are not re-added |
 //! | `forms` | union by form key; an existing form keeps its `common` flag |
-//! | sentences | dedupe by sentence key; new ones appended; existing ones unchanged |
-//! | source link | created with the next `seq` (or the pack's explicit `seq`); an existing link keeps its `seq`; its tag changes only when the pack has a `tag` key (`null` clears it) |
+//! | sentences | dedupe by sentence key; new ones appended; a known one whose `cs` or marked English span differs is updated to the pack's version, unless the owner edited or hid it (English that differs only in what the key folds, e.g. how a quote was cut, is not a correction) |
+//! | source link | created with the next `seq` (or the pack's explicit `seq`); an existing link keeps its `seq`; its tag changes only when the pack gives a tag object (no `tag`, or `null`, keeps it) |
 //! | `low_priority` | owner override, else the most recently imported link's tag |
 //!
 //! The override check runs before "existing empty → take incoming" so a
@@ -18,14 +18,14 @@
 //! `spelling_note` is only filled when the word's resulting `spelling` is
 //! true. A field the pack leaves out never changes anything.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::Serialize;
 use serde_json::Value;
-use vocab_pack::keys::item_key;
-use vocab_pack::types::{PackWord, TagField, TagKind};
+use vocab_pack::keys::{item_key, span_key};
+use vocab_pack::types::{PackSentence, PackWord, TagKind};
 
 use super::{SourceId, WordId};
 
@@ -86,7 +86,10 @@ pub struct WordMerge {
     pub conflicts: Vec<ConflictReport>,
     pub items_added: ItemsAdded,
     pub sentences_added: u32,
-    /// Sentences of the pack the word already had (skipped).
+    /// Known sentences whose text or marked spans the pack corrected.
+    pub sentences_updated: u32,
+    /// Sentences of the pack the word already had (nothing to do), plus
+    /// those that differ but are kept because the owner edited or hid them.
     pub sentences_known: u32,
     /// The word was not yet linked to this source.
     pub source_linked: bool,
@@ -109,6 +112,9 @@ struct Plan {
     new_forms: Vec<usize>,
     /// Indices into `word.sentences`.
     new_sentences: Vec<usize>,
+    /// (`sentence.id`, index into `word.sentences`): known sentences the
+    /// pack corrects.
+    updated_sentences: Vec<(i64, usize)>,
     sentences_known: u32,
     link: LinkPlan,
 }
@@ -139,6 +145,7 @@ impl Plan {
             || self.conflicts.iter().any(|c| !c.already_open)
             || items.total() > 0
             || !self.new_sentences.is_empty()
+            || !self.updated_sentences.is_empty()
             || source_linked
             || tag_changed
         {
@@ -153,6 +160,7 @@ impl Plan {
             conflicts: self.conflicts.clone(),
             items_added: items,
             sentences_added: count(self.new_sentences.len()),
+            sentences_updated: count(self.updated_sentences.len()),
             sentences_known: self.sentences_known,
             source_linked,
             tag_changed,
@@ -234,6 +242,7 @@ fn plan(conn: &Connection, source: SourceId, word: &PackWord) -> rusqlite::Resul
             new_items: new_items(word, &HashSet::new()),
             new_forms: new_forms(word, &HashSet::new()),
             new_sentences: (0..word.sentences.len()).collect(),
+            updated_sentences: Vec::new(),
             sentences_known: 0,
             link: LinkPlan::New,
         });
@@ -306,10 +315,21 @@ fn plan(conn: &Connection, source: SourceId, word: &PackWord) -> rusqlite::Resul
     )?;
     let new_forms = new_forms(word, &known_forms);
 
-    let known_sentences: HashSet<String> =
-        collect(conn, "SELECT en_key FROM sentence WHERE word_id = ?1", id)?;
-    let (known, new): (Vec<usize>, Vec<usize>) =
-        (0..word.sentences.len()).partition(|&i| known_sentences.contains(&word.sentences[i].key));
+    let known_sentences = known_sentences(conn, id)?;
+    let mut new_sentences = Vec::new();
+    let mut updated_sentences = Vec::new();
+    let mut sentences_known = 0;
+    for (i, sentence) in word.sentences.iter().enumerate() {
+        match known_sentences.get(&sentence.key) {
+            None => new_sentences.push(i),
+            // A correction (another translation, another span) reaches the
+            // app; what the owner edited or hid stays his.
+            Some(known) if !known.owner_changed && known.corrected_by(sentence) => {
+                updated_sentences.push((known.id, i));
+            }
+            Some(_) => sentences_known += 1,
+        }
+    }
 
     let link = conn
         .query_row(
@@ -318,9 +338,9 @@ fn plan(conn: &Connection, source: SourceId, word: &PackWord) -> rusqlite::Resul
             |row| {
                 let kind: Option<String> = row.get(0)?;
                 let text: Option<String> = row.get(1)?;
-                let tag_changed = match tag_columns(word) {
+                let tag_changed = match &word.tag {
                     None => false,
-                    Some((in_kind, in_text)) => kind.as_deref() != in_kind || text != in_text,
+                    Some(tag) => kind.as_deref() != Some(tag.kind.as_str()) || text != tag.text,
                 };
                 Ok(LinkPlan::Existing { tag_changed })
             },
@@ -334,8 +354,9 @@ fn plan(conn: &Connection, source: SourceId, word: &PackWord) -> rusqlite::Resul
         conflicts,
         new_items,
         new_forms,
-        new_sentences: new,
-        sentences_known: count(known.len()),
+        new_sentences,
+        updated_sentences,
+        sentences_known,
         link,
     })
 }
@@ -382,14 +403,45 @@ fn collect(conn: &Connection, sql: &str, id: WordId) -> rusqlite::Result<HashSet
     stmt.query_map([id.0], |row| row.get(0))?.collect()
 }
 
-/// The link's tag columns the pack asks for; `None` when the pack has no
-/// `tag` key (keep whatever is stored).
-fn tag_columns(word: &PackWord) -> Option<(Option<&'static str>, Option<String>)> {
-    match &word.tag {
-        TagField::Absent => None,
-        TagField::Null => Some((None, None)),
-        TagField::Tag(tag) => Some((Some(tag.kind.as_str()), tag.text.clone())),
+/// A stored sentence of a word, as far as the merge needs it.
+struct KnownSentence {
+    id: i64,
+    en: String,
+    cs: String,
+    /// The owner edited or hid it: a pack never changes it (design §5.4).
+    owner_changed: bool,
+}
+
+impl KnownSentence {
+    /// Does the pack's version of this sentence correct it? Yes when the
+    /// Czech text (translation or its marked span) differs, or when another
+    /// part of the English sentence is marked. The English text itself is
+    /// the same by definition (same key); how it was cut or punctuated this
+    /// time is not a reason to replace it.
+    fn corrected_by(&self, incoming: &PackSentence) -> bool {
+        self.cs != incoming.cs || span_key(&self.en) != span_key(&incoming.en)
     }
+}
+
+fn known_sentences(
+    conn: &Connection,
+    id: WordId,
+) -> rusqlite::Result<HashMap<String, KnownSentence>> {
+    let mut stmt = conn.prepare(
+        "SELECT en_key, id, en_marked, cs_marked, edited OR hidden FROM sentence WHERE word_id = ?1",
+    )?;
+    stmt.query_map([id.0], |row| {
+        Ok((
+            row.get(0)?,
+            KnownSentence {
+                id: row.get(1)?,
+                en: row.get(2)?,
+                cs: row.get(3)?,
+                owner_changed: row.get(4)?,
+            },
+        ))
+    })?
+    .collect()
 }
 
 // ── public operations ───────────────────────────────────────────────────────
@@ -538,12 +590,30 @@ fn apply_sentences(
             ],
         )?;
     }
+    for &(sentence_id, i) in &plan.updated_sentences {
+        let s = &word.sentences[i];
+        // Same row, same key: reviews that showed the sentence keep it.
+        tx.execute(
+            "UPDATE sentence SET en_marked = ?2, cs_marked = ?3, origin = ?4, \
+             location = COALESCE(?5, location), pack_import_id = ?6, updated_at = ?7 WHERE id = ?1",
+            params![
+                sentence_id,
+                s.en,
+                s.cs,
+                s.origin.as_str(),
+                s.location,
+                link.pack_import_id,
+                link.now,
+            ],
+        )?;
+    }
     Ok(())
 }
 
 /// Create the word ↔ source link (with the pack's explicit `seq`, or the
-/// next one), or update an existing link: its tag when the pack has a `tag`
-/// key (it describes this source relationship) and its last import. The
+/// next one), or update an existing link: its tag when the pack gives a tag
+/// (it describes this source relationship; a pack without one, or with
+/// `"tag": null`, says nothing and the stored tag stays) and its last import. The
 /// `seq` of an existing link never changes (design §5.4); explicit and
 /// derived values may collide, and ties are ordered by link creation.
 fn apply_link(
@@ -552,7 +622,10 @@ fn apply_link(
     link: &ImportLink<'_>,
     word: &PackWord,
 ) -> rusqlite::Result<()> {
-    let tag = tag_columns(word);
+    let tag = word
+        .tag
+        .as_ref()
+        .map(|tag| (tag.kind.as_str(), tag.text.as_deref()));
     let updated = match &tag {
         Some((tag_kind, tag_text)) => tx.execute(
             "UPDATE word_source SET tag_kind = ?3, tag_text = ?4, last_pack_import_id = ?5 \
@@ -571,7 +644,8 @@ fn apply_link(
         )?,
     };
     if updated == 0 {
-        let (tag_kind, tag_text) = tag.unwrap_or((None, None));
+        let (tag_kind, tag_text) = tag.unzip();
+        let tag_text = tag_text.flatten();
         let explicit_seq = word.seq.map(i64::from);
         tx.execute(
             "INSERT INTO word_source (word_id, source_id, seq, tag_kind, tag_text, \

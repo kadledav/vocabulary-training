@@ -164,7 +164,7 @@ fn r10_valid_pack_is_typed_and_normalised() {
     assert_eq!(w.headword, "Caf\u{e9} Au Lait", "trimmed and NFC");
     assert_eq!(w.key, "caf\u{e9} au lait");
     assert_eq!(w.goal, Some(Goal::Recognise));
-    assert_eq!(w.tag.tag().map(|t| t.kind), Some(TagKind::SeenBefore));
+    assert_eq!(w.tag.as_ref().map(|t| t.kind), Some(TagKind::SeenBefore));
     assert_eq!(w.seq, Some(7));
     assert_eq!(w.spelling, Some(true));
     assert_eq!(w.note, None, "blank text counts as absent");
@@ -302,7 +302,8 @@ fn r59_exported_at_must_be_a_date_if_present() {
     for bad in [
         json!("17.11.2026"),
         json!("2026-11-32"),
-        json!(null),
+        json!("2026-02-30"),
+        json!("2026-11-17T10:00:00Z"),
         json!(20261117),
     ] {
         assert_pack_error(
@@ -412,7 +413,7 @@ fn r84_control_characters_reject_the_scope_they_occur_in() {
     );
     // Word scope.
     assert_word_error(
-        &with(pack(), "/words/1/meaning", json!("Line\rbreak")),
+        &with(pack(), "/words/1/meaning", json!("Line\u{b}break")),
         1,
         "/words/1/meaning",
         IssueCode::ControlCharacter,
@@ -924,22 +925,158 @@ fn r01_blank_list_items_are_dropped_with_a_warning() {
     );
 }
 
+/// A1 (R-03/R-51): `"tag": null` says nothing about the tag, exactly like
+/// leaving `tag` out; only a tag object sets one.
 #[test]
-fn r01_absent_tag_and_null_tag_differ() {
-    use vocab_pack::types::TagField;
+fn r03_null_tag_is_the_same_as_no_tag() {
     let absent = validate(&pack());
-    assert_eq!(valid_word(&absent, 0).tag, TagField::Absent);
+    assert_eq!(valid_word(&absent, 0).tag, None);
     let null = validate(&with(pack(), "/words/0/tag", json!(null)));
-    assert_eq!(valid_word(&null, 0).tag, TagField::Null);
+    assert!(null.is_clean());
+    assert_eq!(valid_word(&null, 0).tag, None);
     let set = validate(&with(
         pack(),
         "/words/0/tag",
         json!({ "kind": "seen-before" }),
     ));
     assert_eq!(
-        valid_word(&set, 0).tag.tag().map(|t| t.kind),
+        valid_word(&set, 0).tag.as_ref().map(|t| t.kind),
         Some(TagKind::SeenBefore)
     );
+}
+
+/// A8: `null` for an optional property means "not given".
+#[test]
+fn r23_null_means_absent_for_every_optional_property() {
+    for pointer in [
+        "/exported_at",
+        "/part",
+        "/reading_position",
+        "/source/title",
+        "/source/author",
+        "/source/series",
+        "/source/series_number",
+        "/source/url",
+        "/words/0/grammar",
+        "/words/0/forms",
+        "/words/0/pronunciation",
+        "/words/0/speak",
+        "/words/0/goal",
+        "/words/0/accepted",
+        "/words/0/confusables",
+        "/words/0/hint",
+        "/words/0/spelling",
+        "/words/0/spelling_note",
+        "/words/0/note",
+        "/words/0/tag",
+        "/words/0/icon",
+        "/words/0/seq",
+        "/words/0/sentences/0/location",
+    ] {
+        let result = validate(&with(pack(), pointer, json!(null)));
+        assert!(result.is_clean(), "{pointer}: {result:#?}");
+    }
+    let result = validate(&with(pack(), "/words/0/sentences", json!(null)));
+    assert!(result.is_clean(), "{result:#?}");
+    let w = valid_word(&result, 0);
+    assert!(w.sentences.is_empty());
+    assert_eq!((w.goal, w.spelling, w.seq), (None, None, None));
+    assert!(w.forms.is_empty() && w.accepted.is_empty() && w.confusables.is_empty());
+    // Required properties stay required.
+    for pointer in ["/words/0/czech", "/words/0/meaning", "/words/0/headword"] {
+        assert!(
+            !validate(&with(pack(), pointer, json!(null))).is_clean(),
+            "{pointer}"
+        );
+    }
+}
+
+/// A8: Windows and old-Mac line breaks are read as `\n`, not rejected.
+#[test]
+fn r23_carriage_returns_become_line_feeds() {
+    let noted = with(
+        pack(),
+        "/words/0/note",
+        json!("line one\r\nline two\rline three"),
+    );
+    let result = validate(&noted);
+    assert!(result.is_clean(), "{result:#?}");
+    assert_eq!(
+        valid_word(&result, 0).note.as_deref(),
+        Some("line one\nline two\nline three")
+    );
+    let sentence = with(
+        pack(),
+        "/words/0/sentences/0/en",
+        json!("A low [[hum]]\r\nfilled the room."),
+    );
+    let result = validate(&sentence);
+    assert!(result.is_clean(), "{result:#?}");
+    assert_eq!(
+        valid_word(&result, 0).sentences[0].en,
+        "A low [[hum]]\nfilled the room."
+    );
+}
+
+/// A8: a page number may be a JSON number; it is stored as text.
+#[test]
+fn r20_location_may_be_a_number() {
+    let result = validate(&with(pack(), "/words/0/sentences/0/location", json!(214)));
+    assert!(result.is_clean(), "{result:#?}");
+    assert_eq!(
+        valid_word(&result, 0).sentences[0].location.as_deref(),
+        Some("214")
+    );
+    let bad = validate(&with(pack(), "/words/0/sentences/0/location", json!(true)));
+    assert!(!bad.is_clean());
+}
+
+/// A8: blank `meaning` and a headword without a visible character.
+#[test]
+fn r23_blank_meaning_and_invisible_headword_are_word_errors() {
+    for blank in ["   ", "\u{a0}", "\u{200b}\u{feff}", "\t\n"] {
+        assert_word_error(
+            &with(pack(), "/words/0/meaning", json!(blank)),
+            0,
+            "/words/0/meaning",
+            IssueCode::Invalid,
+        );
+        assert_word_error(
+            &with(pack(), "/words/0/headword", json!(blank)),
+            0,
+            "/words/0/headword",
+            IssueCode::Invalid,
+        );
+    }
+}
+
+/// A8: only web addresses are accepted as `source.url`.
+#[test]
+fn r84_source_url_must_be_http_or_https() {
+    for good in [
+        "https://test.example/article",
+        "http://test.example",
+        "HTTPS://test.example",
+    ] {
+        assert!(
+            validate(&with(pack(), "/source/url", json!(good))).is_clean(),
+            "{good}"
+        );
+    }
+    for bad in [
+        "javascript:alert(1)",
+        "ftp://test.example",
+        "test.example/a",
+        "data:text/html,x",
+    ] {
+        assert_pack_error(
+            &with(pack(), "/source/url", json!(bad)),
+            "/source/url",
+            IssueCode::Invalid,
+        );
+    }
+    // Blank is "not given", as for every optional text.
+    assert!(validate(&with(pack(), "/source/url", json!(" "))).is_clean());
 }
 
 #[test]

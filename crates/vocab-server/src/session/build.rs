@@ -6,7 +6,10 @@ use rusqlite::{Connection, Transaction, params};
 use serde::Serialize;
 
 use super::view::{self, StartResult};
-use super::{ItemOrigin, SERVED_KINDS, SessionError, SessionId, StartRequest};
+use super::{
+    BlockKind, ItemOrigin, MORE_NEW_DEFAULT_MIN, MORE_NEW_MAX, SERVED_KINDS, SessionError,
+    SessionId, StartKind, StartRequest,
+};
 use crate::catalog::{self, PracticeWord, PresentedSentence, SourceId, WordId, WordTraits};
 use crate::clock::{Moment, StudyDay};
 use crate::scheduler::{self, Card, CardFormat, CardId, CardKind, CardState};
@@ -354,6 +357,124 @@ fn plan_block(
     Ok(interleave(due, new, settings.block_size as usize))
 }
 
+/// Extra practice (R-63, design §6.9), offered only while nothing is due
+/// in `scope` (due cards come first; an empty plan otherwise): cards
+/// already seen (at least one review) of the served kinds in `scope`, one
+/// per word.
+/// Cards whose latest rating today was 1–2 are left out (just shown, known);
+/// cards rated 3–5 today come first, then the lowest current FSRS
+/// retrievability. Not limited to a block yet.
+fn plan_extra(
+    conn: &Connection,
+    day: StudyDay,
+    scope: Option<SourceId>,
+) -> rusqlite::Result<Vec<Planned>> {
+    let words = catalog::practice_words(conn, scope)?;
+    let model = scheduler::model(conn)?;
+    let scheduled = scheduled_of(conn, &words, SERVED_KINDS)?;
+    if scheduled.iter().any(|c| c.is_due_on(day)) {
+        return Ok(Vec::new());
+    }
+    let latest = scheduler::latest_grades_on(conn, day)?;
+    let mut cards: Vec<(bool, f64, Card)> = scheduled
+        .into_iter()
+        .filter(|c| c.reps >= 1 && !c.is_due_on(day))
+        .filter_map(|c| {
+            let rated_today = match latest.get(&c.id) {
+                Some(grade) if grade.get() <= 2 => return None,
+                Some(_) => true,
+                None => false,
+            };
+            let recall = model.retrievability(&c, day).unwrap_or(0.0);
+            Some((rated_today, recall, c))
+        })
+        .collect();
+    // Rated 3–5 today first, then lowest retrievability, then card id.
+    cards.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then(a.1.total_cmp(&b.1))
+            .then(a.2.id.cmp(&b.2.id))
+    });
+    let mut seen_words = HashSet::new();
+    Ok(cards
+        .into_iter()
+        .filter(|(_, _, card)| seen_words.insert(card.word_id))
+        .map(|(_, _, card)| Planned {
+            card: card.id,
+            word: card.word_id,
+            origin: ItemOrigin::Due,
+        })
+        .collect())
+}
+
+/// How many cards an extra-practice block (R-63) in `scope` would serve now
+/// (at most a block).
+pub fn extra_available(
+    conn: &Connection,
+    day: StudyDay,
+    scope: Option<SourceId>,
+    settings: &Settings,
+) -> rusqlite::Result<u32> {
+    let eligible = plan_extra(conn, day, scope)?.len();
+    Ok(count(eligible).min(settings.block_size))
+}
+
+/// "Learn more new words" (design §6.6): `count` new words in `scope` by
+/// the usual candidate order and interference rule, regardless of today's
+/// limit and of the backlog pause.
+fn plan_more_new(
+    conn: &Connection,
+    day: StudyDay,
+    scope: Option<SourceId>,
+    count: u32,
+) -> rusqlite::Result<Vec<Planned>> {
+    let words = catalog::practice_words(conn, scope)?;
+    let reviewed_today = scheduler::reviewed_cards_on(conn, day)?;
+    plan_new(conn, day, count, &words, &reviewed_today, &HashSet::new())
+}
+
+/// The number of new words a `more_new` request asks for (validated).
+fn more_new_count(request: &StartRequest, settings: &Settings) -> Result<u32, SessionError> {
+    match (request.kind, request.count) {
+        (StartKind::MoreNew, None) => Ok(settings.new_per_day.max(MORE_NEW_DEFAULT_MIN)),
+        (StartKind::MoreNew, Some(n)) if (1..=MORE_NEW_MAX).contains(&n) => Ok(n),
+        (StartKind::MoreNew, Some(_)) => Err(SessionError::Invalid(format!(
+            "count must be 1-{MORE_NEW_MAX}"
+        ))),
+        (_, Some(_)) => Err(SessionError::Invalid(
+            "count is only accepted with kind \"more_new\"".to_owned(),
+        )),
+        (_, None) => Ok(0),
+    }
+}
+
+/// The kind, target size and items of the block `request` asks for.
+fn plan_request(
+    conn: &Connection,
+    day: StudyDay,
+    request: &StartRequest,
+    settings: &Settings,
+    more_new: u32,
+) -> rusqlite::Result<(BlockKind, u32, Vec<Planned>)> {
+    Ok(match request.kind {
+        StartKind::Start | StartKind::Continue => (
+            BlockKind::Regular,
+            settings.block_size,
+            plan_block(conn, day, request.scope, settings)?,
+        ),
+        StartKind::Extra => {
+            let mut planned = plan_extra(conn, day, request.scope)?;
+            planned.truncate(settings.block_size as usize);
+            (BlockKind::Extra, settings.block_size, planned)
+        }
+        StartKind::MoreNew => (
+            BlockKind::MoreNew,
+            more_new,
+            plan_more_new(conn, day, request.scope, more_new)?,
+        ),
+    })
+}
+
 /// Mark active blocks of earlier study days as expired (design §6.7 step 8:
 /// blocks expire at day rollover; their unanswered items are simply not
 /// reviewed).
@@ -389,6 +510,9 @@ pub fn shown_format(conn: &Connection, card: &Card) -> rusqlite::Result<Option<C
 /// `new_per_day` is lowered afterwards, so the day can end with more
 /// introductions than the new limit. The limit only decides how many new
 /// items a block gets when it is built.
+///
+/// `extra` and `more_new` blocks (R-63, §6.6) are resumed and stored the
+/// same way; their ratings are ordinary reviews.
 pub fn start_block(
     tx: &Transaction<'_>,
     now: &Moment,
@@ -400,6 +524,8 @@ pub fn start_block(
     {
         return Err(SessionError::UnknownSource);
     }
+    let settings = settings::get(tx)?;
+    let more_new = more_new_count(request, &settings)?;
     if request.add_new_anyway {
         settings::allow_new_words_anyway(tx, day)?;
     }
@@ -413,8 +539,7 @@ pub fn start_block(
         }
         view::close_block(tx, &active, now)?;
     }
-    let settings = settings::get(tx)?;
-    let planned = plan_block(tx, day, request.scope, &settings)?;
+    let (kind, block_size, planned) = plan_request(tx, day, request, &settings, more_new)?;
     if planned.is_empty() {
         return Ok(StartResult {
             session: None,
@@ -428,15 +553,17 @@ pub fn start_block(
         |row| row.get(0),
     )?;
     tx.execute(
-        "INSERT INTO practice_session (id, study_day, scope_source_id, block_no, block_size, status, started_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6)",
+        "INSERT INTO practice_session \
+         (id, study_day, scope_source_id, block_no, block_size, status, started_at, kind) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?7)",
         params![
             id.as_str(),
             day,
             request.scope.map(SourceId::get),
             block_no,
-            settings.block_size,
-            now.stamp()
+            block_size,
+            now.stamp(),
+            kind.as_str()
         ],
     )?;
     for (ord, item) in (1u32..).zip(&planned) {
