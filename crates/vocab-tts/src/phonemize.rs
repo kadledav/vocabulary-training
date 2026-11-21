@@ -41,14 +41,16 @@ const FALLBACK: &str = "cmudict.dict";
 /// Version of this front-end: part of the app's clip identity, so a change
 /// in how text becomes phonemes regenerates the clips. Bump it with every
 /// change of the rules or the dictionaries.
-pub const FRONTEND_VERSION: &str = "g2p-3";
+pub const FRONTEND_VERSION: &str = "g2p-4";
 /// Phoneme symbols per chunk the engine synthesises in one pass (Kokoro's
 /// context is 510). The engine's memory grows with the chunk length and
-/// with every new chunk shape (measured in the image: idle 576 MiB, after
-/// one chunk of 150 symbols 753 MiB, of 300 symbols 998 MiB, after two
-/// different 300-symbol chunks 1353 MiB — over the 1280 MB limit), so
-/// chunks stay short; a sentence of up to ~25 words is one chunk.
-const MAX_CHUNK_SYMBOLS: usize = 150;
+/// with every new chunk shape (int8 model, one fresh engine process, the
+/// worst accepted text of 150-symbol chunks: +380 MiB over the loaded
+/// model, of 100-symbol chunks +210 MiB, of 75 +170 MiB), so chunks stay
+/// short. 100 symbols: a sentence of up to ~17 words is one chunk, a longer
+/// one is cut at its last pause (comma, semicolon, …) before the limit, or
+/// else between two words.
+const MAX_CHUNK_SYMBOLS: usize = 100;
 /// Where a chunk that must be cut ends best: at its last pause.
 const CUT_MARKS: [char; 5] = [',', ';', ':', '—', '…'];
 /// Stress and length marks: not sounds (skipped when looking at the last
@@ -1109,8 +1111,10 @@ a ˈ A
     #[test]
     fn r40_no_chunk_exceeds_the_limit_even_for_one_huge_word() {
         let mut chunks = Chunks::default();
+        // Five and a half chunks long: the comma after it still fits.
+        let huge = "b".repeat(MAX_CHUNK_SYMBOLS * 5 + MAX_CHUNK_SYMBOLS / 2);
         chunks.word("həlˈO");
-        chunks.word(&"ab".repeat(400));
+        chunks.word(&huge);
         chunks.pause(',');
         chunks.word("kˈæt");
         let done = chunks.finish();
@@ -1122,7 +1126,7 @@ a ˈ A
             .iter()
             .map(|c| c.chars().filter(|c| *c != ' ').count())
             .sum();
-        assert_eq!(symbols, 5 + 800 + 1 + 4);
+        assert_eq!(symbols, 5 + huge.len() + 1 + 4);
         // Hyphenated compounds and long numbers are several words each.
         for text in [["zxc"; 10].join("-"), "zxc".repeat(21)] {
             let p = us(&text);
@@ -1139,7 +1143,9 @@ a ˈ A
     #[test]
     fn r40_a_long_chunk_is_cut_at_its_last_pause() {
         let mut chunks = Chunks::default();
-        let word = "a".repeat(40);
+        // Three words and a comma fit in a chunk, four do not.
+        let word = "a".repeat(MAX_CHUNK_SYMBOLS / 4 + 3);
+        let w = word.len();
         for _ in 0..2 {
             chunks.word(&word);
         }
@@ -1151,7 +1157,7 @@ a ˈ A
         let done = chunks.finish();
         assert_eq!(done.len(), 2, "{done:?}");
         assert!(done[0].ends_with(','), "{done:?}");
-        assert_eq!(done[0].chars().count(), 82);
+        assert_eq!(done[0].chars().count(), 2 * w + 2);
         assert_eq!(done[1], format!("{word} {word}"));
         // No pause to cut at: the chunk ends before the word.
         let mut chunks = Chunks::default();
@@ -1161,7 +1167,7 @@ a ˈ A
         let done = chunks.finish();
         assert_eq!(
             done.iter().map(|c| c.chars().count()).collect::<Vec<_>>(),
-            [122, 40]
+            [3 * w + 2, w]
         );
     }
 
