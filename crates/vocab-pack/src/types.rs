@@ -1,5 +1,6 @@
-//! Typed view of a validated pack (format v1). Every text is NFC-normalised;
-//! nothing else is changed (design §5.2 "All text").
+//! Typed view of a validated pack (format v1). Every text is NFC-normalised
+//! and its line breaks are `\n`; nothing else is changed (design §5.2 "All
+//! text").
 
 use std::fmt;
 
@@ -156,25 +157,6 @@ pub struct PackTag {
     pub text: Option<String>,
 }
 
-/// The word's `tag`: leaving it out says nothing (an existing tag stays);
-/// `null` explicitly removes the tag.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TagField {
-    Absent,
-    Null,
-    Tag(PackTag),
-}
-
-impl TagField {
-    /// The tag, if one is set.
-    pub fn tag(&self) -> Option<&PackTag> {
-        match self {
-            Self::Tag(tag) => Some(tag),
-            Self::Absent | Self::Null => None,
-        }
-    }
-}
-
 /// A sentence that passed the sentence rules.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackSentence {
@@ -183,6 +165,7 @@ pub struct PackSentence {
     /// Czech text with its `[[…]]` span.
     pub cs: String,
     pub origin: Origin,
+    /// A number in the pack (a page) is kept as its text.
     pub location: Option<String>,
     /// [`crate::keys::sentence_key`] of `en`.
     pub key: String,
@@ -212,7 +195,9 @@ pub struct PackWord {
     pub spelling: Option<bool>,
     pub spelling_note: Option<String>,
     pub note: Option<String>,
-    pub tag: TagField,
+    /// `None` when the pack leaves `tag` out or sets it to `null`: the pack
+    /// says nothing about the tag, and an existing one stays (R-03).
+    pub tag: Option<PackTag>,
     pub icon: Option<String>,
     /// Explicit order within the source (P-1); `None` = derive (§5.5).
     pub seq: Option<u32>,

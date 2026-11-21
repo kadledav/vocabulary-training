@@ -1,25 +1,54 @@
 # Deploying the vocabulary app
 
-Owner steps for the TrueNAS host (design §12; R-80, R-81, R-82, R-83, R-85).
-`vocab.example.home` stands for the real host name, which is kept out of this
-repository. Commands run as root on the TrueNAS shell unless noted.
+Owner steps for a Docker host with ZFS storage, e.g. TrueNAS (design §12;
+R-80, R-81, R-82, R-83, R-85). The names here are placeholders for your own:
+`vocab.example.home` (host name), `tank` (ZFS pool, mounted at `/mnt/tank`),
+`backup-tank` (replication target), `proxy-net` (the reverse proxy's Docker
+network), `home` (its LAN-only entrypoint), `PUBLIC_PORT` (its public port)
+and user ID `3101`. Commands run as root on the host's shell unless noted.
 
-File here: `docker-compose.example.yml` → the home repo as
+File here: `docker-compose.example.yml` → your deployment repo, e.g. as
 `docker/vocabulary/docker-compose.yml` (configuration is in its
 `environment:`; set `VOCAB_PUBLIC_ORIGIN` to `https://<real host name>` — no
 path, no trailing slash, no `:443`). There is no `.env` and no secret in the
 environment: the password and the connector token are set in the app.
 
+## 0. Image access (once, after the first release)
+
+GitHub creates the package `ghcr.io/kadledav/vocabulary-training` as
+**private** on the first push. Make it public once: GitHub → profile →
+Packages → `vocabulary-training` → Package settings → *Change visibility* →
+Public. Then check that it can be pulled without any login (a fresh, empty
+Docker config):
+
+```sh
+DOCKER_CONFIG="$(mktemp -d)" docker buildx imagetools inspect ghcr.io/kadledav/vocabulary-training:0.1.0
+# or: curl -s 'https://ghcr.io/token?scope=repository:kadledav/vocabulary-training:pull' must print a token
+```
+
+It lists the `linux/amd64` and `linux/arm64` images; an `unauthorized` or
+`denied` error means the package is still private.
+
 ## 1. Storage (once)
 
-TrueNAS UI: Datasets → `tank/services` → Add dataset `vocabulary`, preset
-*Generic*. Then Datasets → `vocabulary` → Permissions → Edit: owner user
-**3101**, owner group **3101** (the app's `user:` in the compose file; change
-the group there if yours differs), access for the owner only (`0700`),
+Create the dataset `tank/services/vocabulary` (TrueNAS UI: Datasets →
+`tank/services` → Add dataset `vocabulary`, preset *Generic*). Then set its
+permissions (Datasets → `vocabulary` → Permissions → Edit): owner user
+**e.g. 3101**, owner group **e.g. 3101** (the app's `user:` in the compose
+file; use your own IDs), access for the owner only (`0700`),
 *Apply recursively*. No `mkdir` is needed: the dataset root is mounted at
 `/data` and the app creates the database there and its cache directory
 `cache/` (mode 0700) on first start. If it cannot, it stops with
 `storage is not usable` in `docker logs vocabulary` — then check the owner.
+
+Limit the dataset so a runaway import or audio cache cannot fill the pool
+(`refquota` counts the data itself, `quota` also its snapshots):
+
+```sh
+zfs set refquota=5G tank/services/vocabulary
+zfs set quota=20G tank/services/vocabulary
+zfs get quota,refquota,used tank/services/vocabulary
+```
 
 Backup is the existing daily replication `tank/services` →
 `backup-tank/services`; after its first run check that
@@ -66,11 +95,13 @@ once). Without a token, the connector routes refuse every request.
 
 ## 3. Network and DNS
 
-- Traefik: the stack attaches to `proxy-net` and has **only** the
-  `vocabulary-home` router on the `home` entrypoint. Never add a router for
-  `websecure`, and never a router without an `entrypoints` label.
-- DNS: add a host override `vocab.example.home` → TrueNAS LAN IP on the
-  LAN/VPN resolver (local DNS), like the other `home` services.
+- Reverse proxy (the example uses Traefik labels): the stack attaches to
+  the proxy's network (`proxy-net`) and has **only** the `vocabulary-home`
+  router on your reverse proxy's LAN-only entrypoint (`home`). Never add a
+  router for the public entrypoint (`websecure`), and never a router
+  without an `entrypoints` label (Traefik would attach it to all of them).
+- DNS: on the resolver your LAN and VPN clients use, add a host override
+  `vocab.example.home` → the host's LAN IP.
 - No mesh VPN route (R-81).
 
 ## 4. Deploy and check
@@ -155,3 +186,14 @@ the stack stopped), start, and set the password with the setup code (§2).
 6. Verify in the UI: the words are there and a word's last review date is as
    expected. The restored database brings the password (and connector token)
    it had then; if that password is unknown, reset it (§2).
+7. Log out every session the snapshot brought back (devices that were
+   logged in back then, or have been logged out since). Like
+   `reset-password` it runs with the stack stopped:
+
+   ```sh
+   docker compose stop vocabulary            # in docker/vocabulary/
+   docker compose run --rm vocabulary logout-all
+   docker compose up -d
+   ```
+
+   Then log in again on each device.

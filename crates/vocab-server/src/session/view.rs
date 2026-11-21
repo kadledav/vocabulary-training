@@ -4,7 +4,7 @@
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-use super::{ItemOrigin, SessionId, SessionStatus, build};
+use super::{BlockKind, ItemOrigin, SessionId, SessionStatus, build};
 use crate::catalog::{self, PresentedSentence, SourceId, WordId, WordPresentation};
 use crate::clock::{Moment, StudyDay};
 use crate::scheduler::{
@@ -59,6 +59,8 @@ pub struct ItemView {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SessionView {
     pub id: SessionId,
+    /// `regular`, `extra` (R-63) or `more_new`.
+    pub kind: BlockKind,
     pub study_day: StudyDay,
     pub scope_source_id: Option<SourceId>,
     pub block_no: i64,
@@ -170,6 +172,7 @@ pub fn items(conn: &Connection, id: &SessionId) -> rusqlite::Result<Vec<ItemRow>
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionRow {
     pub id: SessionId,
+    pub kind: BlockKind,
     pub study_day: StudyDay,
     pub scope: Option<SourceId>,
     pub block_no: i64,
@@ -181,13 +184,15 @@ pub struct SessionRow {
 
 pub fn session_row(conn: &Connection, id: &SessionId) -> rusqlite::Result<Option<SessionRow>> {
     conn.query_row(
-        "SELECT study_day, scope_source_id, block_no, block_size, status, started_at, finished_at \
-         FROM practice_session WHERE id = ?1",
+        "SELECT study_day, scope_source_id, block_no, block_size, status, started_at, finished_at, \
+         kind FROM practice_session WHERE id = ?1",
         [id.as_str()],
         |row| {
             let status: String = row.get(4)?;
+            let kind: String = row.get(7)?;
             Ok(SessionRow {
                 id: id.clone(),
+                kind: BlockKind::parse(&kind).unwrap_or(BlockKind::Regular),
                 study_day: row.get(0)?,
                 scope: row.get::<_, Option<i64>>(1)?.map(SourceId::new),
                 block_no: row.get(2)?,
@@ -350,6 +355,7 @@ pub fn session_view(
     let total = count(views.len());
     Ok(Some(SessionView {
         id: row.id,
+        kind: row.kind,
         study_day: row.study_day,
         scope_source_id: row.scope,
         block_no: row.block_no,

@@ -249,7 +249,8 @@ async fn r82_a_valid_session_passes_the_gate_of_every_session_route() {
     let app = app().await;
     let cookie = app.login().await;
     for route in with_access(Access::Session) {
-        if route.path == "/api/auth/logout" {
+        // The two that end the session they are called with.
+        if route.path == "/api/auth/logout" || route.path == "/api/auth/logout-all" {
             continue;
         }
         let uri = concrete(route.path);
@@ -421,15 +422,21 @@ async fn r82_a_new_password_invalidates_every_other_session() {
         ))
         .await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        first.get("/api/today", &old).await.status(),
-        StatusCode::UNAUTHORIZED
-    );
+    // R-82 (fix round R1): the changing device continues with a new token;
+    // its old one is as dead as every other session.
+    let reissued = common::cookie_pair_of(&response).expect("new session cookie");
+    assert_ne!(reissued, current);
+    for dead in [&old, &current] {
+        assert_eq!(
+            first.get("/api/today", dead).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
     assert_eq!(first.sessions_in_db(), 1);
     // A restart keeps the remaining session.
     let second = app_with(first.dir, common::auth());
     assert_eq!(
-        second.get("/api/today", &current).await.status(),
+        second.get("/api/today", &reissued).await.status(),
         StatusCode::OK
     );
 }
@@ -469,9 +476,11 @@ async fn r82_failures_older_than_15_minutes_do_not_count() {
 }
 
 #[tokio::test]
-async fn r82_lockouts_double_from_15_minutes_up_to_24_hours_while_attempts_continue() {
+async fn r82_lockouts_double_while_attempts_continue_until_the_daily_limit_locks_a_day() {
     let app = app().await;
-    let expected_minutes: [i64; 10] = [15, 30, 60, 120, 240, 480, 960, 1440, 1440, 1440];
+    // 15, 30, 60 and 120 minutes; the doubling beyond that is only reached
+    // by slower guessing (unit tests of the throttle), because …
+    let expected_minutes: [i64; 4] = [15, 30, 60, 120];
     for expected in expected_minutes {
         let response = app.fail_logins(5).await;
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -490,6 +499,20 @@ async fn r82_lockouts_double_from_15_minutes_up_to_24_hours_while_attempts_conti
         );
         app.advance(minutes(1));
     }
+    // … the 21st failed login within 24 hours locks logins for a whole day.
+    let response = app.fail_logins(1).await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(retry_after(&response), 24 * 3600);
+    app.advance(minutes(24 * 60 - 1));
+    assert_eq!(
+        app.login_with(common::PASSWORD).await.status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    app.advance(minutes(1));
+    assert_eq!(
+        app.login_with(common::PASSWORD).await.status(),
+        StatusCode::OK
+    );
 }
 
 #[tokio::test]
@@ -903,9 +926,10 @@ fn assert_security_headers(response: &Response, what: &str) {
         get("content-security-policy"),
         "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; \
          media-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; \
-         frame-ancestors 'none'; form-action 'self'",
+         frame-ancestors 'none'; form-action 'self'; require-trusted-types-for 'script'",
         "{what}"
     );
+    assert_eq!(get("cross-origin-resource-policy"), "same-origin", "{what}");
     assert_eq!(get("x-content-type-options"), "nosniff", "{what}");
     assert_eq!(get("referrer-policy"), "same-origin", "{what}");
     assert_eq!(get("cross-origin-opener-policy"), "same-origin", "{what}");

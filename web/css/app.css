@@ -82,6 +82,7 @@
 body {
   margin: 0;
   min-height: 100vh;
+  min-height: 100dvh;
   background: var(--bg);
   color: var(--text);
 }
@@ -89,7 +90,8 @@ body {
 main {
   max-width: 40rem;
   margin: 0 auto;
-  padding: 1.5rem 1rem;
+  padding: 1.5rem max(1rem, env(safe-area-inset-right, 0px)) calc(1.5rem + env(safe-area-inset-bottom, 0px))
+    max(1rem, env(safe-area-inset-left, 0px));
   /* Long words (pack text) wrap instead of widening the page. */
   overflow-wrap: break-word;
 }
@@ -114,7 +116,31 @@ h1 {
 header {
   max-width: 40rem;
   margin: 0 auto;
-  padding: 0.75rem 1rem 0;
+  padding: max(0.75rem, env(safe-area-inset-top, 0px)) max(1rem, env(safe-area-inset-right, 0px)) 0
+    max(1rem, env(safe-area-inset-left, 0px));
+}
+
+/* Practice and login have no navigation: no empty header padding (bug 6). */
+header:empty {
+  display: none;
+}
+
+body.in-practice main {
+  padding-top: env(safe-area-inset-top, 0px);
+}
+
+.busy-banner {
+  max-width: 40rem;
+  margin: 0.5rem auto 0;
+  padding: 0.5rem 1rem;
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  color: var(--text);
+  text-align: center;
+}
+
+.busy-banner:empty {
+  display: none;
 }
 
 nav.top {
@@ -177,8 +203,15 @@ select {
 
 textarea {
   font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-  font-size: 0.85rem;
+  /* 16 px at least: smaller text makes iOS zoom the page on focus (bug 13). */
+  font-size: max(1rem, 16px);
   resize: vertical;
+}
+
+input,
+select,
+textarea {
+  font-size: max(1rem, 16px);
 }
 
 .actions {
@@ -201,6 +234,8 @@ a.button {
   background: transparent;
   color: var(--accent);
   cursor: pointer;
+  /* No double-tap zoom delay on phones. */
+  touch-action: manipulation;
 }
 
 button.primary,
@@ -316,6 +351,9 @@ ul.issues code,
 details > summary {
   cursor: pointer;
   color: var(--muted);
+  /* 44 px tap rows (bug 8). */
+  min-height: 2.75rem;
+  padding: 0.625rem 0;
 }
 
 /* ── word view ──────────────────────────────────────────────────────────── */
@@ -438,6 +476,8 @@ fieldset legend {
   display: flex;
   flex-direction: column;
   line-height: 1.3;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .counts p {
@@ -454,7 +494,9 @@ ol.forecast {
   padding: 0;
   margin: 0;
   display: grid;
-  grid-template-columns: repeat(7, 1fr);
+  /* Seven equal columns that may shrink below their text: with large text
+     the labels wrap inside them instead of widening the page (bug 9). */
+  grid-template-columns: repeat(7, minmax(0, 1fr));
   gap: 0.25rem;
   text-align: center;
 }
@@ -470,6 +512,7 @@ ol.forecast li {
 .fc-day {
   font-size: 0.8rem;
   color: var(--muted);
+  overflow-wrap: anywhere;
 }
 
 .fc-count {
@@ -512,6 +555,14 @@ body.in-practice main {
   flex-direction: column;
   min-height: 100vh;
   min-height: 100dvh;
+}
+
+/* "Pause" ends the block for now; unrated cards stay due (U7). */
+.pause-button {
+  min-height: 2.75rem;
+  padding: 0 0.75rem;
+  border-color: var(--border);
+  color: var(--text);
 }
 
 .practice-top {
@@ -775,12 +826,18 @@ dl.shortcuts dd {
   margin: 0;
 }
 
-/* Bottom bar: pinned to the bottom of the viewport, thumb reach (research §7). */
+/* Bottom bar: pinned to the bottom of the viewport, thumb reach (research §7).
+   Never taller than 40 % of the screen, so the card always shows (bug 1);
+   whatever does not fit scrolls inside the bar. */
 .practice-bottom {
   position: sticky;
   bottom: 0;
   background: var(--bg);
   padding: 0.5rem 0 calc(0.75rem + env(safe-area-inset-bottom, 0px));
+  max-height: 40vh;
+  max-height: 40dvh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .criterion {
@@ -875,6 +932,24 @@ button.rate.outlined {
   }
 }
 
+/* The compact legend: one line in the card's flow above the bar (bug 1). */
+.legend-line {
+  margin: 1rem 0 0;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.legend-item b {
+  color: var(--rate);
+}
+
+/* The pressed state of the rating being saved (U3). */
+button.rate.chosen {
+  outline: 3px solid var(--text);
+  outline-offset: 2px;
+  transform: scale(0.96);
+}
+
 /* Legend (research §10c): definitions, always on during the first blocks. */
 dl.legend {
   margin: 0 0 0.5rem;
@@ -907,19 +982,18 @@ dl.legend {
 
 /* ── toast ──────────────────────────────────────────────────────────────── */
 
+/* The toast is a row of the bottom bar: it never covers the card (bug 2). */
 .toast-slot {
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 100%;
   display: flex;
   justify-content: center;
-  pointer-events: none;
-  padding-bottom: 0.5rem;
+}
+
+.toast-slot:not(:empty) {
+  margin-bottom: 0.5rem;
 }
 
 .toast {
-  pointer-events: auto;
+  max-width: 100%;
   display: flex;
   align-items: center;
   gap: 1rem;
@@ -1040,10 +1114,10 @@ dl.legend {
 }
 
 .look-again a {
-  display: inline-flex;
-  align-items: center;
+  display: block;
+  padding: 0.625rem 0;
   min-height: 2.75rem;
-  min-width: 2.75rem;
+  overflow-wrap: anywhere;
 }
 
 .saving {
@@ -1117,5 +1191,175 @@ form.credentials input[type="password"],
 
 .connector-token input[type="text"] {
   font-family: ui-monospace, monospace;
-  font-size: 0.85rem;
+  font-size: max(1rem, 16px);
+}
+
+/* ── R1-C: end of the day, notices, hints, files, tap targets ────────────── */
+
+.stack {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.stack > p {
+  margin: 0;
+}
+
+.end-title {
+  margin: 0 0 0.75rem;
+  font-size: 1.15rem;
+  font-weight: 700;
+}
+
+.summary-next:not(:empty) {
+  margin: 1rem 0;
+}
+
+.notice-box {
+  margin: 0 0 1rem;
+  padding: 0.75rem 1rem;
+  border-radius: var(--radius);
+  border-left: 0.25rem solid var(--rate-3);
+  background: var(--surface);
+  font-weight: 600;
+}
+
+.field-error {
+  margin: 0.25rem 0 0;
+  color: var(--error);
+  font-weight: 600;
+}
+
+.field-error:empty {
+  display: none;
+}
+
+input[aria-invalid="true"] {
+  border-color: var(--error);
+}
+
+/* The silent-switch hint and "no audio" note sit above the card. */
+.audio-note .hint {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin: 0 0 0.5rem;
+  padding: 0.25rem 0.25rem 0.25rem 0.75rem;
+  border-radius: var(--radius);
+  background: var(--surface);
+  font-size: 0.9rem;
+}
+
+.audio-note .hint p {
+  flex: 1;
+  margin: 0;
+}
+
+.play.playing {
+  background: var(--accent);
+  color: var(--bg);
+  border-color: var(--accent);
+}
+
+/* Words: the whole row is the link (bug 8). */
+.word-rows > li {
+  padding: 0;
+}
+
+a.word-row {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-height: 2.75rem;
+  padding: 0.5rem 0;
+  color: var(--text);
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+
+a.word-row .headword {
+  color: var(--accent);
+}
+
+a.back-link,
+a.tap-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: 2.75rem;
+}
+
+/* Import: files and drag and drop. */
+.drop-zone {
+  border-radius: 0.5rem;
+}
+
+.drop-zone.dragging {
+  outline: 2px dashed var(--accent);
+  outline-offset: 4px;
+}
+
+.drop-hint {
+  margin: 0.25rem 0 0;
+}
+
+@media (pointer: coarse) {
+  .drop-hint {
+    display: none;
+  }
+}
+
+.files-line {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.25rem 0.75rem;
+  overflow-wrap: anywhere;
+}
+
+.files-line p {
+  flex: 1 1 12rem;
+  margin: 0;
+}
+
+.files-line:empty {
+  display: none;
+}
+
+.link-button {
+  border-color: transparent;
+  padding: 0 0.5rem;
+}
+
+.actions.wrap,
+.actions {
+  flex-wrap: wrap;
+}
+
+.issues-title {
+  margin: 0.5rem 0 0;
+  font-weight: 700;
+}
+
+.issue-where {
+  font-weight: 600;
+}
+
+ul.issues.warning {
+  color: var(--muted);
+}
+
+.import-done {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.done-line {
+  font-weight: 700;
+  color: var(--ok);
+}
+
+.report,
+.recent li,
+.word-head {
+  overflow-wrap: anywhere;
 }

@@ -2,12 +2,17 @@
 /**
  * Block summary (design §7.1 screen 5; research wireframe 6): rating
  * distribution in the rating colours, words to look at again, what is due
- * next, and Done / Continue +N.
+ * next, Done, and what comes next: Continue with what the next block holds,
+ * or "Done for today" with "Practise more" / "Learn N more new words"
+ * (owner feedback F1).
  */
 
 import { h, mount } from '../dom.js';
 import { RATINGS } from '../rating.js';
-import { fetchToday, startBlock } from '../session.js';
+import { dayDone, dueTomorrow } from '../day-plan.js';
+import { nextSteps } from '../next-steps.js';
+import { fetchToday } from '../session.js';
+import { loadSettings } from '../settings.js';
 import { getSummary } from '../summary-store.js';
 
 /**
@@ -45,35 +50,15 @@ function distribution(summary) {
 export function renderSummary(root, isCurrent) {
   const entry = getSummary();
   if (!entry) {
-    mount(root, h('h1', {}, 'Summary'), h('p', {}, 'No finished block to show. ', h('a', { href: '#/' }, 'Back to Today'), '.'));
+    // Nothing to show after a reload: Today is the useful screen (U7).
+    window.location.replace('#/');
     return;
   }
-  const { summary, scope, blockSize } = entry;
+  const { summary, scope } = entry;
   const dueLine = h('p', { class: 'muted', 'data-testid': 'due-line' });
   const message = h('p', { class: 'status', role: 'status' });
-  const continueButton = h(
-    'button',
-    {
-      type: 'button',
-      'data-testid': 'continue',
-      onclick: async () => {
-        continueButton.disabled = true;
-        const answer = await startBlock({ kind: 'continue', scope });
-        if (!isCurrent()) return;
-        continueButton.disabled = false;
-        if (!answer.ok) {
-          message.textContent = answer.message;
-          return;
-        }
-        if (!answer.data.session) {
-          message.textContent = 'Nothing more to practise right now.';
-          return;
-        }
-        window.location.hash = '#/practice';
-      },
-    },
-    `Continue +${blockSize}`,
-  );
+  const next = h('div', { class: 'summary-next' });
+  const done = h('a', { class: 'button', href: '#/', 'data-testid': 'done' }, 'Done');
 
   mount(
     root,
@@ -109,20 +94,29 @@ export function renderSummary(root, isCurrent) {
           )
         : null,
       dueLine,
+      next,
       message,
-      h(
-        'div',
-        { class: 'actions summary-actions' },
-        h('a', { class: 'button', href: '#/', 'data-testid': 'done' }, 'Done'),
-        continueButton,
-      ),
+      h('div', { class: 'actions summary-actions' }, done),
     ),
   );
 
   void (async () => {
-    const answer = await fetchToday(scope);
+    const [answer, settings] = await Promise.all([fetchToday(scope), loadSettings()]);
     if (!isCurrent() || !answer.ok) return;
-    const tomorrow = answer.data.forecast[0]?.due ?? 0;
-    dueLine.textContent = `Due now ${answer.data.due_now} · tomorrow ${tomorrow}`;
+    const today = answer.data;
+    if (!dayDone(today, settings.block_size)) dueLine.textContent = `Due now ${today.due_now} · tomorrow ${dueTomorrow(today)}`;
+    if (today.active_session) return;
+    mount(
+      next,
+      nextSteps({
+        today,
+        scope,
+        blockSize: settings.block_size,
+        perDay: settings.new_per_day,
+        isCurrent,
+        message,
+        startTestId: 'continue',
+      }),
+    );
   })();
 }

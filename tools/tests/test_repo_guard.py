@@ -206,9 +206,112 @@ class Renovate(GuardCase):
         cfg["extends"].append("security:minimumReleaseAgeNpm")
         self.assertFlags(self.problems({}, cfg), "top-level minimumReleaseAge", "security:minimumReleaseAgeNpm")
 
+    def test_r91_no_automerge_ignore_tests_or_weaker_age_rules(self):
+        cfg = json.loads(json.dumps(RENOVATE_OK))
+        cfg["packageRules"].append({"matchManagers": ["npm"], "automerge": True, "ignoreTests": True,
+                                    "internalChecksFilter": "flexible",
+                                    "minimumReleaseAgeBehaviour": "timestamp-optional"})
+        self.assertFlags(self.problems({}, cfg), ".automerge = True", ".ignoreTests = True",
+                         ".internalChecksFilter = 'flexible'", "timestamp-optional")
+        del cfg["internalChecksFilter"]
+        self.assertFlags(self.problems({}, cfg), "top-level internalChecksFilter")
+
     def test_r91_repository_config_passes(self):
         self.assertEqual(guard.check_renovate(REPO), [])
 
+
+
+class SkippedDirectories(GuardCase):
+    def test_r95_agent_worktrees_at_the_root_are_skipped_only_there(self):
+        problems = self.problems({".claude/worktrees/a/vocabulary.db": "x", "sub/.claude/vocabulary.db": "x"})
+        self.assertFlags(problems, "sub/.claude/vocabulary.db")
+        self.assertFalse(any(p.startswith(".claude/") for p in problems), problems)
+
+
+class MoreSecrets(GuardCase):
+    def test_r82_key_blocks_tokens_and_password_literals(self):
+        problems = self.problems(
+            {
+                "a.txt": "-----BEGIN PGP " + "PRIVATE KEY BLOCK-----\n",
+                "b.txt": "-----BEGIN OPENSSH " + "PRIVATE KEY-----\n",
+                "c.yml": "token: " + "eyJhbGciOiJIUzI1NiJ9" + ".eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghijklmnop\n",
+                "d.sh": "curl -H 'Authorization: " + "Bearer " + "abcdefghijklmnopqrstuvwxyz012345'\n",
+                "e.toml": "pass" + 'word = "hunter2hunter2"\n',
+                "src/f.rs": 'let c = Config { pass' + 'word: "correct-horse" };\n',
+            }
+        )
+        self.assertFlags(problems, "a.txt:1: looks like a secret: private key", "b.txt:1", "c.yml:1: looks like a secret: JSON Web Token",
+                         "d.sh:1: looks like a secret: bearer token", "e.toml:1: looks like a secret: password literal",
+                         "src/f.rs:1: looks like a secret: password literal")
+
+    def test_r82_test_passwords_placeholders_and_code_are_fine(self):
+        problems = self.problems(
+            {
+                "tools/tests/test_x.py": "pass" + 'word = "anything-goes-in-tests"\n',
+                "web/e2e/login.spec.js": "const pass" + "word = 'test-pw'\n",
+                "tools/smoke.py": '{"pass' + 'word": "test-wrong-password"}\nheaders["Authorization"] = f"Bearer {token}"\n',
+                "deploy/x.yml": "pass" + 'word: "${PASSWORD}"\n',
+            }
+        )
+        self.assertEqual(problems, [])
+
+
+class PersonalData(GuardCase):
+    def test_r95_home_paths_private_addresses_and_emails(self):
+        problems = self.problems(
+            {
+                "a.md": "/Us" + "ers/alice/dev/x and /ho" + "me/bob/.ssh\n",
+                "b.yml": "host: 192.16" + "8.1.20\nother: 10.0" + ".0.7\nts: 100.10" + "0.1.2\nlink: 169.25" + "4.1.1\n",
+                "c.toml": 'authors = ["Alice <alice@exam' + 'ple.org>", "bob@mail' + 'box.cz"]\n',
+            }
+        )
+        self.assertFlags(problems, "a.md:1: absolute home directory '/Us" + "ers/alice/'", "absolute home directory '/ho" + "me/bob/'",
+                         "b.yml:1: private IPv4", "b.yml:2: private IPv4", "b.yml:3: private IPv4", "b.yml:4: private IPv4",
+                         "c.toml:1: e-mail address 'bob@mail" + "box.cz'")
+        self.assertFalse(any("alice@" in p for p in problems), problems)  # example.org is fine
+
+    def test_r95_allowed_forms_are_not_flagged(self):
+        problems = self.problems(
+            {
+                "a.md": ("127.0.0.1, 0.0.0.0, 192.0.2.10, 198.51.100.1, 203.0.113.5, version 1.10.0.1, 2.192.168.1.1.3\n"
+                         "/home/runner/work, /Users/<you>/x, /home/$USER/x\n"
+                         "Co-Authored-By: X <noreply@anthrop" + "ic.com>, git@github.com:o/r.git, 1234+x@users.noreply.github.com\n"
+                         "@playwright/test, actions/checkout@v7, typescript@7.0.2\n"),
+            }
+        )
+        self.assertEqual(problems, [])
+
+    def test_r95_real_hosts_in_config_files_only_when_allowed(self):
+        problems = self.problems(
+            {
+                "deploy/compose.yml": "rule: Host(`vocab.my-home.n" + "et`)\nimage: ghcr.io/o/r:1\norigin: https://vocab.example.home\n",
+                "docker/Dockerfile.x": "RUN echo https://mirror.some" + "where.de/x\n",
+                ".github/workflows/x.yml": "url: https://docs.github.com/x and https://registry.npmjs.org/\n",
+                "docs/notes.md": "see https://www.some" + "where.de (docs are not config)\n",
+                "testdata/packs/valid/a.json": '{"url": "https://www.bbc.c' + 'o.uk/x"}\n',
+                "deploy/labels.yml": "labels: org.opencontainers.image.title, com.docker.compose.project\n",
+            }
+        )
+        self.assertFlags(problems, "deploy/compose.yml:1: host name 'vocab.my-home.n" + "et'",
+                         "docker/Dockerfile.x:1: host name 'mirror.some" + "where.de'")
+        self.assertEqual(len([p for p in problems if "host name" in p]), 2, problems)
+
+    def test_r95_generated_notices_are_exempt(self):
+        self.assertEqual(self.problems({"THIRD-PARTY-NOTICES.txt": "Copyright (c) A <a@mail" + "box.cz>\n"}), [])
+
+
+class RustComments(GuardCase):
+    def test_r92_visibility_in_comments_is_ignored_but_not_in_code(self):
+        source = (
+            "// a pub(crate) helper would be wrong here\n"
+            "/* pub(super) fn x() {} /* nested pub(crate) */ still comment pub(self) */\n"
+            'const S: &str = "// not a comment"; pub(crate) fn a() {}\n'
+            'const R: &str = r#"/* not a comment */"#; pub(super) fn b() {}\n'
+            "/// docs mention pub(crate)\n"
+        )
+        problems = self.problems({"crates/a/src/lib.rs": source})
+        self.assertFlags(problems, "crates/a/src/lib.rs:3:", "crates/a/src/lib.rs:4:")
+        self.assertEqual(len(problems), 2, problems)
 
 
 class RustImages(GuardCase):

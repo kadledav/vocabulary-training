@@ -8,9 +8,13 @@
  * with "More" open until Next. The toast, ↶ and `U` undo the last rating.
  * When every item is rated, "See summary" finishes the block.
  *
- * Every phase change opens the 250 ms input guard again, for the reveal and
- * Next buttons as well as the ratings, so a double tap never acts on the
- * card that appears under the finger. A rating whose answer was lost
+ * Every phase change opens the 250 ms input guard again for the reveal and
+ * Next buttons; ratings wait 500 ms after the reveal, and a rating tap that
+ * lands where the reveal tap landed within 600 ms is ignored, so even a
+ * slow double tap never rates the card that appears under the finger. The
+ * tapped rating shows pressed at once; the "Rated … Undo" toast is a row of
+ * the bottom bar, never over the card. A rating refused because the study
+ * day rolled over is reported on Today. A rating whose answer was lost
  * (network error, timeout) is never silently re-sent with another grade:
  * the owner retries the same rating or first finds out what was saved.
  */
@@ -28,11 +32,22 @@ import {
   progress,
   wordSpeech,
 } from '../practice/model.js';
-import { legend, ratingBar } from '../practice/rating-bar.js';
-import { INPUT_GUARD_MS, guardOpen, isGrade, legendVisible, rating, toastPlan, toastText } from '../rating.js';
-import { fetchCurrent, fetchToday, finishBlock, postRating, undoRating } from '../session.js';
+import { legend, legendLine, ratingBar } from '../practice/rating-bar.js';
+import {
+  INPUT_GUARD_MS,
+  guardOpen,
+  isGrade,
+  legendVisible,
+  rating,
+  ratingGuardOpen,
+  sameSpotTap,
+  toastPlan,
+  toastText,
+} from '../rating.js';
+import { setNotice } from '../notice.js';
+import { fetchCurrent, fetchToday, finishBlock, postRating, takeStarted, undoRating } from '../session.js';
 import { DEFAULT_SETTINGS, loadSettings } from '../settings.js';
-import { speak, speechAvailable, stopSpeaking } from '../speech.js';
+import { prepareSpeech, speak, speechAvailable, stopSpeaking } from '../speech.js';
 import { setSummary } from '../summary-store.js';
 import { Toast } from '../toast.js';
 
@@ -54,7 +69,7 @@ const SHORTCUTS = [
   ['M', 'more: note, forms, sentences'],
   ['S / R', 'speak sentence / word'],
   ['E', 'word detail'],
-  ['Esc', 'close the help · end the block'],
+  ['Esc', 'close the help · pause the block'],
   ['?', 'this help'],
 ];
 
@@ -62,6 +77,29 @@ const SHORTCUTS = [
 const SAVING_DELAY_MS = 150;
 /** The "already saved" toast stays longer: it asks for a check. */
 const ALREADY_SAVED_TOAST_MS = 8000;
+/** The silent-switch hint has been dismissed on this device. */
+const SILENT_HINT_KEY = 'vocab.silent-hint-seen';
+
+/** Is this a touch device (where the phone's silent switch may mute speech)? */
+function touchDevice() {
+  return typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
+}
+
+function silentHintSeen() {
+  try {
+    return localStorage.getItem(SILENT_HINT_KEY) === '1';
+  } catch {
+    return true;
+  }
+}
+
+function rememberSilentHint() {
+  try {
+    localStorage.setItem(SILENT_HINT_KEY, '1');
+  } catch {
+    // No storage: the hint may show again next time.
+  }
+}
 
 /** Elapsed milliseconds on a monotonic clock. */
 function now() {
@@ -135,7 +173,8 @@ export function renderPractice(root, isCurrent) {
   /** @type {{ session: Session | null, item: Item | null, phase: Phase, phaseAt: number, revealedAt: number,
    *           shownAt: number, moreOpen: boolean, helpOpen: boolean, legendAlways: boolean, busy: boolean,
    *           phaseKey: string | null, pending: PendingRating | null, unsure: (PendingRating & { why: string }) | null,
-   *           settings: import('../settings.js').Settings }} */
+   *           settings: import('../settings.js').Settings, revealTap: { x: number, y: number, t: number } | null,
+   *           chosen: Grade | null }} */
   const state = {
     session: null,
     item: null,
@@ -152,8 +191,11 @@ export function renderPractice(root, isCurrent) {
     pending: null,
     unsure: null,
     settings: DEFAULT_SETTINGS,
+    revealTap: null,
+    chosen: null,
   };
   const speechOk = speechAvailable();
+  prepareSpeech();
 
   const top = h('div', { class: 'practice-top' });
   const help = h('div', { class: 'practice-help' });
@@ -164,8 +206,9 @@ export function renderPractice(root, isCurrent) {
   const bottom = h('div', { class: 'practice-bottom' }, toastSlot, saving, bottomContent);
   const live = h('p', { class: 'sr-only', role: 'status', 'aria-live': 'polite' });
   const errorLine = h('p', { class: 'error practice-error', role: 'alert', 'data-testid': 'practice-error' });
+  const audioNote = h('div', { class: 'audio-note', 'data-testid': 'audio-note' });
   const toast = new Toast(toastSlot);
-  const screen = h('div', { class: 'practice' }, top, help, errorLine, body, bottom, live);
+  const screen = h('div', { class: 'practice' }, top, help, errorLine, audioNote, body, bottom, live);
   /** @type {(() => void) | null} */
   let releaseWakeLock = null;
 
@@ -243,24 +286,67 @@ export function renderPractice(root, isCurrent) {
 
   // ── audio ────────────────────────────────────────────────────────────────
 
+  /** The last pointer-down on the screen, to tell where the reveal tap landed. */
+  /** @type {{ x: number, y: number, t: number } | null} */
+  let lastPointer = null;
+  /** The rating gesture in progress started where the reveal tap landed. */
+  let ignoreRatingTap = false;
+
+  /**
+   * Say why nothing plays, or show the silent-switch hint once on touch
+   * devices (U5). Both sit above the card, never over it.
+   *
+   * @param {import('../speech.js').SpeakResult} result
+   */
+  const afterSpeak = (result) => {
+    if (result === 'unavailable') {
+      announce('Speech is not available in this browser.');
+      return;
+    }
+    if (result === 'no-voice') {
+      mount(audioNote, h('p', { class: 'hint', role: 'status' }, 'No audio on this device yet: it has no English voice of its own.'));
+      return;
+    }
+    if (touchDevice() && !silentHintSeen() && audioNote.childElementCount === 0) {
+      const ok = h('button', { type: 'button', class: 'hint-ok' }, 'OK');
+      ok.addEventListener('click', () => {
+        rememberSilentHint();
+        mount(audioNote);
+      });
+      mount(audioNote, h('div', { class: 'hint', 'data-testid': 'silent-hint' }, h('p', {}, 'No sound? Check your phone’s silent switch.'), ok));
+    }
+  };
+
+  /**
+   * Play `text`, showing the playing state on `button` (or the play button
+   * of that kind on screen, for the S/R keys).
+   *
+   * @param {string} text
+   * @param {'sentence' | 'word'} what
+   */
+  const play = (text, what) => {
+    const button = body.querySelector(`button.play-${what}`);
+    const result = speak(text, { voice: state.settings.voice, speed: state.settings.speed }, {
+      onStart: () => button?.classList.add('playing'),
+      onEnd: () => button?.classList.remove('playing'),
+    });
+    afterSpeak(result);
+  };
+
   const speakSentence = () => {
     const item = state.item;
     if (!item || state.phase === 'complete') return;
     const sentence =
       item.card.format === 'sentence' && item.sentence ? item.sentence : state.phase === 'question' ? null : exampleSentence(item);
     if (!sentence) return;
-    if (!speak(plainText(sentence.en), { voice: state.settings.voice, speed: state.settings.speed })) {
-      announce('Speech is not available in this browser.');
-    }
+    play(plainText(sentence.en), 'sentence');
   };
   const speakWord = () => {
     const item = state.item;
     if (!item || state.phase === 'complete') return;
     // On the question side of a sentence card only the sentence plays.
     if (state.phase === 'question' && item.card.format === 'sentence' && item.sentence) return;
-    if (!speak(wordSpeech(item.word), { voice: state.settings.voice, speed: state.settings.speed })) {
-      announce('Speech is not available in this browser.');
-    }
+    play(wordSpeech(item.word), 'word');
   };
   const audio = { speechOk, onSpeakSentence: speakSentence, onSpeakWord: speakWord };
 
@@ -273,7 +359,18 @@ export function renderPractice(root, isCurrent) {
     const shown = state.phase === 'complete' ? p.total : state.phase === 'question' || state.phase === 'answer' ? p.position : p.answered;
     mount(
       top,
-      h('button', { type: 'button', class: 'icon-button', 'aria-label': 'End block (Esc)', title: 'End block (Esc)', onclick: () => void end() }, '✕'),
+      h(
+        'button',
+        {
+          type: 'button',
+          class: 'pause-button',
+          'aria-label': 'Pause: end this block for now; unrated cards stay due (Esc)',
+          title: 'Pause — unrated cards stay due (Esc)',
+          'data-testid': 'pause',
+          onclick: () => void end(),
+        },
+        'Pause',
+      ),
       h(
         'div',
         { class: 'progress' },
@@ -359,6 +456,7 @@ export function renderPractice(root, isCurrent) {
         showMore: hasMore(item),
         onToggleMore: () => toggleMore(true),
       }),
+      state.phase === 'answer' && !state.unsure && state.legendAlways && !state.helpOpen ? legendLine() : null,
     );
   };
 
@@ -395,11 +493,7 @@ export function renderPractice(root, isCurrent) {
     } else if (state.phase === 'answer' && state.unsure) {
       mount(bottomContent, unsurePanel());
     } else if (state.phase === 'answer') {
-      mount(
-        bottomContent,
-        state.legendAlways && !state.helpOpen ? legend() : null,
-        ratingBar((grade) => void rate(grade)),
-      );
+      mount(bottomContent, ratingBar((grade) => void rate(grade), state.busy ? state.chosen : null));
     } else if (state.phase === 'feedback') {
       mount(
         bottomContent,
@@ -456,6 +550,8 @@ export function renderPractice(root, isCurrent) {
 
   const reveal = () => {
     if (state.phase !== 'question' || !state.item || !advanceReady()) return;
+    // Where the finger was when the answer appeared (null for keys).
+    state.revealTap = handlingKey === null && lastPointer && now() - lastPointer.t < 1000 ? lastPointer : null;
     setPhase('answer');
     state.revealedAt = state.phaseAt;
     state.moreOpen = moreOpenOnReveal(state.item);
@@ -485,6 +581,7 @@ export function renderPractice(root, isCurrent) {
     state.helpOpen = !state.helpOpen;
     renderTop();
     renderHelp();
+    if (state.phase === 'answer') renderBody();
     renderBottom();
   };
 
@@ -576,6 +673,10 @@ export function renderPractice(root, isCurrent) {
         if (await refresh()) showAlreadySaved(pending.itemId);
         return;
       }
+      if (answer.code === 'session_expired') {
+        dayRolledOver();
+        return;
+      }
       if (answer.status === 409 || answer.status === 404) {
         showError('The block changed (perhaps in another window), so it was loaded again.');
         await reload();
@@ -583,12 +684,14 @@ export function renderPractice(root, isCurrent) {
       }
       showError(`The rating was not saved because ${reason(answer)}. Rate again.`);
       state.unsure = null;
+      state.chosen = null;
       renderBottom();
       return;
     }
     clearError();
     state.pending = null;
     state.unsure = null;
+    state.chosen = null;
     state.session = answer.data.session;
     const plan = toastPlan({ grade: pending.grade, msSinceReveal: sinceReveal, lastFailed: item.card.last_failed || item.card.is_repeat });
     toast.show({ text: toastText(pending.grade), grade: pending.grade, ms: plan.ms, pulse: plan.pulse, onUndo: () => void undo() });
@@ -598,7 +701,11 @@ export function renderPractice(root, isCurrent) {
   /** @param {Grade} grade */
   const rate = async (grade) => {
     const item = state.item;
-    if (state.busy || state.phase !== 'answer' || !state.session || !item || !inputReady()) return;
+    const tapIgnored = ignoreRatingTap;
+    ignoreRatingTap = false;
+    if (state.busy || state.phase !== 'answer' || !state.session || !item) return;
+    // Too soon after the reveal, or the second tap of a double tap on it.
+    if (!ratingGuardOpen(now() - state.revealedAt) || (handlingKey === null && tapIgnored)) return;
     if (state.unsure) {
       // Only the unsure grade may be sent again until it is resolved.
       if (grade === state.unsure.grade) await retry();
@@ -610,6 +717,11 @@ export function renderPractice(root, isCurrent) {
       state.pending && state.pending.itemId === item.item_id && state.pending.grade === grade
         ? state.pending
         : { itemId: item.item_id, grade, id: crypto.randomUUID() };
+    // Acknowledge the tap at once (U3): the button shows pressed while saving.
+    state.chosen = grade;
+    for (const button of bottomContent.querySelectorAll('button.rate')) {
+      button.classList.toggle('chosen', button.getAttribute('data-grade') === String(grade));
+    }
     await submit(pending);
   };
 
@@ -665,6 +777,8 @@ export function renderPractice(root, isCurrent) {
       if (answer.code === 'nothing_to_undo') {
         showError('There is no rating to undo.');
         await reload();
+      } else if (answer.code === 'session_expired') {
+        dayRolledOver();
       } else if (answer.status === 409 || answer.status === 404) {
         showError('The block changed (perhaps in another window), so it was loaded again.');
         await reload();
@@ -692,6 +806,12 @@ export function renderPractice(root, isCurrent) {
     render({ focus: true, scroll: true });
   };
 
+  /** The study day rolled over: this block is gone; Today says why (bug 12). */
+  const dayRolledOver = () => {
+    setNotice('A new study day has started — your last rating was not saved.');
+    window.location.replace('#/');
+  };
+
   const end = async () => {
     const session = state.session;
     if (state.busy || !session) return;
@@ -700,7 +820,12 @@ export function renderPractice(root, isCurrent) {
     setBusy(false);
     if (!isCurrent()) return;
     if (!answer.ok) {
-      showError(`The block could not be ended because ${reason(answer)}. Try again.`);
+      if (answer.code === 'session_expired') {
+        setNotice('A new study day has started, so the block was closed.');
+        window.location.replace('#/');
+        return;
+      }
+      showError(`The block could not be paused because ${reason(answer)}. Try again.`);
       return;
     }
     setSummary({ summary: answer.data, scope: session.scope_source_id, blockSize: state.settings.block_size });
@@ -769,38 +894,67 @@ export function renderPractice(root, isCurrent) {
   document.addEventListener('keydown', onKeyDown);
   document.addEventListener('keyup', onKeyUp);
 
+  /** @param {PointerEvent} event */
+  const onPointerDown = (event) => {
+    const tap = { x: event.clientX, y: event.clientY, t: now() };
+    const onRating = event.target instanceof Element && event.target.closest('button.rate') !== null;
+    if (onRating) ignoreRatingTap = state.phase === 'answer' && sameSpotTap(state.revealTap, tap);
+    lastPointer = tap;
+  };
+  screen.addEventListener('pointerdown', onPointerDown, true);
+
   // ── load ─────────────────────────────────────────────────────────────────
 
-  void (async () => {
+  /** @param {Session} session @param {number} finishedBlocks */
+  const open = (session, finishedBlocks) => {
+    state.legendAlways = legendVisible(state.settings.legend, finishedBlocks);
+    state.session = session;
+    mount(root, screen);
+    releaseWakeLock = wakeLock();
+    advance();
+  };
+
+  const load = async () => {
+    // A block just started on Today or the summary is used as it is (U4).
+    const started = takeStarted();
+    if (started) {
+      state.settings = await loadSettings();
+      if (!isCurrent()) return;
+      open(started.session, started.finishedBlocks);
+      return;
+    }
     const [current, today, settings] = await Promise.all([fetchCurrent(), fetchToday(null), loadSettings()]);
     if (!isCurrent()) return;
     state.settings = settings;
     if (!current.ok) {
+      const retry = h('button', { type: 'button', 'data-testid': 'try-again' }, 'Try again');
+      retry.addEventListener('click', () => {
+        mount(root, h('p', { class: 'muted' }, 'Loading…'));
+        void load();
+      });
       mount(
         root,
         h('p', { class: 'error' }, `The block could not be loaded because ${reason(current)}.`),
-        h('p', {}, h('a', { href: '#/' }, 'Back to Today')),
+        h('div', { class: 'actions' }, retry, h('a', { class: 'button', href: '#/' }, 'Back to Today')),
       );
+      window.addEventListener('online', () => {
+        if (isCurrent() && !state.session) void load();
+      }, { once: true });
       return;
     }
     if (!current.data) {
-      mount(
-        root,
-        h('h1', {}, 'No block in progress'),
-        h('p', {}, h('a', { href: '#/' }, 'Start one on the Today screen'), '.'),
-      );
+      // No block in progress: Today is where one starts (U7).
+      window.location.replace('#/');
       return;
     }
-    state.legendAlways = legendVisible(settings.legend, today.ok ? today.data.finished_blocks.total : 0);
-    state.session = current.data;
-    mount(root, screen);
-    releaseWakeLock = wakeLock();
-    advance();
-  })();
+    open(current.data, today.ok ? today.data.finished_blocks.total : 0);
+  };
+  void load();
 
   return () => {
     document.removeEventListener('keydown', onKeyDown);
     document.removeEventListener('keyup', onKeyUp);
+    screen.removeEventListener('pointerdown', onPointerDown, true);
     toast.clearTimer();
     if (savingTimer !== null) clearTimeout(savingTimer);
     if (guardTimer !== null) clearTimeout(guardTimer);

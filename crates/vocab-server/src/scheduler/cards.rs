@@ -8,7 +8,7 @@ use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use serde::{Deserialize, Serialize};
 use vocab_pack::types::Goal;
 
-use super::{CardFormat, CardId, CardKind, CardState, LeechState};
+use super::{CardFormat, CardId, CardKind, CardState, LeechState, RawGrade};
 use crate::catalog::{WordId, WordTraits};
 use crate::clock::{Moment, StudyDay};
 
@@ -153,6 +153,26 @@ pub fn reviewed_cards_on(
         out.entry(WordId::new(word))
             .or_default()
             .insert(CardId(card));
+    }
+    Ok(out)
+}
+
+/// The raw grade of each card's latest (non-undone) review on `day`
+/// (extra practice, R-63).
+pub fn latest_grades_on(
+    conn: &Connection,
+    day: StudyDay,
+) -> rusqlite::Result<HashMap<CardId, RawGrade>> {
+    let mut stmt = conn.prepare(
+        "SELECT r.card_id, r.raw_grade FROM review_log r WHERE r.id IN \
+         (SELECT MAX(id) FROM review_log WHERE review_day = ?1 AND undone = 0 GROUP BY card_id)",
+    )?;
+    let mut out = HashMap::new();
+    for row in stmt.query_map([day], |row| Ok((row.get(0)?, row.get(1)?)))? {
+        let (card, grade): (i64, u8) = row?;
+        if let Some(grade) = RawGrade::new(grade) {
+            out.insert(CardId(card), grade);
+        }
     }
     Ok(out)
 }
@@ -309,12 +329,32 @@ pub fn relock_cards(tx: &Transaction<'_>, word: &WordTraits) -> rusqlite::Result
     delete_unreviewed(tx, &stale)
 }
 
+/// One-way format upgrade (R-52, design §6.4): an Understand card that was
+/// fixed to `word_only` because the word had too few sentences becomes a
+/// `sentence` card once the word has enough visible ones. Never back: a
+/// sentence card keeps its format when sentences are hidden later.
+pub fn upgrade_format(tx: &Transaction<'_>, word: &WordTraits) -> rusqlite::Result<bool> {
+    if CardFormat::for_first_review(CardKind::Understand, word) != CardFormat::Sentence {
+        return Ok(false);
+    }
+    let changed = tx.execute(
+        "UPDATE card SET format = ?2 WHERE word_id = ?1 AND kind = 'understand' AND format = ?3",
+        params![
+            word.id.get(),
+            CardFormat::Sentence.as_str(),
+            CardFormat::WordOnly.as_str()
+        ],
+    )?;
+    Ok(changed > 0)
+}
+
 /// Make the word's cards match its traits (design §6.4): the Understand
-/// card exists; Produce is suspended unless the goal is `active` and
-/// Spelling unless `spelling` is set (state kept, re-activated when the
-/// trait comes back); Produce/Spelling cards whose unlock condition holds
-/// are created. Idempotent; called at import, at startup (backfill) and on
-/// word changes. Returns the cards it created.
+/// card exists (and is upgraded from `word_only` to `sentence` when the
+/// word has enough sentences now); Produce is suspended unless the goal is
+/// `active` and Spelling unless `spelling` is set (state kept, re-activated
+/// when the trait comes back); Produce/Spelling cards whose unlock
+/// condition holds are created. Idempotent; called at import, at startup
+/// (backfill) and on word changes. Returns the cards it created.
 pub fn ensure_cards(
     tx: &Transaction<'_>,
     word: &WordTraits,
@@ -324,6 +364,7 @@ pub fn ensure_cards(
     if find(tx, word.id, CardKind::Understand)?.is_none() {
         created.push(insert(tx, word.id, CardKind::Understand, None, now)?);
     }
+    upgrade_format(tx, word)?;
     if let Some(produce) = find(tx, word.id, CardKind::Produce)? {
         set_suspended(tx, &produce, word.effective_goal() != Goal::Active)?;
     }

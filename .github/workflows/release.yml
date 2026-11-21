@@ -1,9 +1,18 @@
-# Release (design §12.4, §14.2): on a version tag, run every CI check, then
-# build the server image ONCE, with SLSA provenance (mode=max) and an SBOM,
-# and push it under `sha-<short>` only. tools/release-promote.py pulls that
-# exact digest back, smoke-tests it and only then adds the `X.Y.Z` tag to the
-# same manifest (no rebuild; never `latest`). The digest goes into the job
-# summary and the GitHub release notes; deploy by tag AND digest.
+# Release (design §12.4, §14.2), on a tag vX.Y.Z:
+#
+# 1. prepare: the tag is exactly vMAJOR.MINOR.PATCH, equals the workspace
+#    version in Cargo.toml and its commit is on main; if the version tag
+#    already exists in GHCR (a re-run), nothing is built again.
+# 2. checks: every CI check (ci.yml).
+# 3. image-amd64 / image-arm64: each platform is built ONCE, natively on its
+#    own runner (no QEMU), with SLSA provenance (mode=max) and an SBOM,
+#    pushed by digest only (untagged), pulled back and smoke-tested there
+#    (release-image.yml).
+# 4. publish: the two tested images are merged into one multi-platform index
+#    `sha-<short>` (no rebuild) and the version tag X.Y.Z is added to that
+#    index; an existing version tag is never moved. Never `latest`.
+# 5. notes: the reference `X.Y.Z@digest` goes into the job summary and,
+#    once, into the GitHub release notes. Deploy by tag AND digest.
 #
 # Every action is pinned by commit SHA, the BuildKit and SBOM-generator images
 # by digest; tools/dep-age.py dates all of them (R-90).
@@ -20,75 +29,114 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  checks:
-    name: CI checks
+  prepare:
+    name: tag, version, main, registry
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     permissions:
       contents: read
-    uses: ./.github/workflows/ci.yml
-
-  publish:
-    name: publish image to GHCR
-    needs: checks
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    permissions:
-      contents: write
-      packages: write
+      packages: read
+    outputs:
+      number: ${{ steps.prepare.outputs.version }}
+      short: ${{ steps.prepare.outputs.short }}
+      existing: ${{ steps.prepare.outputs.existing }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Version from the tag
-        id: version
+          # All branches: the tagged commit must be an ancestor of origin/main.
+          fetch-depth: 0
+      - name: Check the tag, its commit and whether the version is published
+        id: prepare
         env:
           TAG: ${{ github.ref_name }}
           COMMIT: ${{ github.sha }}
-        run: |
-          version="${TAG#v}"
-          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo "tag $TAG is not vX.Y.Z" >&2; exit 1; fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "short=${COMMIT:0:7}" >> "$GITHUB_OUTPUT"
-      # Provenance and SBOM need a BuildKit container; its image is pinned.
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+          GHCR_USER: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 tools/release-promote.py prepare --repository ghcr.io/kadledav/vocabulary-training --tag "$TAG" --commit "$COMMIT"
+
+  checks:
+    name: CI checks
+    needs: prepare
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
+  image-amd64:
+    name: image linux/amd64
+    needs: [prepare, checks]
+    if: needs.prepare.outputs.existing == ''
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/release-image.yml
+    with:
+      platform: linux/amd64
+      runner: ubuntu-24.04
+      number: ${{ needs.prepare.outputs.number }}
+
+  image-arm64:
+    name: image linux/arm64
+    needs: [prepare, checks]
+    if: needs.prepare.outputs.existing == ''
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/release-image.yml
+    with:
+      platform: linux/arm64
+      runner: ubuntu-24.04-arm
+      number: ${{ needs.prepare.outputs.number }}
+
+  publish:
+    name: merge the tested images, tag X.Y.Z
+    needs: [prepare, image-amd64, image-arm64]
+    if: needs.prepare.outputs.existing == ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.publish.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          driver-opts: image=moby/buildkit:v0.34.1@sha256:99368f3e46177c6405b9740e4461d91cee004128daeecca78d4ceac50ec1da5c
+          persist-credentials: false
       - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build once and push under sha-<short>
-        id: build
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          file: docker/Dockerfile.server
-          push: true
-          provenance: mode=max
-          # SBOM attestation, made by a pinned generator image.
-          sbom: generator=docker/buildkit-syft-scanner:1.12.1@sha256:873a7458c3c8ac8e32c7b796c10e1600b07b963d2aa000a72a2d97aaaa2d6315
-          tags: ghcr.io/kadledav/vocabulary-training:sha-${{ steps.version.outputs.short }}
-          labels: |
-            org.opencontainers.image.version=${{ steps.version.outputs.version }}
-            org.opencontainers.image.revision=${{ github.sha }}
-      - name: Smoke-test the pushed digest, then tag it X.Y.Z
+      - name: One index sha-<short> of both tested images, then the version tag
+        id: publish
         env:
-          NUMBER: ${{ steps.version.outputs.version }}
-          DIGEST: ${{ steps.build.outputs.digest }}
-        run: python3 tools/release-promote.py ghcr.io/kadledav/vocabulary-training "$DIGEST" "$NUMBER"
-      - name: Digest into the job summary and the release notes
+          NUMBER: ${{ needs.prepare.outputs.number }}
+          SHORT: ${{ needs.prepare.outputs.short }}
+          AMD64: ${{ needs.image-amd64.outputs.digest }}
+          ARM64: ${{ needs.image-arm64.outputs.digest }}
+          GHCR_USER: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 tools/release-promote.py publish --repository ghcr.io/kadledav/vocabulary-training --version "$NUMBER" --short "$SHORT" --digest "$AMD64" --digest "$ARM64"
+
+  notes:
+    name: digest into the release notes
+    needs: [prepare, publish]
+    # Also on a re-run of an already published version (publish skipped).
+    if: always() && needs.prepare.result == 'success' && (needs.publish.result == 'success' || (needs.publish.result == 'skipped' && needs.prepare.outputs.existing != ''))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Reference tag and digest in the summary and the release notes
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
-          NUMBER: ${{ steps.version.outputs.version }}
-          DIGEST: ${{ steps.build.outputs.digest }}
-        run: |
-          ref="ghcr.io/kadledav/vocabulary-training:${NUMBER}@${DIGEST}"
-          notes="$(printf 'Server image, deploy by tag and digest:\n\n    %s\n\nIf this release adds a database migration, take a ZFS snapshot first (deploy/README.md).\n' "$ref")"
-          printf '%s\n' "$notes" >> "$GITHUB_STEP_SUMMARY"
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            existing="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body)"
-            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes "$(printf '%s\n\n%s\n' "$existing" "$notes")"
-          else
-            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes "$notes" --verify-tag
-          fi
+          NUMBER: ${{ needs.prepare.outputs.number }}
+          DIGEST: ${{ needs.publish.outputs.digest || needs.prepare.outputs.existing }}
+        run: python3 tools/release-promote.py notes --repository ghcr.io/kadledav/vocabulary-training --tag "$TAG" --version "$NUMBER" --digest "$DIGEST"

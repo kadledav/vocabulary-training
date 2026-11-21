@@ -1,5 +1,5 @@
 //! The binary's subcommands: `check`, `serve` (first-run setup through the
-//! logged setup code), `healthcheck`, `reset-password`.
+//! logged setup code), `healthcheck`, `reset-password`, `logout-all`.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -206,7 +206,7 @@ impl Drop for KillOnDrop {
 fn r85_check_and_reset_password_need_an_existing_database() {
     // A wrong or empty mount: refused, nothing created.
     let env = Env::new(&[ORIGIN]);
-    for subcommand in ["check", "reset-password"] {
+    for subcommand in ["check", "reset-password", "logout-all"] {
         let output = env.run(subcommand);
         assert_eq!(output.status.code(), Some(1), "{subcommand}");
         let log = String::from_utf8_lossy(&output.stdout);
@@ -285,7 +285,7 @@ fn r82_reset_password_and_check_refuse_while_the_server_runs() {
     let code = server.setup_code();
     let body = format!(r#"{{"code":"{code}","password":"{PASSWORD}"}}"#);
     let cookie = session_cookie(&post(port, "/api/auth/setup", &body, None));
-    for subcommand in ["reset-password", "check"] {
+    for subcommand in ["reset-password", "logout-all", "check"] {
         let output = env.run(subcommand);
         assert_eq!(output.status.code(), Some(1), "{subcommand}");
         let log = String::from_utf8_lossy(&output.stdout);
@@ -461,5 +461,144 @@ fn r82_serve_shows_the_setup_code_even_when_warnings_are_not_logged() {
     assert!(
         line.starts_with("Setup required: open the app and enter setup code "),
         "{line}"
+    );
+}
+
+// ── fix round R1 ────────────────────────────────────────────────────────────
+
+/// B2: `logout-all` (stack stopped) ends every session and nothing else.
+#[test]
+fn r82_logout_all_ends_every_session_but_keeps_the_password() {
+    let port = free_port();
+    let env = env_listening(port);
+    let server = Server::start(&env);
+    let code = server.setup_code();
+    let body = format!(r#"{{"code":"{code}","password":"{PASSWORD}"}}"#);
+    let first = session_cookie(&post(port, "/api/auth/setup", &body, None));
+    let login = format!(r#"{{"password":"{PASSWORD}"}}"#);
+    let second = session_cookie(&post(port, "/api/auth/login", &login, None));
+    assert!(get_today(port, &second).starts_with("HTTP/1.1 200"));
+    drop(server);
+
+    let output = env.run("logout-all");
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Every session is ended (2 in all)"),
+        "{stdout}"
+    );
+
+    let server = Server::start(&env);
+    let log = server.log(Duration::from_millis(300));
+    assert!(
+        log.iter().all(|l| !l.contains("Setup required")),
+        "the password is kept: {log:?}"
+    );
+    for cookie in [&first, &second] {
+        assert!(get_today(port, cookie).starts_with("HTTP/1.1 401"));
+    }
+    let response = post(port, "/api/auth/login", &login, None);
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    drop(server);
+    // Nothing left to end.
+    let output = env.run("logout-all");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("(1 in all)"));
+}
+
+/// B3(d), B7: a login lock survives a restart, and `reset-password` clears
+/// it together with the password.
+#[test]
+fn r82_reset_password_clears_the_login_lock() {
+    let port = free_port();
+    let env = env_listening(port);
+    let server = Server::start(&env);
+    let code = server.setup_code();
+    let body = format!(r#"{{"code":"{code}","password":"{PASSWORD}"}}"#);
+    assert!(post(port, "/api/auth/setup", &body, None).starts_with("HTTP/1.1 200"));
+    let wrong = r#"{"password":"test-password-wrong"}"#;
+    let mut last = String::new();
+    for _ in 0..5 {
+        last = post(port, "/api/auth/login", wrong, None);
+    }
+    assert!(last.starts_with("HTTP/1.1 429"), "{last}");
+    // Every failed login and the start of the lock are in the log (WARN),
+    // without anything that was typed.
+    let log = server.log(Duration::from_millis(300));
+    assert_eq!(
+        log.iter().filter(|l| l.contains("failed login:")).count(),
+        5,
+        "{log:?}"
+    );
+    assert_eq!(
+        log.iter().filter(|l| l.contains("logins locked")).count(),
+        1
+    );
+    assert!(log.iter().all(|l| !l.contains("test-password")), "{log:?}");
+    drop(server);
+
+    // Still locked after a restart, also for the right password.
+    let server = Server::start(&env);
+    let login = format!(r#"{{"password":"{PASSWORD}"}}"#);
+    let response = post(port, "/api/auth/login", &login, None);
+    assert!(response.starts_with("HTTP/1.1 429"), "{response}");
+    drop(server);
+
+    assert!(env.run("reset-password").status.success());
+    let server = Server::start(&env);
+    let code = server.setup_code();
+    let body = format!(r#"{{"code":"{code}","password":"{PASSWORD}"}}"#);
+    assert!(post(port, "/api/auth/setup", &body, None).starts_with("HTTP/1.1 200"));
+    let response = post(port, "/api/auth/login", &login, None);
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "no lock left: {response}"
+    );
+}
+
+/// B4 (review probe p9): health checks are not logged at the default
+/// level, and a flood of requests gives at most 20 log lines a second
+/// plus one line that says how many were left out.
+#[test]
+fn r83_the_request_log_skips_health_checks_and_is_rate_limited() {
+    let port = free_port();
+    let mut env = env_listening(port);
+    env.vars.retain(|(k, _)| k != "VOCAB_LOG_LEVEL");
+    let server = Server::start(&env);
+    server.log(Duration::from_millis(300));
+    let health = "GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    let status = "GET /api/auth/setup HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    const FLOOD: usize = 150;
+    for _ in 0..FLOOD {
+        assert!(http(port, health).starts_with("HTTP/1.1 200"));
+        assert!(http(port, status).starts_with("HTTP/1.1 200"));
+    }
+    // One more after the second is over: it reports what was left out.
+    std::thread::sleep(Duration::from_millis(1100));
+    assert!(http(port, status).starts_with("HTTP/1.1 200"));
+    let log = server.log(Duration::from_millis(500));
+    assert!(
+        log.iter().all(|l| !l.contains("/healthz")),
+        "health checks are logged at debug only"
+    );
+    let written = log
+        .iter()
+        .filter(|l| l.contains("route=/api/auth/setup"))
+        .count();
+    let suppressed: usize = log
+        .iter()
+        .filter_map(|l| l.split("suppressed=").nth(1))
+        .filter_map(|rest| rest.split_whitespace().next()?.parse::<usize>().ok())
+        .sum();
+    assert!(suppressed > 0, "{log:?}");
+    assert_eq!(
+        written + suppressed,
+        FLOOD + 1,
+        "every request is accounted for"
+    );
+    assert!(written < FLOOD, "{written} lines for {FLOOD} requests");
+    assert!(
+        log.iter()
+            .any(|l| l.contains(" WARN ") && l.contains("request log lines")),
+        "{log:?}"
     );
 }

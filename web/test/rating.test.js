@@ -67,8 +67,8 @@ test('R-62 the toast stays 4 s normally', () => {
 });
 
 test('R-62 a reflex 1 right after a failed card keeps the toast 8 s and pulses (slip guard)', () => {
-  assert.deepEqual(toastPlan({ grade: 1, msSinceReveal: 599, lastFailed: true }), { ms: SLIP_TOAST_MS, pulse: true });
-  assert.deepEqual(toastPlan({ grade: 1, msSinceReveal: 600, lastFailed: true }), { ms: TOAST_MS, pulse: false });
+  assert.deepEqual(toastPlan({ grade: 1, msSinceReveal: 999, lastFailed: true }), { ms: SLIP_TOAST_MS, pulse: true });
+  assert.deepEqual(toastPlan({ grade: 1, msSinceReveal: 1000, lastFailed: true }), { ms: TOAST_MS, pulse: false });
   assert.equal(SLIP_TOAST_MS, 8000);
 });
 

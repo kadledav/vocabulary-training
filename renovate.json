@@ -1,5 +1,11 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": [
+    "R-90/R-91: every update waits 14 days after its release (minimumReleaseAge) and only versions past that age are proposed (internalChecksFilter strict).",
+    "internalChecksAsSuccess: CI runs on pull requests only, so a Renovate branch has no CI status before its PR exists; its only check is Renovate's own renovate/stability-days, which by default does not count as passing. With prCreation not-pending that PR would never be opened (minimumReleaseAge disables the prNotPendingHours fallback). Counting the passed internal check lets the PR open; a pending or failed one still blocks it, and strict filtering means the branch only exists once the age has passed.",
+    "No automerge: every PR is reviewed and must pass CI (tools/dep-age.py re-checks the age of everything, transitive dependencies included).",
+    "lockFileMaintenance is off: it regenerates the lock files with the newest transitive releases, which have no release timestamp for Renovate and are often younger than 14 days. Transitive dependencies are updated together with the direct dependency that needs them; a manual refresh must pass tools/dep-age.py."
+  ],
   "extends": [
     "config:recommended",
     "helpers:pinGitHubActionDigests",
@@ -7,17 +13,16 @@
   ],
   "minimumReleaseAge": "14 days",
   "internalChecksFilter": "strict",
+  "internalChecksAsSuccess": true,
   "prCreation": "not-pending",
+  "automerge": false,
   "rangeStrategy": "pin",
   "vulnerabilityAlerts": {
     "enabled": true,
     "minimumReleaseAge": "14 days"
   },
   "lockFileMaintenance": {
-    "enabled": true,
-    "schedule": [
-      "before 6am on the first day of the month"
-    ]
+    "enabled": false
   },
   "packageRules": [
     {
@@ -51,20 +56,30 @@
         "ghcr.io/kadledav/vocabulary-training-tts"
       ],
       "enabled": false
+    },
+    {
+      "description": [
+        "One PR for the Rust release: rust-toolchain.toml (built-in rust-toolchain manager) and the rust: image of the Dockerfile must move together (repo-guard checks that they match)."
+      ],
+      "matchManagers": [
+        "rust-toolchain"
+      ],
+      "groupName": "Rust toolchain"
+    },
+    {
+      "description": [
+        "The Dockerfile's rust: build image, grouped with rust-toolchain.toml."
+      ],
+      "matchManagers": [
+        "dockerfile"
+      ],
+      "matchDepNames": [
+        "rust"
+      ],
+      "groupName": "Rust toolchain"
     }
   ],
   "customManagers": [
-    {
-      "customType": "regex",
-      "managerFilePatterns": [
-        "/^rust-toolchain\\.toml$/"
-      ],
-      "matchStrings": [
-        "channel = \"(?<currentValue>[0-9.]+)\""
-      ],
-      "datasourceTemplate": "github-releases",
-      "depNameTemplate": "rust-lang/rust"
-    },
     {
       "customType": "regex",
       "managerFilePatterns": [

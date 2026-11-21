@@ -23,11 +23,6 @@ pub fn format_timestamp(ts: Timestamp) -> String {
     ts.strftime("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
-/// The UTC calendar date of `ts` as `YYYY-MM-DD`.
-pub fn utc_date(ts: Timestamp) -> String {
-    ts.strftime("%Y-%m-%d").to_string()
-}
-
 /// Errors from building a [`DayRule`] or parsing a [`StudyDay`].
 #[derive(Debug, thiserror::Error)]
 pub enum ClockError {
@@ -338,7 +333,6 @@ mod tests {
     fn r11_import_timestamps_are_rfc3339_utc_seconds() {
         let t = ts("2026-11-17T23:30:15.123456Z");
         assert_eq!(format_timestamp(t), "2026-11-17T23:30:15Z");
-        assert_eq!(utc_date(t), "2026-11-17");
     }
 
     #[test]

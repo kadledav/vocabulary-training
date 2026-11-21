@@ -858,7 +858,7 @@ async fn r54_settings_can_be_read_and_changed() {
         .request(
             "PATCH",
             "/api/settings",
-            Some(&json!({ "new_per_day": 99 })),
+            Some(&json!({ "new_per_day": 101 })),
         )
         .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
@@ -1436,4 +1436,289 @@ async fn r62_today_counts_finished_blocks_for_the_legend_and_continue() {
         today(&env, None).await["finished_blocks"],
         json!({ "total": 1, "today": 0 })
     );
+}
+
+// ── fix round R1 (A3, review probe G) ───────────────────────────────────────
+
+/// A3 (R-54): failing the in-session repeats of a card again still queues
+/// the next repeat and is logged with its raw grade, but only the first
+/// failure of the day lowered the card's memory state; undo steps back
+/// through those ratings one by one.
+#[tokio::test]
+async fn r54_repeated_failures_in_a_block_requeue_but_lower_the_memory_only_once() {
+    let env = env();
+    env.import("test-novel", vec![word("hard", 5, 3)]).await;
+    let session = start_block(&env).await;
+    let first = rate_next(&env, &session, 5).await;
+    let memory = |result: &Value| {
+        (
+            result["review"]["card"]["stability"].clone(),
+            result["review"]["card"]["difficulty"].clone(),
+        )
+    };
+    let after_first = memory(&first);
+    assert!(after_first.0.is_number());
+    assert!(first["repeat_item_id"].is_i64());
+
+    let second = rate_next(&env, &first["session"], 5).await;
+    assert!(second["repeat_item_id"].is_i64(), "still requeued");
+    assert_eq!(memory(&second), after_first, "memory not lowered again");
+    assert_eq!(second["review"]["raw_grade"], 5);
+    assert_eq!(second["review"]["card"]["state"], "relearning");
+    assert_eq!(
+        second["review"]["card"]["lapses"], 0,
+        "a new card: no lapse"
+    );
+    let third = rate_next(&env, &second["session"], 4).await;
+    assert_eq!(memory(&third), after_first);
+    assert!(third["repeat_item_id"].is_i64());
+    assert_eq!(
+        env.int("SELECT COUNT(*) FROM review_log WHERE memory_updated = 0 AND raw_grade >= 4"),
+        2
+    );
+    assert_eq!(
+        env.int("SELECT COUNT(*) FROM review_log WHERE memory_updated = 1"),
+        1
+    );
+
+    // Undo the third rating: its repeat goes, the card is as after the second.
+    let sid = session_id(&session);
+    let (status, undone) = env
+        .post(&format!("/api/sessions/{sid}/undo"), &json!({}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{undone}");
+    assert_eq!(undone["session"]["remaining"], 1);
+    // A pass on the repeat applies as usual and ends the repeats.
+    let passed = rate_next(&env, &undone["session"], 2).await;
+    assert_ne!(memory(&passed), after_first);
+    assert_eq!(passed["review"]["card"]["state"], "review");
+    assert!(passed["repeat_item_id"].is_null());
+    assert_eq!(passed["session"]["remaining"], 0);
+}
+
+// ── extra practice and more new words (R-63, owner feedback after v0.1.0) ──
+
+/// Give the words matching `headword_like` a reviewed card that is not due
+/// before `due_day`, last reviewed on 2026-11-15 with `stability`.
+fn seed_seen(env: &Env, headword_like: &str, stability: f64, due_day: &str) {
+    env.exec(&format!(
+        "UPDATE card SET state = 'review', stability = {stability}, difficulty = 5.0, \
+         due_day = '{due_day}', last_review_day = '2026-11-15', introduced_day = '2026-11-01', \
+         reps = 3, format = 'sentence' \
+         WHERE word_id IN (SELECT id FROM word WHERE headword LIKE '{headword_like}')"
+    ));
+}
+
+async fn source_id(env: &Env, slug: &str) -> i64 {
+    let (_, sources) = env.get("/api/sources").await;
+    sources
+        .as_array()
+        .expect("sources")
+        .iter()
+        .find(|s| s["slug"] == slug)
+        .and_then(|s| s["id"].as_i64())
+        .unwrap_or_else(|| panic!("{slug} not found"))
+}
+
+#[tokio::test]
+async fn r63_extra_practice_serves_seen_cards_that_are_not_due() {
+    let env = env();
+    env.import(
+        "test-novel",
+        ["xa", "xb", "xc", "xd", "xt", "xdue", "xnew"]
+            .iter()
+            .map(|h| word(h, 5, 3))
+            .collect(),
+    )
+    .await;
+    // Lower stability → lower retrievability today.
+    seed_seen(&env, "xa", 1.0, "2026-11-23");
+    seed_seen(&env, "xb", 40.0, "2026-12-30");
+    seed_seen(&env, "xc", 8.0, "2026-11-25");
+    seed_seen(&env, "xd", 3.0, "2026-11-22");
+    seed_seen(&env, "xt", 20.0, "2026-11-21");
+    make_due(&env, "xdue", "2026-11-20");
+    // No new words in a regular block today, so `xnew` stays unseen.
+    set_settings(&env, json!({ "new_per_day": 0 })).await;
+
+    // While a card is due, extra practice is not offered.
+    let view = today(&env, None).await;
+    assert_eq!(view["extra_available"], 0, "{view}");
+    assert_eq!(view["due_tomorrow"], 1);
+    assert_eq!(view["due_tomorrow"], view["forecast"][0]["due"]);
+    assert_eq!(
+        start(&env, json!({ "kind": "extra" })).await,
+        json!({ "session": null, "resumed": false })
+    );
+    // Practising the due card (rated 2: known) makes it available.
+    let session = start_block(&env).await;
+    assert_eq!(headwords(&session), ["xdue"]);
+    let session = rate_all(&env, session, 2).await;
+    finish(&env, &session).await;
+    assert_eq!(today(&env, None).await["extra_available"], 5);
+
+    // Not due, already seen, lowest retrievability first; neither the card
+    // just rated 2 nor the unseen word.
+    let result = start(&env, json!({ "kind": "extra" })).await;
+    let session = result["session"].clone();
+    assert_eq!(session["kind"], "extra");
+    assert_eq!(result["resumed"], false);
+    assert_eq!(headwords(&session), ["xa", "xd", "xc", "xt", "xb"]);
+    assert_eq!(origins(&session), "DDDDD");
+    assert_eq!(
+        today(&env, None).await["active_session"]["kind"],
+        "extra",
+        "Today tells what kind of block can be resumed"
+    );
+
+    // Ratings are ordinary reviews with the real elapsed time.
+    let session = rate_next(&env, &session, 2).await["session"].clone(); // xa
+    assert_eq!(
+        env.int(
+            "SELECT elapsed_days FROM review_log WHERE card_id = \
+             (SELECT c.id FROM card c JOIN word w ON w.id = c.word_id WHERE w.headword = 'xa')"
+        ),
+        5
+    );
+    assert_eq!(
+        env.int(
+            "SELECT reps FROM card WHERE word_id = (SELECT id FROM word WHERE headword = 'xa')"
+        ),
+        4
+    );
+    let session = rate_next(&env, &session, 3).await["session"].clone(); // xd
+    let session = rate_next(&env, &session, 5).await["session"].clone(); // xc fails
+    let session = rate_next(&env, &session, 1).await["session"].clone(); // xt
+    let session = rate_next(&env, &session, 3).await["session"].clone(); // xb
+    // The failed card is repeated in the block; passing the repeat sends it
+    // to a later day.
+    assert_eq!(next_item(&session)["word"]["headword"], "xc");
+    let session = rate_all(&env, session, 3).await;
+    finish(&env, &session).await;
+
+    // Next extra block: rated 3–5 today first (xb, xc, xd), then the rest
+    // (none: xa and xt were last rated 1–2 today and stay out).
+    let result = start(&env, json!({ "kind": "extra" })).await;
+    let mut words = headwords(&result["session"]);
+    words.sort();
+    assert_eq!(words, ["xb", "xc", "xd"]);
+}
+
+#[tokio::test]
+async fn r63_extra_practice_with_nothing_to_practise_is_an_empty_start() {
+    let env = env();
+    env.import("test-novel", vec![word("ynew", 5, 3), word("ydue", 5, 3)])
+        .await;
+    env.import("test-general", vec![word("yseen", 5, 3)]).await;
+    seed_seen(&env, "yseen", 5.0, "2026-11-25");
+    make_due(&env, "ydue", "2026-11-20");
+    let novel = source_id(&env, "test-novel").await;
+    let general = source_id(&env, "test-general").await;
+    let empty = json!({ "session": null, "resumed": false });
+
+    // A due card blocks extra practice in its scope (and in "all"), not
+    // in another source.
+    assert_eq!(today(&env, None).await["extra_available"], 0);
+    assert_eq!(today(&env, Some(novel)).await["extra_available"], 0);
+    assert_eq!(start(&env, json!({ "kind": "extra" })).await, empty);
+    let body = json!({ "kind": "extra", "scope_source_id": novel });
+    assert_eq!(start(&env, body).await, empty);
+    assert_eq!(today(&env, Some(general)).await["extra_available"], 1);
+    let body = json!({ "kind": "extra", "scope_source_id": general });
+    let result = start(&env, body.clone()).await;
+    assert_eq!(headwords(&result["session"]), ["yseen"]);
+
+    // A card just rated 1–2 today is left out: nothing qualifies.
+    let session = rate_all(&env, result["session"].clone(), 2).await;
+    finish(&env, &session).await;
+    assert_eq!(today(&env, Some(general)).await["extra_available"], 0);
+    assert_eq!(start(&env, body).await, empty);
+}
+
+#[tokio::test]
+async fn r54_more_new_words_go_beyond_the_daily_limit() {
+    let env = env();
+    env.import(
+        "test-novel",
+        (1..=12).map(|i| word(&format!("m{i:02}"), 5, 3)).collect(),
+    )
+    .await;
+    let view = today(&env, None).await;
+    assert_eq!(view["new_waiting"], 12);
+    assert_eq!(view["new_left_today"], 5);
+    assert_eq!(view["new_paused_reason"], Value::Null);
+
+    // Today's five.
+    let session = start_block(&env).await;
+    assert_eq!(session["kind"], "regular");
+    assert_eq!(origins(&session), "NNNNN");
+    let session = rate_all(&env, session, 2).await;
+    finish(&env, &session).await;
+    let view = today(&env, None).await;
+    assert_eq!(view["new_left_today"], 0);
+    assert_eq!(view["new_waiting"], 7);
+    assert_eq!(
+        start(&env, json!({ "kind": "continue" })).await["session"],
+        Value::Null
+    );
+
+    // Bad counts are refused before anything is built.
+    for body in [
+        json!({ "kind": "more_new", "count": 0 }),
+        json!({ "kind": "more_new", "count": 51 }),
+        json!({ "kind": "start", "count": 5 }),
+        json!({ "kind": "more_new", "count": "5" }),
+    ] {
+        let (status, error) = env.post("/api/sessions", &body).await;
+        assert!(status.is_client_error(), "{body} -> {status} {error}");
+    }
+
+    // Default: the new-per-day setting, at least 5.
+    let result = start(&env, json!({ "kind": "more_new" })).await;
+    let session = result["session"].clone();
+    assert_eq!(session["kind"], "more_new");
+    assert_eq!(session["block_size"], 5);
+    assert_eq!(headwords(&session), ["m06", "m07", "m08", "m09", "m10"]);
+    assert_eq!(origins(&session), "NNNNN");
+    let session = rate_all(&env, session, 2).await;
+    finish(&env, &session).await;
+    // They count toward today's introduced words.
+    let view = today(&env, None).await;
+    assert_eq!(view["new_words"]["introduced_today"], 10);
+    assert_eq!(view["new_left_today"], 0);
+    assert_eq!(view["new_waiting"], 2);
+
+    // An explicit count takes what is left; then there is nothing.
+    let result = start(&env, json!({ "kind": "more_new", "count": 50 })).await;
+    assert_eq!(headwords(&result["session"]), ["m11", "m12"]);
+    let session = rate_all(&env, result["session"].clone(), 2).await;
+    finish(&env, &session).await;
+    let result = start(&env, json!({ "kind": "more_new", "count": 3 })).await;
+    assert_eq!(result, json!({ "session": null, "resumed": false }));
+}
+
+#[tokio::test]
+async fn r54_more_new_words_ignore_the_backlog_pause() {
+    let env = env();
+    let backlog: Vec<Value> = (1..=41)
+        .map(|i| word(&format!("due{i:02}"), 5, 3))
+        .collect();
+    env.import("test-novel", backlog).await;
+    make_due(&env, "due%", "2026-11-18");
+    env.import(
+        "test-novel",
+        vec![word("fresh1", 5, 3), word("fresh2", 5, 3)],
+    )
+    .await;
+    let view = today(&env, None).await;
+    assert_eq!(view["new_paused_reason"], "backlog");
+    assert_eq!(view["new_left_today"], 0);
+    assert_eq!(view["new_waiting"], 2);
+    let result = start(&env, json!({ "kind": "more_new", "count": 1 })).await;
+    assert_eq!(headwords(&result["session"]), ["fresh1"]);
+    assert_eq!(origins(&result["session"]), "N");
+    // The pause itself is not lifted.
+    let view = today(&env, None).await;
+    assert_eq!(view["new_words"]["paused"], true);
+    assert_eq!(view["new_words"]["anyway_today"], false);
 }

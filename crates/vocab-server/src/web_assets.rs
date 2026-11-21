@@ -1,6 +1,7 @@
 //! The embedded single-page frontend (design §1.3, §3.2).
 //!
-//! `web/index.html`, `web/css/` and `web/js/` are compiled into the binary.
+//! `web/index.html`, `web/css/`, `web/js/` and `web/img/` (icon, manifest)
+//! are compiled into the binary.
 //! Assets are served under `/assets/<build-id>/…`, where the build id is a
 //! hash of all embedded files, so they can be cached forever (`immutable`)
 //! and a new release never mixes old and new files. The shell itself is
@@ -20,6 +21,7 @@ use sha2::{Digest, Sha256};
 static INDEX_TEMPLATE: &str = include_str!("../../../web/index.html");
 static CSS: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../../web/css");
 static JS: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../../web/js");
+static IMG: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../../web/img");
 
 /// Placeholder in `index.html` replaced by the build id.
 const BUILD_PLACEHOLDER: &str = "__BUILD_ID__";
@@ -27,7 +29,7 @@ const BUILD_PLACEHOLDER: &str = "__BUILD_ID__";
 static BUILD_ID: LazyLock<String> = LazyLock::new(|| {
     let mut hasher = Sha256::new();
     hasher.update(INDEX_TEMPLATE.as_bytes());
-    for (prefix, dir) in [("css", &CSS), ("js", &JS)] {
+    for (prefix, dir) in [("css", &CSS), ("js", &JS), ("img", &IMG)] {
         let mut files = Vec::new();
         collect_files(dir, &mut files);
         files.sort_by_key(|file| file.path());
@@ -80,6 +82,7 @@ pub async fn asset(Path((build, path)): Path<(String, String)>) -> Response {
             match dir {
                 "css" => CSS.get_file(rest),
                 "js" => JS.get_file(rest),
+                "img" => IMG.get_file(rest),
                 _ => None,
             }
         })
@@ -112,7 +115,8 @@ fn content_type(path: &str) -> Option<&'static str> {
         "svg" => "image/svg+xml",
         "png" => "image/png",
         "woff2" => "font/woff2",
-        "json" | "webmanifest" => "application/json",
+        "json" => "application/json",
+        "webmanifest" => "application/manifest+json",
         _ => return None,
     })
 }

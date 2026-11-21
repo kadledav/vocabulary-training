@@ -16,13 +16,14 @@ import { RATINGS, ratingAriaLabel, ratingGroups } from '../rating.js';
 /**
  * @param {Rating} r
  * @param {(grade: Grade) => void} onRate
+ * @param {Grade | null} chosen
  */
-function rateButton(r, onRate) {
+function rateButton(r, onRate, chosen) {
   return h(
     'button',
     {
       type: 'button',
-      class: `rate rate-${r.grade} ${r.pass ? 'filled' : 'outlined'}`,
+      class: `rate rate-${r.grade} ${r.pass ? 'filled' : 'outlined'}${chosen === r.grade ? ' chosen' : ''}`,
       'data-grade': r.grade,
       'aria-label': ratingAriaLabel(r.grade),
       onclick: () => onRate(r.grade),
@@ -34,8 +35,9 @@ function rateButton(r, onRate) {
 
 /**
  * @param {(grade: Grade) => void} onRate
+ * @param {Grade | null} [chosen] the grade being saved: shown pressed at once (U3)
  */
-export function ratingBar(onRate) {
+export function ratingBar(onRate, chosen = null) {
   const { pass, fail } = ratingGroups();
   return h(
     'div',
@@ -49,10 +51,26 @@ export function ratingBar(onRate) {
     h(
       'div',
       { class: 'rating-bar', role: 'group', 'aria-label': 'Rate the word: 1 = best, 5 = no idea' },
-      pass.map((r) => rateButton(r, onRate)),
+      pass.map((r) => rateButton(r, onRate, chosen)),
       h('span', { class: 'rating-divider', 'aria-hidden': 'true', 'data-testid': 'rating-divider' }, '┆'),
-      fail.map((r) => rateButton(r, onRate)),
+      fail.map((r) => rateButton(r, onRate, chosen)),
     ),
+  );
+}
+
+/**
+ * The legend in one compact line, shown in the flow of the card above the
+ * rating bar during the first blocks (never inside the pinned bar, where it
+ * would hide the answer on small screens).
+ */
+export function legendLine() {
+  return h(
+    'p',
+    { class: 'legend-line', 'data-testid': 'legend' },
+    RATINGS.flatMap((r, i) => [
+      i > 0 ? h('span', { class: 'legend-sep' }, ' · ') : null,
+      h('span', { class: `legend-item rate-${r.grade}` }, h('b', {}, String(r.grade)), ` = ${r.short}`),
+    ]),
   );
 }
 

@@ -6,7 +6,7 @@
  * setup the app returns to the screen that asked for it.
  */
 
-import { login, newPasswordProblem, setUp, setupStatus, takeReturn } from '../auth.js';
+import { leaveLogin, login, newPasswordProblem, setUp, setupStatus } from '../auth.js';
 import { h, mount } from '../dom.js';
 import { reloadSettings } from '../settings.js';
 
@@ -20,7 +20,7 @@ function passwordInput(attrs) {
 /** Back to the screen that asked for the login. */
 function done() {
   void reloadSettings();
-  window.location.hash = takeReturn();
+  leaveLogin();
 }
 
 /**
@@ -28,10 +28,13 @@ function done() {
  * @param {import('../router.js').IsCurrent} isCurrent
  */
 export function renderLogin(root, isCurrent) {
-  drawLogin(root, isCurrent);
+  // Ask first, so a first run never flashes the login form (bug 12).
+  mount(root, h('p', { class: 'muted' }, 'Loading…'));
   void (async () => {
     const answer = await setupStatus();
-    if (isCurrent() && answer.ok && answer.data.required) drawSetup(root, isCurrent);
+    if (!isCurrent()) return;
+    if (answer.ok && answer.data.required) drawSetup(root, isCurrent);
+    else drawLogin(root, isCurrent);
   })();
 }
 
@@ -92,7 +95,7 @@ function drawLogin(root, isCurrent) {
 }
 
 /**
- * First run: setup code (from `docker logs`) and the new password.
+ * First run: setup code (from the app's log) and the new password.
  *
  * @param {HTMLElement} root
  * @param {import('../router.js').IsCurrent} isCurrent
@@ -167,11 +170,8 @@ function drawSetup(root, isCurrent) {
   mount(
     root,
     h('h1', {}, 'Set up'),
-    h(
-      'p',
-      { class: 'muted' },
-      'Enter the setup code from the server log (docker logs vocabulary) and choose a password of at least 12 characters.',
-    ),
+    h('p', {}, 'The setup code is in the app’s log. Enter it and choose a password of at least 12 characters.'),
+    h('p', { class: 'muted small' }, 'To see the log on the server: ', h('code', {}, 'docker logs vocabulary')),
     form,
   );
   code.focus();

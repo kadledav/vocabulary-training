@@ -31,6 +31,38 @@ pub use read::{
 };
 pub use source::{ReadingUpdate, SourceUpsert, source_titles, upsert_source};
 
+/// Hard caps on what the catalog holds (R-84): far above any real use (a
+/// reader collects a few thousand words in years), low enough that a
+/// runaway or hostile import cannot fill the disk.
+pub const MAX_WORDS: i64 = 20_000;
+pub const MAX_SENTENCES: i64 = 200_000;
+
+/// The catalog holds more than a cap allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum CapacityError {
+    #[error("the app holds at most {MAX_WORDS} words")]
+    Words,
+    #[error("the app holds at most {MAX_SENTENCES} sentences")]
+    Sentences,
+}
+
+/// Check the hard caps. Called by the import after merging a pack, inside
+/// its transaction, so a pack that would pass a cap is not imported at all.
+pub fn check_capacity(conn: &rusqlite::Connection) -> rusqlite::Result<Result<(), CapacityError>> {
+    let count = |table: &str| {
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get::<_, i64>(0)
+        })
+    };
+    Ok(if count("word")? > MAX_WORDS {
+        Err(CapacityError::Words)
+    } else if count("sentence")? > MAX_SENTENCES {
+        Err(CapacityError::Sentences)
+    } else {
+        Ok(())
+    })
+}
+
 /// Id of a `source` row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]

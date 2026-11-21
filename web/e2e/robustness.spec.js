@@ -296,9 +296,10 @@ test('R-70 the screen stays awake while practising, again after the page was hid
     });
   });
   const requests = () => page.evaluate(() => /** @type {any} */ (window).wakeRequests);
-  // No block: no wake lock.
+  // No block: no wake lock, and the dead screen goes to Today (U7).
   await page.goto(`${app.url}/#/practice`);
-  await expect(page.getByRole('heading', { name: 'No block in progress' })).toBeVisible();
+  await expect(page).toHaveURL(/#\/$/);
+  await expect(page.getByRole('heading', { name: 'Today' })).toBeVisible();
   expect(await requests()).toBe(0);
 
   await startBookBlock(page, app);

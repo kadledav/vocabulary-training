@@ -9,6 +9,8 @@ publish.workspace = true
 
 [dependencies]
 hex.workspace = true
+# `Visitor` for measuring a JSON value without building it (paste limits).
+serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 unicode-normalization.workspace = true

@@ -108,8 +108,13 @@ function installFakeSpeech() {
       this.voice = null;
     }
   }
+  // One on-device English voice: only on-device voices are used (R-24).
+  const voices = [
+    { lang: 'en-US', name: 'Fake US voice', localService: true, default: true },
+    { lang: 'en-GB', name: 'Fake UK voice', localService: true, default: false },
+  ];
   const synth = {
-    getVoices: () => [],
+    getVoices: () => voices,
     cancel: () => {},
     /** @param {FakeUtterance} u */
     speak: (u) => {
@@ -189,7 +194,7 @@ export async function headwordOnScreen(page) {
   return (await sentence.first().textContent())?.trim() ?? '';
 }
 
-/** Wait out the 250 ms input guard after a reveal. */
+/** Wait out the rating guards after a reveal (500 ms; 600 ms for a tap on the reveal spot, bug 4). */
 export function waitGuard() {
-  return new Promise((resolve) => setTimeout(() => resolve(undefined), 300));
+  return new Promise((resolve) => setTimeout(() => resolve(undefined), 650));
 }

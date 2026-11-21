@@ -7,7 +7,10 @@ Runs the locally built image the way the Compose stack does (read-only root
 filesystem, all capabilities dropped, no-new-privileges, no tmpfs at all,
 configuration from VOCAB_* variables): once as the image's user 65532 on a
 fresh named volume, once as the deployment's user 3101 on a bind-mounted
-directory owned by 3101 (needs passwordless sudo, as on CI runners). Checks:
+directory owned by 3101 (needs passwordless sudo, as on CI runners; without
+it, outside GitHub Actions, these checks are skipped with "needs root" and
+sudo never prompts). The engine is `docker`, which may be Podman (detected
+from `docker version`; e.g. a docker -> podman shim on a Mac). Checks:
 
 * the image runs as 65532:65532 and contains no shell, busybox, package
   manager or other program but /vocab-server (filesystem listing, where
@@ -117,6 +120,39 @@ def image_programs(entries: list[tuple[str, bool, bytes]]) -> list[str]:
 
 def one_line(text: str) -> str:
     return " ".join(text.split())
+
+
+_engine: str | None = None
+
+
+def engine() -> str:
+    """'podman' when the `docker` command is Podman, else 'docker'."""
+    global _engine
+    if _engine is None:
+        result = subprocess.run(["docker", "version"], capture_output=True, text=True, timeout=60)
+        _engine = "podman" if "podman" in (result.stdout + result.stderr).lower() else "docker"
+    return _engine
+
+
+def top_args(name: str) -> list[str]:
+    """`top` listing PID and UID of the container's processes. Docker passes
+    ps options; Podman's `-eo` form runs ps in the container's namespaces and
+    lists that ps itself (as UID 0), so it gets Podman's own descriptors."""
+    return ["top", name, "pid", "uid"] if engine() == "podman" else ["top", name, "-eo", "pid,uid"]
+
+
+def process_uids(top_output: str) -> list[str]:
+    """UIDs of the processes in a `top` listing (header line skipped)."""
+    rows = [line.split() for line in top_output.splitlines()[1:]]
+    return [row[1] for row in rows if len(row) >= 2]
+
+
+def root_available() -> bool:
+    """Whether host commands can run as root without a prompt (`sudo -n`)."""
+    try:
+        return subprocess.run(["sudo", "-n", "true"], capture_output=True, timeout=30).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
 
 
 def docker(*args: str, check: bool = True, stdin: str | None = None) -> subprocess.CompletedProcess:
@@ -277,9 +313,8 @@ def serve_and_check(image: str, name: str, user: str, data: str, password: str) 
         result = docker("exec", name, "/vocab-server", "healthcheck", check=False)
         check(result.returncode == 0, f"{tag} the healthcheck subcommand passes inside the container",
               one_line(result.stderr + result.stdout))
-        # `docker top` needs a PID column to find the container's processes.
-        rows = [line.split() for line in docker("top", name, "-eo", "pid,uid").stdout.splitlines()[1:]]
-        uids = [row[1] for row in rows if len(row) >= 2]
+        # `top` needs a PID column to find the container's processes.
+        uids = process_uids(docker(*top_args(name)).stdout)
         check(bool(uids) and all(u == user for u in uids), f"{tag} the process runs as UID {user}", f"got {uids}")
         if not healthy:
             skip(gates["http"] + gates["code"] + gates["setup"] + gates["login"], "the server is not healthy")
@@ -374,9 +409,16 @@ def refusal_checks(volume: str, image: str) -> None:
 
 def bind_mount_checks(image: str, run_id: str, password: str) -> None:
     """The deployment's user on a bind-mounted directory it owns."""
-    data_dir = tempfile.mkdtemp(prefix="vocab-smoke-")
     owned_check = f"the database was written as UID {DEPLOY_UID}"
     cache_check = f"the app created its cache directory (0700, UID {DEPLOY_UID}) in /data"
+    if not root_available():
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            check(False, "bind-mounted data directory: passwordless sudo", "sudo -n is not available on the runner")
+        else:
+            skip([f"[uid {DEPLOY_UID}] bind-mounted data directory", owned_check, cache_check],
+                 "needs root (passwordless sudo is not available)")
+        return
+    data_dir = tempfile.mkdtemp(prefix="vocab-smoke-")
     try:
         def prepare() -> None:
             sudo("chown", f"{DEPLOY_UID}:{DEPLOY_UID}", data_dir)

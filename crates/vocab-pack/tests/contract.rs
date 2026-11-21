@@ -270,10 +270,12 @@ fn r22_sentence_key_trims_leading_and_trailing_ellipses_only() {
     ] {
         assert_eq!(sentence_key(variant), key, "{variant:?}");
     }
+    // R-22/R-53 (review): closing sentence punctuation is not identity.
+    assert_eq!(sentence_key("the [[hum]] stopped."), key);
     assert_ne!(
-        sentence_key("the [[hum]] stopped."),
+        sentence_key("the [[hum]]. Stopped"),
         key,
-        "a full stop is text"
+        "a full stop inside the sentence is text"
     );
     assert_ne!(
         sentence_key("the [[hum]] \u{2026} stopped"),
@@ -303,7 +305,7 @@ fn r03_item_key_trims_collapses_and_lowercases() {
 
 #[test]
 fn r84_control_characters_rejected_in_word_scope_fields() {
-    for c in ['\u{0}', '\u{7}', '\u{1b}', '\r', '\u{7f}'] {
+    for c in ['\u{0}', '\u{7}', '\u{1b}', '\u{b}', '\u{7f}'] {
         let text = format!("bad{c}text");
         for field in [
             "meaning",
@@ -351,7 +353,7 @@ fn r84_control_characters_rejected_in_word_scope_fields() {
 
 #[test]
 fn r84_control_characters_in_sentences_drop_only_the_sentence() {
-    for c in ['\u{0}', '\u{8}', '\r', '\u{7f}'] {
+    for c in ['\u{0}', '\u{8}', '\u{c}', '\u{7f}'] {
         for field in ["en", "cs", "location"] {
             let mut w = word("hum");
             w["sentences"][1][field] = if field == "location" {

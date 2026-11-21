@@ -11,20 +11,33 @@ not ignored) breaks one of these rules. Every file is scanned as text
              `test-…` source/pack ids — JSON/YAML/TOML keys and the `slug`,
              `pack_id`, `source_slug` columns of SQL INSERTs (synthetic
              content, design §14.5);
-* R-82       no secret-looking strings: private keys, API tokens, argon2
-             hashes (also base64-encoded, as stored in .env), filled-in
-             VOCAB_* secrets in `KEY=value` or `KEY: value` form;
+* R-82       no secret-looking strings: private keys (PEM/PGP blocks), API
+             tokens, JWTs and bearer tokens, argon2 hashes (also
+             base64-encoded, as stored in .env), filled-in VOCAB_* secrets
+             in `KEY=value` or `KEY: value` form, password literals outside
+             tests (test values start with `test-`);
+* R-95       public repository: no absolute home directories
+             (/Users/<name>/, /home/<name>/), private IPv4 addresses
+             (10/8, 172.16/12, 192.168/16, 100.64/10, 169.254/16; loopback,
+             0.0.0.0 and the RFC 5737 documentation ranges are fine), e-mail
+             addresses other than noreply@… / …@example.*, and in
+             configuration files no host name under a real TLD that is not on
+             ALLOWED_HOSTS (add a host there, reviewed, to allow it);
 * R-84       every file under web/ (except node_modules): no HTML-injection
              APIs (innerHTML/outerHTML in any spelling incl. string literals
              naming them, insertAdjacentHTML, document.write, eval, Function,
              execCommand, string timers, srcdoc, javascript: URLs, …), no
              inline <script>; markup files also no inline styles, event
              handler attributes or embedded frames;
-* R-92       no `pub(…)` restricted-visibility shortcuts in the Rust crates;
+* R-92       no `pub(…)` restricted-visibility shortcuts in the Rust crates
+             (code only: comments are ignored);
 * R-90       every Dockerfile's `FROM rust:<X>…` uses the release pinned in
              rust-toolchain.toml (the image build does not read that file);
 * R-91       renovate.json: top-level minimumReleaseAge "14 days", every
-             minimumReleaseAge anywhere equal to "14 days", only known presets.
+             minimumReleaseAge anywhere equal to "14 days", only known presets,
+             internalChecksFilter "strict" everywhere, no automerge, no
+             ignoreTests, no minimumReleaseAgeBehaviour other than
+             "timestamp-required".
 
 Afterwards it prints (without failing) the MUST requirements that no test
 names yet (tests start with their R-ID: `r23_…` in Rust, `test('R-23 …')` in JS,
@@ -42,6 +55,9 @@ import subprocess
 import sys
 from pathlib import Path, PurePosixPath
 
+# Top-level directories that are not part of the repository's content even
+# when untracked and not ignored: local agent worktrees (other checkouts).
+ROOT_SKIP_DIRS = {".claude"}
 MAX_BYTES = 1024 * 1024
 LARGE_FILE_ALLOWLIST: set[str] = set()
 SELF = "tools/repo-guard.py"
@@ -54,7 +70,9 @@ FORBIDDEN_NAMES = [
 ]
 
 SECRET_PATTERNS = [
-    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"), "private key"),
+    (re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----"), "private key"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"), "JSON Web Token"),
+    (re.compile(r"\bBearer\s+[A-Za-z0-9._~+/-]{20,}=*"), "bearer token"),
     (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}"), "GitHub token"),
     (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{40,}"), "GitHub token"),
     (re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}"), "Anthropic API key"),
@@ -99,6 +117,43 @@ SHELL = "web/index.html"
 
 VISIBILITY_SHORTCUT = re.compile(r"\bpub\s*\(")
 
+# A password literal (`password = "…"`, `"password": "…"`) outside tests;
+# test values start with `test-`, placeholders are fine.
+PASSWORD_LITERAL = re.compile(
+    r"\bpassword[\"']?\s*[=:]\s*[\"'](?!test-|<|\$\{|\{\{|\$[A-Z_])[^\"'\s]{4,}[\"']", re.I
+)
+TEST_PATH = re.compile(r"(^|/)(tests?|e2e|testdata|fixtures)/|(^|/)test_[^/]*$|[._-](test|spec)\.[^/]+$")
+
+# ── personal data and home infrastructure (public repository) ────────────────
+#
+# Absolute home directories, private IPv4 addresses and e-mail addresses
+# anywhere; real host names in configuration files. To allow a new host, add
+# it to ALLOWED_HOSTS below (a reviewed change) -- a subdomain of an allowed
+# host is allowed too.
+HOME_PATH = re.compile(r"/(?:Users|home)/(?!<|\$|\{|runner/|user/|me/|you/|example/|USER/|USERNAME/)[A-Za-z0-9._-]+/")
+PRIVATE_IPV4 = re.compile(
+    r"(?<![\d.])(?:10\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])|192\.168|169\.254"
+    r"|100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7]))\.\d{1,3}\.\d{1,3}(?![\d.]*\d)"
+)
+EMAIL = re.compile(r"(?<![\w.%+-])[A-Za-z0-9._%+-]+@(?P<domain>[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,})\b")
+ALLOWED_EMAIL = re.compile(r"^(noreply|no-reply|git)@|@(?:[\w-]+\.)*(example\.[a-z]+|users\.noreply\.github\.com)$", re.I)
+# Real top-level domains likely in a home setup or a config file (file
+# extensions such as .rs, .sh, .py, .md, .pl, .so, .in are left out on purpose).
+REAL_TLDS = (
+    "com|net|org|io|dev|app|ai|co|me|info|biz|xyz|cloud|tech|site|online|eu|uk|de|cz|sk|at|ch|fr|nl|be|dk|se|no"
+    "|fi|it|es|pt|ie|hu|ro|hr|si|lt|lv|ee|us|ca|au|nz|jp|ru|ua|tv|cc|ws|link|page|host|lol|duckdns|ddns"
+)
+HOST = re.compile(rf"(?<![\w.@-])((?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+(?:{REAL_TLDS}))(?![\w-]|\.[\w-])", re.I)
+ALLOWED_HOSTS = {
+    "github.com", "githubusercontent.com", "ghcr.io", "gcr.io", "crates.io", "npmjs.org", "debian.org",
+    "docker.io", "docker.com", "anthropic.com", "rust-lang.org", "renovatebot.com", "json-schema.org",
+    "nodejs.org", "opencontainers.org", "sqlite.org", "llvm.org", "playwright.dev",
+}
+CONFIG_SUFFIXES = {".yml", ".yaml", ".toml", ".json", ".ini", ".cfg", ".conf", ".env", ".example", ".npmrc",
+                   ".dockerignore", ".gitignore"}
+# Generated or third-party text: licence texts name their authors.
+PERSONAL_DATA_EXEMPT = {"THIRD-PARTY-NOTICES.txt", "LICENSE"}
+
 FIXTURE_DIRS = {"testdata", "test-data", "test_data", "fixtures", "__fixtures__"}
 FIXTURE_KEYS = r"id|pack_id|slug|source_slug|source_id"
 FIXTURE_KV = re.compile(rf"[\"']?\b({FIXTURE_KEYS})\b[\"']?\s*[:=]\s*[\"']?([^\"'\s,}}\]#]+)")
@@ -128,7 +183,10 @@ def repo_files(root: Path) -> list[str]:
         ).stdout
     except (OSError, subprocess.CalledProcessError) as err:
         sys.exit(f"repo-guard: cannot list files with git in {root}: {err}")
-    return sorted({f for f in out.decode().split("\0") if f and (root / f).is_file()})
+    return sorted({
+        f for f in out.decode().split("\0")
+        if f and PurePosixPath(f).parts[0] not in ROOT_SKIP_DIRS and (root / f).is_file()
+    })
 
 
 def line_of(text: str, pos: int) -> int:
@@ -159,6 +217,11 @@ def check(root: Path, files: list[str]) -> list[str]:
 
         if rel != SELF:
             problems += scan(text, rel, SECRET_PATTERNS, "looks like a secret: ")
+            if not TEST_PATH.search(rel):
+                problems += scan(text, rel, [(PASSWORD_LITERAL, "password literal outside tests")],
+                                 "looks like a secret: ")
+            if rel not in PERSONAL_DATA_EXEMPT:
+                problems += personal_data(rel, text)
 
         if parts[0] == "web" and "node_modules" not in parts:
             problems += scan(text, rel, WEB_FORBIDDEN, "forbidden in web/ (R-84): ")
@@ -167,7 +230,8 @@ def check(root: Path, files: list[str]) -> list[str]:
                 problems += scan(text, rel, markup, "forbidden in markup (R-84): ")
 
         if parts[0] == "crates" and "src" in parts and path.suffix == ".rs":
-            problems += scan(text, rel, [(VISIBILITY_SHORTCUT, "restricted visibility pub(…) (R-92)")], "")
+            code = without_rust_comments(text)
+            problems += scan(code, rel, [(VISIBILITY_SHORTCUT, "restricted visibility pub(…) (R-92)")], "")
 
         if FIXTURE_DIRS.intersection(parts[:-1]):
             problems += check_fixture(rel, text)
@@ -175,6 +239,83 @@ def check(root: Path, files: list[str]) -> list[str]:
     problems += check_renovate(root)
     problems += check_rust_images(root, files)
     return problems
+
+
+def is_config(rel: str) -> bool:
+    """Configuration-like files (not docs, fixtures or code): where a real
+    host name means a real deployment."""
+    parts = PurePosixPath(rel).parts
+    if parts[0] == "docs" or FIXTURE_DIRS.intersection(parts) or parts[-1] in ("Cargo.lock", "package-lock.json"):
+        return False
+    name = parts[-1].lower()
+    return bool(DOCKERFILE_NAME.search(rel)) or name.startswith(".env") or any(
+        name.endswith(suffix) for suffix in CONFIG_SUFFIXES
+    )
+
+
+def host_allowed(host: str) -> bool:
+    host = host.lower()
+    if re.search(r"(^|\.)example\.[a-z]+$", host):
+        return True
+    return any(host == allowed or host.endswith("." + allowed) for allowed in ALLOWED_HOSTS)
+
+
+def personal_data(rel: str, text: str) -> list[str]:
+    problems = []
+    for m in HOME_PATH.finditer(text):
+        problems.append(f"{rel}:{line_of(text, m.start())}: absolute home directory {m.group(0)!r} (personal data)")
+    for m in PRIVATE_IPV4.finditer(text):
+        problems.append(f"{rel}:{line_of(text, m.start())}: private IPv4 address {m.group(0)} (home network detail)")
+    for m in EMAIL.finditer(text):
+        if not ALLOWED_EMAIL.search(m.group(0)):
+            problems.append(f"{rel}:{line_of(text, m.start())}: e-mail address {m.group(0)!r} (personal data; "
+                            "use noreply@… or …@example.com)")
+    if is_config(rel):
+        for m in HOST.finditer(text):
+            if not host_allowed(m.group(1)):
+                problems.append(f"{rel}:{line_of(text, m.start())}: host name {m.group(1)!r} is not on "
+                                "ALLOWED_HOSTS (use a placeholder such as vocab.example.home, or allow it in "
+                                "tools/repo-guard.py)")
+    return problems
+
+
+def without_rust_comments(text: str) -> str:
+    """Rust source with `//` and (nested) `/* */` comments blanked out, line
+    breaks kept; string literals (also raw strings) are left alone."""
+    out = []
+    i, n = 0, len(text)
+    while i < n:
+        if text.startswith("//", i):
+            end = text.find("\n", i)
+            end = n if end < 0 else end
+            out.append(" " * (end - i))
+            i = end
+        elif text.startswith("/*", i):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if text.startswith("/*", j):
+                    depth, j = depth + 1, j + 2
+                elif text.startswith("*/", j):
+                    depth, j = depth - 1, j + 2
+                else:
+                    j += 1
+            out.append(re.sub(r"[^\n]", " ", text[i:j]))
+            i = j
+        elif (raw := re.match(r'b?r(#*)"', text[i:])) and not (i and (text[i - 1].isalnum() or text[i - 1] == "_")):
+            end = text.find('"' + raw.group(1), i + raw.end())
+            end = n if end < 0 else end + 1 + len(raw.group(1))
+            out.append(text[i:end])
+            i = end
+        elif text[i] == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            out.append(text[i:j + 1])
+            i = j + 1
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
 
 
 RUST_IMAGE = re.compile(r"^\s*FROM\s+(?:--\S+\s+)*(?:docker\.io/)?(?:library/)?rust:(?P<version>[0-9.]+)\b", re.I | re.M)
@@ -329,10 +470,22 @@ def check_renovate(root: Path) -> list[str]:
     if not isinstance(cfg, dict) or cfg.get("vulnerabilityAlerts", {}).get("minimumReleaseAge") != "14 days":
         problems.append('renovate.json: vulnerabilityAlerts.minimumReleaseAge must be "14 days" (R-90)')
 
+    if not isinstance(cfg, dict) or cfg.get("internalChecksFilter") != "strict":
+        problems.append('renovate.json: top-level internalChecksFilter must be "strict" (only versions past the age)')
+
     def walk(node, where: str) -> None:
         if isinstance(node, dict):
             for key, value in node.items():
                 here = f"{where}.{key}"
+                if key == "automerge" and value is not False:
+                    problems.append(f"renovate.json: {here} = {value!r}; no automerge (every update is reviewed)")
+                if key == "ignoreTests" and value is not False:
+                    problems.append(f"renovate.json: {here} = {value!r}; updates must pass CI")
+                if key == "internalChecksFilter" and value != "strict":
+                    problems.append(f'renovate.json: {here} = {value!r}; must be "strict"')
+                if key == "minimumReleaseAgeBehaviour" and value != "timestamp-required":
+                    problems.append(f"renovate.json: {here} = {value!r}; a release without a timestamp must "
+                                    "not count as old enough")
                 if key in ("minimumReleaseAge", "stabilityDays", "minimumMinorAge") and value != "14 days":
                     problems.append(f'renovate.json: {here} = {value!r}; every release age must be "14 days"')
                 if key in ("extends", "ignorePresets") and isinstance(value, list):

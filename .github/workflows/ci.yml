@@ -46,6 +46,8 @@ jobs:
         run: cargo install --locked cargo-deny --version 0.20.2
       - name: cargo deny (advisories, licences, bans, sources)
         run: cargo deny --locked check
+      - name: Third-party notices and the image licence label match Cargo.lock
+        run: python3 tools/licenses.py --check
 
   rust:
     name: rust (fmt, clippy, test)
@@ -128,6 +130,7 @@ jobs:
         run: npm run e2e
 
   image-smoke:
+    # linux/amd64 only; release.yml builds and tests both platforms natively.
     name: image (build, smoke tests R-83)
     # Nothing is built or run before the age gate and guards have passed.
     needs: guards

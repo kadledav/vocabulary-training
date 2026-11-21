@@ -13,7 +13,7 @@ use serde_json::Value;
 use crate::clock::StudyDay;
 
 /// Range of `new_per_day` (R-54, design §6.6).
-pub const NEW_PER_DAY_MAX: u32 = 15;
+pub const NEW_PER_DAY_MAX: u32 = 100;
 /// Range of `block_size`.
 pub const BLOCK_SIZE_MIN: u32 = 5;
 pub const BLOCK_SIZE_MAX: u32 = 50;
@@ -55,7 +55,7 @@ pub enum Speed {
 /// All preferences with their effective values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Settings {
-    /// New Understand cards introduced per study day (0–15, default 5).
+    /// New Understand cards introduced per study day (0–100, default 5).
     pub new_per_day: u32,
     /// Items per practice block (default 20).
     pub block_size: u32,
@@ -262,7 +262,7 @@ mod tests {
         let err = update_with(
             &db,
             SettingsPatch {
-                new_per_day: Some(16),
+                new_per_day: Some(101),
                 block_size: Some(30),
                 ..SettingsPatch::default()
             },

@@ -3,13 +3,14 @@
  * Settings (design §7.1 screen 10, M4 part): new words per day, block size,
  * theme, rating legend; voice, speed and auto-play are stored for the
  * neural audio of M6 (browser speech already uses voice and speed). Every
- * change is saved at once. Account: change the password (logs out every
- * other device), create the connector token (shown once), and "Log out",
- * which ends this device's session.
+ * change is saved at once; a number out of range is kept in the field with
+ * a message saying the allowed range. Account: change the password (logs
+ * out every other device), create the connector token (shown once), "Log
+ * out" (this device) and "Log out everywhere" (every device).
  */
 
-import { changePassword, connectorTokenStatus, createConnectorToken, logout, newPasswordProblem } from '../auth.js';
-import { h, mount } from '../dom.js';
+import { changePassword, connectorTokenStatus, createConnectorToken, logout, logoutEverywhere, newPasswordProblem } from '../auth.js';
+import { h, keepFocus, mount } from '../dom.js';
 import { loadSettings, saveSettings } from '../settings.js';
 
 /**
@@ -44,7 +45,8 @@ function radioGroup(name, label, options, current, onChange) {
 }
 
 /**
- * A whole-number field saved on change.
+ * A whole-number field saved on change. A value outside `min`–`max` is not
+ * saved: the field keeps it and says what is allowed (bug 11).
  *
  * @param {string} id
  * @param {string} label
@@ -55,26 +57,35 @@ function radioGroup(name, label, options, current, onChange) {
  * @param {(value: number) => void} onChange
  */
 function numberField(id, label, help, value, min, max, onChange) {
+  const problem = h('p', { class: 'field-error', id: `${id}-problem`, role: 'alert', 'data-testid': `${id}-problem` });
   const input = h('input', {
     type: 'number',
     id,
+    name: id,
     min: String(min),
     max: String(max),
     step: '1',
     inputmode: 'numeric',
     value: String(value),
-    'aria-describedby': `${id}-help`,
+    'aria-describedby': `${id}-help ${id}-problem`,
   });
   input.addEventListener('change', () => {
     const n = Number(input.value);
-    if (Number.isInteger(n) && n >= min && n <= max) onChange(n);
-    else input.value = String(value);
+    if (input.value.trim() !== '' && Number.isInteger(n) && n >= min && n <= max) {
+      problem.textContent = '';
+      input.removeAttribute('aria-invalid');
+      onChange(n);
+    } else {
+      problem.textContent = `Enter a whole number from ${min} to ${max}. Not saved.`;
+      input.setAttribute('aria-invalid', 'true');
+    }
   });
   return h(
     'div',
     { class: 'setting' },
-    h('label', { for: id }, label),
+    h('label', { for: id }, `${label} (${min}–${max})`),
     input,
+    problem,
     h('p', { class: 'muted small', id: `${id}-help` }, help),
   );
 }
@@ -228,30 +239,37 @@ function connectorTokenSection(isCurrent) {
 export function renderSettings(root, isCurrent) {
   const status = h('p', { class: 'status', role: 'status', 'data-testid': 'settings-status' });
   const form = h('div', { class: 'settings' }, h('p', { class: 'muted' }, 'Loading…'));
-  const logoutButton = h(
-    'button',
-    {
-      type: 'button',
-      'data-testid': 'logout',
-      onclick: () => {
-        logoutButton.disabled = true;
-        void (async () => {
-          const answer = await logout();
-          logoutButton.disabled = false;
-          if (!isCurrent()) return;
-          if (answer.ok) window.location.hash = '#/login';
-          else status.textContent = answer.message;
-        })();
-      },
-    },
-    'Log out',
-  );
+  /**
+   * @param {string} testId
+   * @param {string} label
+   * @param {() => Promise<import('../api.js').ApiResult<unknown>>} call
+   */
+  const logoutButton = (testId, label, call) => {
+    const button = h('button', { type: 'button', 'data-testid': testId }, label);
+    button.addEventListener('click', () => {
+      button.disabled = true;
+      void (async () => {
+        const answer = await call();
+        button.disabled = false;
+        if (!isCurrent()) return;
+        if (answer.ok) window.location.replace('#/login');
+        else status.textContent = answer.message;
+      })();
+    });
+    return button;
+  };
   const account = h(
     'section',
     { class: 'settings account' },
     h('h2', {}, 'Account'),
-    h('p', { class: 'muted small' }, 'Logging out ends the session on this device only.'),
-    logoutButton,
+    h(
+      'div',
+      { class: 'stack' },
+      logoutButton('logout', 'Log out', logout),
+      h('p', { class: 'muted small' }, 'Ends the session on this device only.'),
+      logoutButton('logout-all', 'Log out everywhere', logoutEverywhere),
+      h('p', { class: 'muted small' }, 'Ends the sessions on every device, this one included — for a lost phone.'),
+    ),
     passwordForm(isCurrent),
     connectorTokenSection(isCurrent),
   );
@@ -263,7 +281,7 @@ export function renderSettings(root, isCurrent) {
     const result = await saveSettings(patch);
     if (!isCurrent()) return;
     status.textContent = result.ok ? 'Saved.' : result.message;
-    if (result.ok) draw(result.settings);
+    if (result.ok) keepFocus(form, () => draw(result.settings));
   };
 
   /** @param {Settings} s */
@@ -271,10 +289,16 @@ export function renderSettings(root, isCurrent) {
     mount(
       form,
       h('h2', {}, 'Practice'),
-      numberField('new-per-day', 'New words per day', '0–15; paused automatically when reviews pile up.', s.new_per_day, 0, 15, (n) =>
-        void save({ new_per_day: n }),
+      numberField(
+        'new-per-day',
+        'New words per day',
+        'Many new words today mean many reviews over the next days. New words pause by themselves when reviews pile up.',
+        s.new_per_day,
+        0,
+        100,
+        (n) => void save({ new_per_day: n }),
       ),
-      numberField('block-size', 'Cards per block', '5–50; "Continue" adds another block.', s.block_size, 5, 50, (n) =>
+      numberField('block-size', 'Cards per block', '"Continue" adds another block of this size.', s.block_size, 5, 50, (n) =>
         void save({ block_size: n }),
       ),
       radioGroup(

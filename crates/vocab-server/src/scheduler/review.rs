@@ -6,6 +6,12 @@
 //! cards it unlocked, so undo restores the card exactly and removes those
 //! cards. Undone reviews stay in the log (`undone = 1`) and are ignored
 //! everywhere else.
+//!
+//! One bad day counts once (R-50, R-54, R-55): per card and study day, only
+//! the first failing rating (4/5) lowers the FSRS memory state and only it
+//! can be a lapse. Further failing ratings of that day are logged with
+//! their raw grade (`memory_updated = 0`) and leave the card in
+//! `relearning`, due today, with its memory state untouched.
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
@@ -213,6 +219,16 @@ pub fn review_outcome(conn: &Connection, id: ReviewId) -> rusqlite::Result<Optio
     }))
 }
 
+/// Did the card already get a failing rating (4/5, not undone) on `day`?
+fn failed_on(tx: &Connection, card: CardId, day: StudyDay) -> rusqlite::Result<bool> {
+    tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM review_log WHERE card_id = ?1 AND undone = 0 \
+         AND review_day = ?2 AND raw_grade >= 4)",
+        params![card.get(), day],
+        |row| row.get(0),
+    )
+}
+
 /// Two-5s leech rule (design §6.5, guarantor decision G5): the 5s must be on
 /// different study days, like lapses; same-day repeats do not count. This
 /// is the stability before the first review of the card's previous review
@@ -243,7 +259,9 @@ fn previous_day_five_stability(
 /// Understand review, the Produce/Spelling unlock check (§6.4).
 ///
 /// Rated 4/5 (Again) → `relearning`, due today (repeated in the session);
-/// rated 1–3 → `review`, due after the FSRS interval.
+/// rated 1–3 → `review`, due after the FSRS interval. A second failing
+/// rating on the same study day changes neither the memory state nor the
+/// lapse count (module docs).
 pub fn record_review(
     tx: &Transaction<'_>,
     input: &ReviewInput<'_>,
@@ -261,7 +279,21 @@ pub fn record_review(
         .last_review_day
         .map_or(0, |last| last.days_between(day).max(0).unsigned_abs());
     let retention = desired_retention(before.kind, word);
-    let (memory, interval) = model.next(before.memory(), retention, elapsed, rating)?;
+    // The first failure of a study day is the one that counts.
+    let first_failure_today = raw.failed() && !failed_on(tx, before.id, day)?;
+    let memory_updated = !raw.failed() || first_failure_today || before.memory().is_none();
+    let (stability, difficulty, interval) = if memory_updated {
+        let (memory, interval) = model.next(before.memory(), retention, elapsed, rating)?;
+        (
+            Some(f64::from(memory.stability)),
+            Some(f64::from(memory.difficulty)),
+            interval,
+        )
+    } else {
+        // Failed again today: nothing more to learn from it (the interval
+        // is unused, a failed card is due today).
+        (before.stability, before.difficulty, 0)
+    };
 
     let mut after = before.clone();
     let shown = input
@@ -270,8 +302,8 @@ pub fn record_review(
         .unwrap_or_else(|| CardFormat::for_first_review(before.kind, word));
     // Fixed at the first review (D-2): the format that was shown.
     after.format = before.format.or(Some(shown));
-    after.stability = Some(f64::from(memory.stability));
-    after.difficulty = Some(f64::from(memory.difficulty));
+    after.stability = stability;
+    after.difficulty = difficulty;
     if rating == Rating::Again {
         after.state = CardState::Relearning;
         after.due_day = Some(day);
@@ -279,9 +311,10 @@ pub fn record_review(
         after.state = CardState::Review;
         after.due_day = Some(day.add_days(interval));
     }
-    // A lapse is a failed review of a card in `review` state (not new, not
-    // a same-day repeat, design §6.5).
-    if raw.failed() && before.state == CardState::Review {
+    // A lapse is the first failing review of a study day of a card that is
+    // not new (design §6.5): at most one per card and day, and also when
+    // the card is still `relearning` from an earlier day.
+    if first_failure_today && before.state != CardState::New {
         after.lapses += 1;
     }
     after.consecutive_fives = if raw.get() == 5 {
@@ -315,8 +348,8 @@ pub fn record_review(
     tx.execute(
         "INSERT INTO review_log (client_review_id, card_id, session_id, reviewed_at, client_ts, \
          review_day, raw_grade, fsrs_rating, suggested_grade, format, sentence_id, typed_answer, \
-         answer_match, hint_used, elapsed_days, duration_ms, before_json) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+         answer_match, hint_used, elapsed_days, duration_ms, before_json, memory_updated) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         params![
             input.client_review_id,
             before.id.get(),
@@ -335,6 +368,7 @@ pub fn record_review(
             elapsed,
             input.duration_ms,
             before_json,
+            memory_updated,
         ],
     )?;
     let review_id = ReviewId(tx.last_insert_rowid());
@@ -397,6 +431,8 @@ pub fn undo_review(
     let snapshot: Snapshot = serde_json::from_str(&before)
         .map_err(|e| SchedulerError::Corrupt(format!("snapshot of review {}: {e}", id.0)))?;
     snapshot.restore(tx, card_id)?;
+    // The snapshot may predate sentences that upgraded the card's format.
+    cards::upgrade_format(tx, word)?;
     tx.execute("UPDATE review_log SET undone = 1 WHERE id = ?1", [id.0])?;
     let mut removed_cards = cards::delete_unreviewed(tx, &created_ids(&created))?;
     // Cards unlocked meanwhile by something else (an import) on the

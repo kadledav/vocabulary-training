@@ -29,6 +29,20 @@ import { markedText } from '../marked.js';
  */
 
 /**
+ * The list's search text, source filter and scroll position, kept while
+ * the app is open so Back from a word returns to the same place (bug 5).
+ */
+const memory = { query: '', source: '', scrollY: 0, openedWord: false };
+
+/**
+ * @param {number} n
+ * @param {string} one
+ */
+function plural(n, one) {
+  return `${n} ${n === 1 ? one : `${one}s`}`;
+}
+
+/**
  * @param {HTMLElement} root
  * @param {import('../router.js').IsCurrent} isCurrent
  */
@@ -39,10 +53,12 @@ export function renderWords(root, isCurrent) {
     'aria-label': 'Search words',
     autocomplete: 'off',
     spellcheck: 'false',
+    value: memory.query,
   });
   // Radio buttons rather than a <select>: WebKit's built-in select styles
   // are refused by the CSP (style-src 'self'), and radios are easier to tap.
-  let source = '';
+  let source = memory.source;
+  let restored = false;
   /**
    * @param {string} value
    * @param {string} label
@@ -58,6 +74,7 @@ export function renderWords(root, isCurrent) {
         checked: value === source,
         onchange: () => {
           source = value;
+          memory.source = value;
           void load();
         },
       }),
@@ -84,31 +101,54 @@ export function renderWords(root, isCurrent) {
     const rows = answer.data;
     mount(
       list,
-      h('p', { class: 'muted' }, `${rows.length} ${rows.length === 1 ? 'word' : 'words'}`),
+      h('p', { class: 'muted' }, plural(rows.length, 'word')),
       h(
         'ul',
-        { class: 'rows' },
+        { class: 'rows word-rows' },
         rows.map((row) =>
           h(
             'li',
             {},
-            h('a', { href: `#/words/${row.id}`, lang: 'en' }, row.headword),
-            h('span', { class: 'muted', lang: 'cs' }, ` — ${row.czech.join(', ')}`),
+            // The whole row is the link: an easy tap target (bug 8).
             h(
-              'span',
-              { class: 'muted small' },
-              ` · usefulness ${row.usefulness} · ${row.sentence_count} sentences`,
-              row.seq !== null ? ` · #${row.seq}` : '',
+              'a',
+              {
+                class: 'word-row',
+                href: `#/words/${row.id}`,
+                onclick: () => {
+                  memory.openedWord = true;
+                  memory.scrollY = window.scrollY;
+                },
+              },
+              h('span', { class: 'word-row-head' }, h('span', { class: 'headword', lang: 'en' }, row.headword), h('span', { class: 'muted', lang: 'cs' }, ` — ${row.czech.join(', ')}`)),
+              h(
+                'span',
+                { class: 'muted small' },
+                `usefulness ${row.usefulness} · ${plural(row.sentence_count, 'sentence')}`,
+                row.seq !== null ? ` · #${row.seq}` : '',
+                row.low_priority ? h('span', { class: 'badge' }, 'low priority') : null,
+                row.open_conflicts > 0 ? h('span', { class: 'badge outcome-merged' }, 'conflicts') : null,
+              ),
             ),
-            row.low_priority ? h('span', { class: 'badge' }, 'low priority') : null,
-            row.open_conflicts > 0 ? h('span', { class: 'badge outcome-merged' }, 'conflicts') : null,
           ),
         ),
       ),
     );
+    if (memory.openedWord && !restored) {
+      restored = true;
+      // The source choices above the list change its position: wait for them.
+      await sourcesLoaded;
+      if (mine === generation && isCurrent()) {
+        memory.openedWord = false;
+        window.scrollTo(0, memory.scrollY);
+      }
+    }
   };
 
-  search.addEventListener('input', () => void load());
+  search.addEventListener('input', () => {
+    memory.query = search.value;
+    void load();
+  });
 
   mount(
     root,
@@ -117,7 +157,7 @@ export function renderWords(root, isCurrent) {
     list,
   );
 
-  void (async () => {
+  const sourcesLoaded = (async () => {
     const answer = /** @type {import('../api.js').ApiResult<Source[]>} */ (await getJson('/api/sources'));
     if (answer.ok && isCurrent()) {
       for (const source of answer.data) {
@@ -152,7 +192,7 @@ function wordView(word) {
   return h(
     'article',
     { class: 'word-view' },
-    h('p', {}, h('a', { href: '#/words' }, '← Words')),
+    h('p', {}, h('a', { class: 'back-link', href: '#/words' }, '← Words')),
     h('h1', { lang: 'en' }, displayIcon(word.icon) ? `${displayIcon(word.icon)} ` : '', word.headword),
     h('p', { class: 'meaning', lang: 'en' }, word.meaning),
     h(
@@ -223,7 +263,7 @@ export async function renderWord(root, id, isCurrent) {
   const answer = /** @type {import('../api.js').ApiResult<WordView>} */ (await getJson(`/api/words/${id}`));
   if (!isCurrent()) return;
   if (!answer.ok) {
-    mount(root, h('p', {}, h('a', { href: '#/words' }, '← Words')), h('p', { class: 'error' }, answer.message));
+    mount(root, h('p', {}, h('a', { class: 'back-link', href: '#/words' }, '← Words')), h('p', { class: 'error' }, answer.message));
     return;
   }
   mount(root, wordView(answer.data));

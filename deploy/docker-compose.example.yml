@@ -1,5 +1,7 @@
 # Compose stack of the vocabulary app (design §12.2, R-80, R-81, R-83, R-85).
-# Copy to the home repo as docker/vocabulary/docker-compose.yml. No .env and
+# Copy to your deployment repo, e.g. as docker/vocabulary/docker-compose.yml,
+# and replace the placeholders (`tank` pool, `proxy-net` network, `home`
+# entrypoint, host name, user ID) with your own. No .env and
 # no secrets: the password is set in the app on first start (setup code in
 # `docker logs vocabulary`, see README.md). Set both `image:` lines to the tag
 # AND digest printed in the release notes. The TTS service (M6) is reachable
@@ -11,8 +13,8 @@ services:
     container_name: vocabulary
     image: ghcr.io/kadledav/vocabulary-training:X.Y.Z@sha256:DIGEST-FROM-THE-RELEASE-NOTES
     restart: unless-stopped
-    # The owner's TrueNAS user and group (owner of the dataset, see
-    # README.md); change the second number if your group ID differs.
+    # The user and group that own the dataset, e.g. 3101:3101 (see
+    # README.md); use your own IDs.
     user: "3101:3101"
     read_only: true
     cap_drop: [ALL]
@@ -51,7 +53,8 @@ services:
       - "traefik.enable=true"
       - "traefik.docker.network=proxy-net"
       - "traefik.http.services.vocabulary-svc.loadbalancer.server.port=8080"
-      # 'home' entrypoint ONLY (LAN + VPN). Never add a
+      # Your reverse proxy's LAN-only entrypoint ONLY ('home' here: LAN +
+      # VPN). Never add a
       # 'websecure' router: a router without an explicit entrypoints label
       # would attach to ALL entrypoints, including the public one.
       - "traefik.http.routers.vocabulary-home.rule=Host(`vocab.example.home`)"

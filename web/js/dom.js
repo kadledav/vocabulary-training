@@ -54,3 +54,28 @@ export function h(tag, attrs = {}, ...children) {
 export function mount(parent, ...nodes) {
   parent.replaceChildren(...nodes.filter((node) => node !== null && node !== undefined && node !== false));
 }
+
+/**
+ * Redraw part of a screen without losing keyboard focus: when a form
+ * control inside `container` has focus (a radio being changed with the
+ * arrow keys), the control with the same name and value — or id — gets it
+ * back after `redraw`.
+ *
+ * @param {Element} container
+ * @param {() => void} redraw
+ */
+export function keepFocus(container, redraw) {
+  const before = document.activeElement;
+  const key =
+    before instanceof HTMLInputElement && container.contains(before)
+      ? { name: before.name, value: before.value, id: before.id }
+      : null;
+  redraw();
+  if (!key) return;
+  for (const input of container.querySelectorAll('input')) {
+    if ((key.id !== '' && input.id === key.id) || (key.id === '' && input.name === key.name && input.value === key.value)) {
+      input.focus({ preventScroll: true });
+      return;
+    }
+  }
+}

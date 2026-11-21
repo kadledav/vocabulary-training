@@ -254,8 +254,11 @@ fn before_memory(card: &Card) -> Option<fsrs::MemoryState> {
     card.memory()
 }
 
+/// A5 (review probe D): the format is fixed at the first review, with one
+/// one-way exception: `word_only` becomes `sentence` once the word has
+/// three visible sentences.
 #[tokio::test]
-async fn r52_understand_format_is_fixed_at_the_first_review() {
+async fn r52_understand_format_is_fixed_at_the_first_review_and_upgrades_one_way() {
     let env = env();
     env.import(
         "test-book",
@@ -268,14 +271,68 @@ async fn r52_understand_format_is_fixed_at_the_first_review() {
     assert_eq!(rich.card.format, Some(CardFormat::Sentence));
     assert_eq!(poor.card.format, Some(CardFormat::WordOnly));
     assert_eq!(none.card.format, Some(CardFormat::WordOnly));
-    // More sentences arrive later: the card keeps its format (D-2).
-    env.import("test-book", vec![word("poor", 5, 5)]).await;
+    // One more sentence is not enough yet (still two visible ones).
+    env.import("test-book", vec![word("poor", 5, 2)]).await;
     let id = env.word_id("poor").await;
+    assert_eq!(
+        understand(&env, id).await.format,
+        Some(CardFormat::WordOnly)
+    );
+    // More sentences arrive later: the word-only card becomes a sentence
+    // card at the import, with its memory state untouched.
+    let before = understand(&env, id).await;
+    env.import("test-book", vec![word("poor", 5, 5)]).await;
     assert_eq!(env.traits(id).await.visible_sentences, 5);
-    let due = understand(&env, id).await.due_day.expect("due");
+    let upgraded = understand(&env, id).await;
+    assert_eq!(upgraded.format, Some(CardFormat::Sentence));
+    assert_eq!(
+        (upgraded.stability, upgraded.due_day, upgraded.reps),
+        (before.stability, before.due_day, before.reps)
+    );
+    let due = upgraded.due_day.expect("due");
     env.set_day(&due.to_string());
     let again = rate_understand(&env, id, 2).await;
-    assert_eq!(again.card.format, Some(CardFormat::WordOnly));
+    assert_eq!(again.card.format, Some(CardFormat::Sentence));
+    assert_eq!(
+        env.int("SELECT COUNT(*) FROM review_log WHERE format = 'sentence' AND card_id = (SELECT id FROM card WHERE word_id = (SELECT id FROM word WHERE headword = 'poor'))"),
+        1
+    );
+    // Never back: hiding sentences later leaves a sentence card as it is,
+    // and a card that started as a sentence card stays one.
+    env.exec("UPDATE sentence SET hidden = 1 WHERE word_id IN (SELECT id FROM word WHERE headword IN ('poor', 'rich'))");
+    for headword in ["poor", "rich"] {
+        let id = env.word_id(headword).await;
+        assert_eq!(env.traits(id).await.visible_sentences, 0);
+        ensure(&env, id).await;
+        assert_eq!(
+            understand(&env, id).await.format,
+            Some(CardFormat::Sentence)
+        );
+    }
+    // Undoing a review made before the upgrade does not bring `word_only`
+    // back while the word still has its sentences.
+    let none = env.word_id("none").await;
+    let due = understand(&env, none).await.due_day.expect("due");
+    env.set_day(&due.to_string());
+    let second = rate_understand(&env, none, 2).await;
+    assert_eq!(second.card.format, Some(CardFormat::WordOnly));
+    env.import("test-book", vec![word("none", 5, 3)]).await;
+    assert_eq!(
+        understand(&env, none).await.format,
+        Some(CardFormat::Sentence)
+    );
+    let traits = env.traits(none).await;
+    let review_id = second.review_id;
+    env.db
+        .write(move |tx| {
+            Ok::<_, DbError>(scheduler::undo_review(tx, review_id, &traits).expect("undo"))
+        })
+        .await
+        .expect("undo");
+    assert_eq!(
+        understand(&env, none).await.format,
+        Some(CardFormat::Sentence)
+    );
 }
 
 #[tokio::test]
@@ -296,7 +353,7 @@ async fn r54_failed_rating_puts_the_card_into_relearning_due_today() {
         env.int("SELECT elapsed_days FROM review_log ORDER BY id DESC LIMIT 1"),
         0
     );
-    // New and same-day failures are not lapses (design §6.5).
+    // Failing a new card is not a lapse (design §6.5).
     assert_eq!(repeat.card.lapses, 0);
 }
 
@@ -625,4 +682,180 @@ async fn r54_normal_load_is_the_fourteen_day_mean_with_a_floor_of_twenty() {
     insert(100, "2026-11-05", 3, "review", 0);
     insert(14, "2026-11-06", 3, "review", 0);
     assert_eq!(load(&env).await, 31.0);
+}
+
+// ── fix round R1: one bad day counts once (A2, A3) ──────────────────────────
+
+fn memory_of(card: &Card) -> (Option<f64>, Option<f64>) {
+    (card.stability, card.difficulty)
+}
+
+/// A2 (review probes A/A2): a lapse is the first failing review of a study
+/// day of any card that is not new, also while it is still `relearning`;
+/// at most one per card and day. A word failed day after day, with every
+/// in-session repeat failed too, becomes a leech.
+#[tokio::test]
+async fn r55_a_word_failed_every_day_becomes_a_leech_even_when_all_repeats_fail() {
+    for (label, learn_first, grade) in [("never learned", false, 5u8), ("learned first", true, 4)] {
+        let env = env();
+        env.import("test-book", vec![word("stubborn", 8, 3)]).await;
+        let id = env.word_id("stubborn").await;
+        let mut day_no = 20;
+        if learn_first {
+            rate_understand(&env, id, 2).await;
+            day_no += 1;
+            env.set_day(&format!("2026-11-{day_no}"));
+        }
+        let mut lapses_by_day = Vec::new();
+        let mut flagged_on = None;
+        for n in 0..6 {
+            // The first rating of the day and two failed in-session repeats.
+            for _ in 0..3 {
+                let outcome = rate_understand(&env, id, grade).await;
+                assert_eq!(outcome.card.state, CardState::Relearning, "{label}");
+                if outcome.leech_flagged && flagged_on.is_none() {
+                    flagged_on = Some(n);
+                }
+            }
+            lapses_by_day.push(understand(&env, id).await.lapses);
+            day_no += 1;
+            env.set_day(&format!("2026-11-{day_no}"));
+        }
+        if learn_first {
+            assert_eq!(
+                lapses_by_day,
+                [1, 2, 3, 4, 5, 6],
+                "{label}: one lapse per day"
+            );
+            assert_eq!(
+                flagged_on,
+                Some(3),
+                "{label}: flagged with the fourth lapse"
+            );
+        } else {
+            // The day the card was new is not a lapse.
+            assert_eq!(lapses_by_day, [0, 1, 2, 3, 4, 5], "{label}");
+            assert_eq!(flagged_on, Some(4), "{label}");
+        }
+        let card = understand(&env, id).await;
+        assert_eq!(card.leech, LeechState::Flagged, "{label}");
+        assert!(!card.suspended);
+    }
+}
+
+/// A2: passing the in-session repeat does not hide the day's lapse, and a
+/// second failure after a pass on the same day is not a second lapse.
+#[tokio::test]
+async fn r55_at_most_one_lapse_per_card_and_study_day() {
+    let env = env();
+    env.import("test-book", vec![word("alpha", 5, 3)]).await;
+    let id = env.word_id("alpha").await;
+    rate_understand(&env, id, 2).await;
+    env.set_day("2026-11-25");
+    assert_eq!(rate_understand(&env, id, 4).await.card.lapses, 1);
+    assert_eq!(rate_understand(&env, id, 2).await.card.lapses, 1);
+    assert_eq!(rate_understand(&env, id, 5).await.card.lapses, 1);
+    assert_eq!(rate_understand(&env, id, 5).await.card.lapses, 1);
+    env.set_day("2026-11-26");
+    assert_eq!(rate_understand(&env, id, 2).await.card.lapses, 1);
+    assert_eq!(rate_understand(&env, id, 4).await.card.lapses, 2);
+}
+
+/// A3 (R-50/R-54, review probe G): only the first failing rating of a study
+/// day lowers the memory state. Later failing ratings of that day are
+/// logged with their raw grade, keep the card `relearning` and due today,
+/// and change neither stability nor difficulty; a pass applies as always.
+#[tokio::test]
+async fn r50_only_the_first_failure_of_a_study_day_lowers_the_memory_state() {
+    let env = env();
+    env.import(
+        "test-book",
+        vec![word("mature", 8, 3), word("control", 8, 3)],
+    )
+    .await;
+    let id = env.word_id("mature").await;
+    let control = env.word_id("control").await;
+    for word in [id, control] {
+        env.set_day("2026-11-20");
+        review_until(&env, word, 2, |o| {
+            o.card.stability.is_some_and(|s| s > 25.0)
+        })
+        .await;
+    }
+    // Both cards are in the same state; give them the same bad day.
+    let bad_day = understand(&env, id)
+        .await
+        .due_day
+        .max(understand(&env, control).await.due_day)
+        .expect("due");
+    env.set_day(&bad_day.to_string());
+    let before = understand(&env, id).await;
+
+    let first = rate_understand(&env, id, 4).await;
+    assert!(
+        first.card.stability < before.stability,
+        "the first failure counts"
+    );
+    let after_first = memory_of(&first.card);
+    for grade in [4, 5, 5] {
+        let again = rate_understand(&env, id, grade).await;
+        assert_eq!(
+            memory_of(&again.card),
+            after_first,
+            "raw {grade}: memory untouched"
+        );
+        assert_eq!(again.card.state, CardState::Relearning);
+        assert_eq!(again.card.due_day, Some(bad_day));
+        assert_eq!(again.raw_grade.get(), grade);
+        assert_eq!(again.fsrs_rating, 1);
+    }
+    assert_eq!(understand(&env, id).await.reps, before.reps + 4);
+    let logged: Vec<(i64, i64)> = {
+        let conn = env.sql();
+        let mut stmt = conn
+            .prepare(
+                "SELECT raw_grade, memory_updated FROM review_log WHERE review_day = ?1 \
+                 AND card_id = ?2 ORDER BY id",
+            )
+            .expect("prepare");
+        stmt.query_map(
+            rusqlite::params![bad_day.to_string(), before.id.get()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("query")
+        .map(|r| r.expect("row"))
+        .collect()
+    };
+    assert_eq!(
+        logged,
+        [(4, 1), (4, 0), (5, 0), (5, 0)],
+        "raw grades kept (R-61)"
+    );
+
+    // Four failures then a pass leave the card exactly where one failure
+    // and a pass leave the control card.
+    let passed = rate_understand(&env, id, 2).await;
+    rate_understand(&env, control, 4).await;
+    let control_passed = rate_understand(&env, control, 2).await;
+    assert_eq!(memory_of(&passed.card), memory_of(&control_passed.card));
+    assert_eq!(passed.card.due_day, control_passed.card.due_day);
+    assert_eq!(passed.card.state, CardState::Review);
+
+    // Undo goes back step by step through logged-only ratings too.
+    let traits = env.traits(id).await;
+    let review_id = passed.review_id;
+    let undone = env
+        .db
+        .write(move |tx| {
+            Ok::<_, DbError>(scheduler::undo_review(tx, review_id, &traits).expect("undo"))
+        })
+        .await
+        .expect("undo");
+    assert_eq!(memory_of(&undone.card), after_first);
+    assert_eq!(undone.card.state, CardState::Relearning);
+    // The next day a failure counts again.
+    env.set_day(&bad_day.add_days(1).to_string());
+    let next = rate_understand(&env, id, 4).await;
+    assert_ne!(memory_of(&next.card), after_first);
+    assert_eq!(next.card.lapses, before.lapses + 2);
 }

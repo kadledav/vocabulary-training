@@ -33,6 +33,8 @@ const DEFAULT_ROLLOVER_HOUR: u8 = 4;
 const DEFAULT_LISTEN: &str = "0.0.0.0:8080";
 /// Session lifetime (design §9.1).
 const SESSION_DAYS: u32 = 180;
+/// Absolute session lifetime in days (§9.1).
+const SESSION_MAX_DAYS: u32 = 365;
 
 pub const PUBLIC_ORIGIN_ENV: &str = "VOCAB_PUBLIC_ORIGIN";
 const TIMEZONE_ENV: &str = "VOCAB_TIMEZONE";
@@ -76,7 +78,10 @@ pub struct Config {
     pub day_rule: DayRule,
     pub listen: SocketAddr,
     pub log_level: tracing::Level,
+    /// Sliding session lifetime (§9.1).
     pub session_days: u32,
+    /// Longest life of a session, however often it is renewed (§9.1).
+    pub session_max_days: u32,
     pub limits: Limits,
     pub paths: Paths,
 }
@@ -89,16 +94,35 @@ pub struct Limits {
     pub body_bytes: usize,
     /// Default time a request may take before the server answers 503.
     pub request_timeout_secs: u64,
-    /// Requests handled at the same time; further requests wait.
+    /// Requests handled at the same time; further requests wait for
+    /// `slot_wait_ms` and are then refused (503).
     pub max_concurrent_requests: usize,
-    /// Time a client has to send a complete request head; also the idle
-    /// timeout of keep-alive connections.
+    /// Of those, slots only requests of a logged-in browser may use, so
+    /// that unauthenticated traffic can never take every slot.
+    pub reserved_session_slots: usize,
+    /// How long a request waits for a free slot before it is refused.
+    pub slot_wait_ms: u64,
+    /// Time a client has to send the body of a request to a public route
+    /// (login, setup).
+    pub public_body_read_secs: u64,
+    /// Time a client has to send a complete request head, counted from its
+    /// first byte (and the wait for the first request of a connection).
     pub header_read_timeout_secs: u64,
+    /// How long a connection that has answered a request may sit idle
+    /// before the next one. Longer than a reverse proxy keeps idle upstream
+    /// connections (about 90 s), so the proxy never reuses a connection the
+    /// app is closing (a sporadic 502).
+    pub keep_alive_idle_secs: u64,
     /// Open client connections; further connections wait in the backlog.
     pub max_connections: usize,
-    /// Body limit of `/api/import/*`: room for a 2 MiB paste inside a JSON
-    /// string, where quotes, backslashes and line breaks double in size (the
-    /// 2 MiB paste limit itself is checked on the decoded text).
+    /// Open connections from one peer address; further ones are refused at
+    /// once. Behind the reverse proxy every browser shares the proxy's
+    /// address, so this is generous: it only keeps one address from taking
+    /// every connection (the health check comes from another one).
+    pub max_connections_per_peer: usize,
+    /// Body limit of `/api/import/*`: a 2 MiB paste inside a JSON string,
+    /// with some room for the escaping of quotes and line breaks (the 2 MiB
+    /// paste limit itself is checked on the decoded text).
     pub import_body_bytes: usize,
     /// Time an import commit may take before the server answers 503 (the
     /// commit itself may still finish; see `workflows`).
@@ -111,9 +135,14 @@ impl Default for Limits {
             body_bytes: 64 * 1024,
             request_timeout_secs: 30,
             max_concurrent_requests: 64,
+            reserved_session_slots: 8,
+            slot_wait_ms: 2000,
+            public_body_read_secs: 5,
             header_read_timeout_secs: 10,
+            keep_alive_idle_secs: 120,
             max_connections: 256,
-            import_body_bytes: 5 * 1024 * 1024,
+            max_connections_per_peer: 128,
+            import_body_bytes: 5 * 1024 * 1024 / 2,
             import_commit_timeout_secs: 120,
         }
     }
@@ -124,8 +153,20 @@ impl Limits {
         Duration::from_secs(self.request_timeout_secs)
     }
 
+    pub fn slot_wait(&self) -> Duration {
+        Duration::from_millis(self.slot_wait_ms)
+    }
+
+    pub fn public_body_read_timeout(&self) -> Duration {
+        Duration::from_secs(self.public_body_read_secs)
+    }
+
     pub fn header_read_timeout(&self) -> Duration {
         Duration::from_secs(self.header_read_timeout_secs)
+    }
+
+    pub fn keep_alive_idle(&self) -> Duration {
+        Duration::from_secs(self.keep_alive_idle_secs)
     }
 
     pub fn import_commit_timeout(&self) -> Duration {
@@ -260,6 +301,7 @@ impl Config {
             listen,
             log_level,
             session_days: SESSION_DAYS,
+            session_max_days: SESSION_MAX_DAYS,
             limits: Limits::default(),
             paths: Paths {
                 data_dir,
@@ -344,9 +386,19 @@ mod tests {
         assert_eq!(config.day_rule.time_zone_name(), Some("Europe/Prague"));
         assert_eq!(config.log_level, tracing::Level::INFO);
         assert_eq!(config.session_days, 180);
+        assert_eq!(config.session_max_days, 365);
         assert_eq!(config.limits, Limits::default());
         assert_eq!(config.limits.body_bytes, 64 * 1024);
-        assert_eq!(config.limits.import_body_bytes, 5 * 1024 * 1024);
+        assert_eq!(config.limits.import_body_bytes, 2_621_440, "2.5 MiB");
+        assert_eq!(
+            (
+                config.limits.max_concurrent_requests,
+                config.limits.reserved_session_slots,
+                config.limits.max_connections,
+                config.limits.max_connections_per_peer
+            ),
+            (64, 8, 256, 128)
+        );
         assert_eq!(config.paths.data_dir, PathBuf::from("/data"));
         assert_eq!(config.paths.cache_dir, PathBuf::from("/data/cache"));
         let config = load(&[ORIGIN, (DATA_DIR_ENV, "/srv/vocab")]).expect("valid");

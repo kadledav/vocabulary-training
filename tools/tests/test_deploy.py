@@ -66,11 +66,24 @@ class Compose(unittest.TestCase):
     def test_r85_readme_uses_the_dataset_root_setup_code_and_reset(self):
         readme = (REPO / "deploy" / "README.md").read_text()
         self.assertNotIn("mkdir -p /mnt/tank/services/vocabulary", readme)
-        self.assertIn("owner user\n**3101**", readme)
+        self.assertIn("owner user\n**e.g. 3101**", readme)
         self.assertIn("docker logs vocabulary 2>&1 | grep 'Setup required'", readme)
         self.assertIn("docker compose run --rm vocabulary reset-password", readme)
         self.assertIn("*Create token*", readme)
         self.assertNotIn("hash-password", readme)
+
+    def test_r85_readme_limits_the_dataset_and_logs_out_after_a_restore(self):
+        readme = (REPO / "deploy" / "README.md").read_text()
+        self.assertRegex(readme, r"zfs set refquota=\S+ tank/services/vocabulary")
+        self.assertRegex(readme, r"zfs set quota=\S+ tank/services/vocabulary")
+        restore = readme.split("## 6. Restore", 1)[1]
+        self.assertIn("docker compose run --rm vocabulary logout-all", restore)
+        self.assertLess(restore.index("Verify in the UI"), restore.index("logout-all"))
+
+    def test_r80_readme_makes_the_package_public_and_checks_anonymous_pulls(self):
+        readme = (REPO / "deploy" / "README.md").read_text()
+        self.assertIn("*Change visibility*", readme)
+        self.assertIn('DOCKER_CONFIG="$(mktemp -d)" docker buildx imagetools inspect', readme)
 
 
 def service(name: str) -> str:
@@ -151,6 +164,20 @@ class Dockerfile(unittest.TestCase):
         self.assertRegex(stage, r'(?m)^ENTRYPOINT \["/vocab-server"\]$')
         # Nothing runs in the runtime stage: there is no shell to run it.
         self.assertNotRegex(stage, r"(?m)^(RUN|SHELL)\b")
+
+    def test_r83_build_is_native_for_amd64_and_arm64(self):
+        self.assertIn("ARG TARGETARCH", DOCKERFILE)
+        self.assertIn("amd64) echo x86_64-unknown-linux-musl", DOCKERFILE)
+        self.assertIn("arm64) echo aarch64-unknown-linux-musl", DOCKERFILE)
+        self.assertNotRegex(DOCKERFILE, r"--target x86_64")
+
+    def test_licences_and_lock_file_are_in_the_image(self):
+        stage = self.runtime_stage()
+        self.assertRegex(stage, r"(?m)^COPY LICENSE THIRD-PARTY-NOTICES.txt /licenses/$")
+        self.assertRegex(stage, r"(?m)^COPY Cargo.lock /usr/share/doc/vocab-server/Cargo.lock$")
+        ignore = (REPO / ".dockerignore").read_text()
+        for name in ("LICENSE", "THIRD-PARTY-NOTICES.txt", "Cargo.lock"):
+            self.assertIn(f"!{name}\n", ignore)
 
     def test_r83_every_base_image_is_pinned_by_digest(self):
         froms = re.findall(r"(?m)^FROM\s+(\S+)", DOCKERFILE)

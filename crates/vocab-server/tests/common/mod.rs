@@ -13,7 +13,7 @@ use axum::http::{HeaderValue, Request, StatusCode, header};
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use tower::ServiceExt;
-use vocab_server::auth::{Auth, SetupCode};
+use vocab_server::auth::{Auth, SessionLifetime, SetupCode};
 use vocab_server::catalog::{self, WordId, WordTraits};
 use vocab_server::clock::{Clock, DayRule, ManualClock, Moment, StudyDay, Timestamp};
 use vocab_server::config::Limits;
@@ -38,16 +38,25 @@ pub fn prague() -> DayRule {
 pub const ORIGIN: &str = "https://vocab.example.home";
 pub const PASSWORD: &str = "test-password-for-the-integration-tests";
 
-/// Auth with the design's 180-day sessions, and its start's setup code.
+/// Auth with the design's sessions (180 days sliding, 365 at most), and
+/// its start's setup code.
 pub fn auth() -> (Arc<Auth>, SetupCode) {
-    let (auth, code) = Auth::new(ORIGIN, 180).expect("auth");
+    let lifetime = SessionLifetime {
+        sliding_days: 180,
+        max_days: 365,
+    };
+    let (auth, code) = Auth::new(ORIGIN, lifetime).expect("auth");
     (Arc::new(auth), code)
 }
 
 /// Auth whose sessions outlive any clock jump of a test (100 years), for
 /// tests about other things than sessions.
 pub fn long_auth() -> (Arc<Auth>, SetupCode) {
-    let (auth, code) = Auth::new(ORIGIN, 36_500).expect("auth");
+    let lifetime = SessionLifetime {
+        sliding_days: 36_500,
+        max_days: 36_500,
+    };
+    let (auth, code) = Auth::new(ORIGIN, lifetime).expect("auth");
     (Arc::new(auth), code)
 }
 

@@ -21,6 +21,7 @@ assert _spec and _spec.loader
 dep_age = importlib.util.module_from_spec(_spec)
 sys.modules["dep_age"] = dep_age  # dataclasses look the module up by name
 _spec.loader.exec_module(dep_age)
+dep_age.cache_enabled = False  # never read or write the real cache (see the Cache tests)
 
 OLD = dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc)
 YOUNG = dt.datetime(2026, 11, 16, tzinfo=dt.timezone.utc)
@@ -82,10 +83,16 @@ def npm_entry(name: str, version: str, **extra) -> dict:
     return entry
 
 
-def package_lock(packages: dict) -> str:
+def package_lock(packages: dict, root_deps: dict | None = None) -> str:
+    """A lockfileVersion 3 lock; the root entry declares `root_deps` as
+    devDependencies (default: every package at its locked version)."""
     import json
 
-    return json.dumps({"name": "w", "lockfileVersion": 3, "packages": {"": {"name": "w"}, **packages}})
+    if root_deps is None:
+        root_deps = {key.rsplit("node_modules/", 1)[-1]: entry["version"] for key, entry in packages.items()
+                     if key.count("node_modules/") == 1 and "version" in entry}
+    root = {"name": "w", **({"devDependencies": root_deps} if root_deps else {})}
+    return json.dumps({"name": "w", "lockfileVersion": 3, "packages": {"": root, **packages}})
 
 
 class FakeRegistries:
@@ -104,7 +111,7 @@ class FakeRegistries:
             name: getattr(dep_age, name)
             for name in (
                 "crate_published", "npm_published", "rust_published", "node_published", "action_published",
-                "image_published", "debian_published",
+                "image_published", "debian_published", "release_asset_published",
             )
         }
         dep_age.crate_published = lambda n, v: self._date(n, v)
@@ -114,6 +121,7 @@ class FakeRegistries:
         dep_age.action_published = lambda repo, sha, tag: self._date(repo, sha, tag)
         dep_age.image_published = lambda name, digest: self._date(name, digest)
         dep_age.debian_published = lambda pkg, version: self._date(pkg, version)
+        dep_age.release_asset_published = lambda repo, tag, asset, sha256: self._date(asset, tag, sha256)
         return self
 
     def __exit__(self, *exc):
@@ -449,6 +457,7 @@ class Lockfiles(RepoCase):
 
     def test_r90_scoped_npm_packages_are_accepted(self):
         files = self.clean_files()
+        files["web/package.json"] = '{"devDependencies": {"@typescript/typescript-linux-x64": "7.0.2"}}'
         files["web/package-lock.json"] = package_lock(
             {"node_modules/@typescript/typescript-linux-x64": npm_entry("@typescript/typescript-linux-x64", "7.0.2")}
         )
@@ -511,8 +520,14 @@ class ActionDates(unittest.TestCase):
         self.assertEqual(self.run_with(r).isoformat(), "2026-11-16T00:00:00+00:00")
 
     def test_r90_without_release_the_commit_date_is_used(self):
-        r = self.responses(**{"/repos/o/r/releases/tags/": dep_age.LookupFailed("404")})
+        r = self.responses(**{"/repos/o/r/releases/tags/": dep_age.LookupFailed("HTTP 404", 404)})
         self.assertEqual(self.run_with(r).isoformat(), "2026-01-01T00:00:00+00:00")
+
+    def test_r90_release_lookup_errors_other_than_404_fail_closed(self):
+        for status in (403, 429, 500, None):
+            r = self.responses(**{"/repos/o/r/releases/tags/": dep_age.LookupFailed(f"HTTP {status}", status)})
+            with self.subTest(status=status), self.assertRaises(dep_age.LookupFailed):
+                self.run_with(r)
 
     def test_r90_tag_pointing_elsewhere_fails(self):
         r = self.responses(**{"/repos/o/r/git/ref/tags/": {"object": {"type": "commit", "sha": "0" * 40}}})
@@ -523,6 +538,37 @@ class ActionDates(unittest.TestCase):
         r = self.responses(**{"/repos/o/r/git/ref/tags/": [{"ref": "refs/tags/v1.2.30"}]})
         with self.assertRaises(dep_age.LookupFailed):
             self.run_with(r)
+
+
+class ReleaseAssetDates(unittest.TestCase):
+    """release_asset_published: GitHub's digest must be the pinned checksum;
+    the age is the asset's upload (a re-upload counts)."""
+
+    def run_with(self, release):
+        saved, saved_cache = dep_age.github_api, dep_age.cache_enabled
+        dep_age.cache_enabled = False
+        dep_age.github_api = lambda path: release if path == "/repos/o/r/releases/tags/v1" else {}
+        try:
+            return dep_age.release_asset_published("o/r", "v1", "a.tar.bz2", DIGEST)
+        finally:
+            dep_age.github_api, dep_age.cache_enabled = saved, saved_cache
+
+    def asset(self, **override):
+        base = {"name": "a.tar.bz2", "digest": f"sha256:{DIGEST}",
+                "created_at": "2026-10-26T09:08:26Z", "updated_at": "2026-10-26T09:08:34Z"}
+        base.update(override)
+        return {"published_at": "2023-11-21T07:43:51Z", "assets": [{"name": "other"}, base]}
+
+    def test_r90_upload_time_of_the_asset_is_its_date(self):
+        self.assertEqual(self.run_with(self.asset()).isoformat(), "2026-10-26T09:08:34+00:00")
+        reuploaded = self.asset(updated_at="2026-11-20T00:00:00Z")
+        self.assertEqual(self.run_with(reuploaded).isoformat(), "2026-11-20T00:00:00+00:00")
+
+    def test_r90_digest_must_match_and_be_known(self):
+        for release in [self.asset(digest=f"sha256:{DIGEST2}"), self.asset(digest=None),
+                        {"assets": [{"name": "other"}]}, {}]:
+            with self.subTest(release), self.assertRaises(dep_age.LookupFailed):
+                self.run_with(release)
 
 
 DIGEST = "a" * 64
@@ -676,6 +722,30 @@ class Dockerfiles(RepoCase):
         # The pinned image of line 5 is still dated.
         self.assertIn("alpine:3.20", {f.name for f in result.findings if f.kind == "image"})
 
+    def test_r90_add_of_a_checksum_pinned_github_release_asset_is_dated(self):
+        url = "https://github.com/o/r/releases/download/v2.0.1/lib-linux-x64.tar.bz2"
+        result = self.dockerfile(CLEAN_DOCKERFILE + f"ADD --checksum=sha256:{DIGEST} {url} /archives/\n")
+        self.assertEqual(result.errors, [])
+        assets = [(f.kind, f.name, f.version) for f in result.findings if f.kind == "asset"]
+        self.assertEqual(assets, [("asset", "o/r/lib-linux-x64.tar.bz2", "v2.0.1")])
+        young = self.dockerfile(CLEAN_DOCKERFILE + f"ADD --checksum=sha256:{DIGEST} {url} /archives/\n",
+                                young={"lib-linux-x64.tar.bz2"})
+        self.assertIn(YOUNG, {f.published for f in young.findings if f.kind == "asset"})
+
+    def test_r90_add_from_a_url_without_checksum_or_from_elsewhere_is_rejected(self):
+        url = "https://github.com/o/r/releases/download/v1/a.tar.gz"
+        for line in [
+            f"ADD {url} /x",
+            f"ADD --checksum=sha256:{DIGEST[:10]} {url} /x",
+            f"ADD --checksum=sha256:{DIGEST} https://example.invalid/a.tar.gz /x",
+            f"ADD --checksum=sha256:{DIGEST} https://github.com/o/r/archive/refs/heads/main.tar.gz /x",
+            f"ADD --checksum=sha256:{DIGEST} --chmod=755 {url} /x",
+            f"ADD --checksum=sha256:{DIGEST} {url} {url} /x",
+            f"ADD --checksum=sha256:{DIGEST} git@github.com:o/r.git /x",
+        ]:
+            with self.subTest(line):
+                self.assertError(self.dockerfile(CLEAN_DOCKERFILE + line + "\n"), "ADD from a URL must be")
+
     def test_r90_redirecting_settings_in_dockerfiles_are_rejected(self):
         result = self.dockerfile(CLEAN_DOCKERFILE + "ENV RUSTUP_DIST_SERVER=https://example.invalid\n")
         self.assertError(result, "RUSTUP_DIST_SERVER can redirect")
@@ -745,6 +815,7 @@ class ComposeDiscovery(RepoCase):
 class WorkflowImages(RepoCase):
     def workflow(self, body: str):
         files = self.clean_files()
+        files["docker/Dockerfile.server"] = CLEAN_DOCKERFILE
         files[".github/workflows/x.yml"] = "jobs:\n  b:\n    steps:\n" + textwrap.indent(textwrap.dedent(body), "      ")
         return self.evaluate(files)
 
@@ -763,7 +834,8 @@ class WorkflowImages(RepoCase):
             """
         )
         self.assertEqual(result.errors, [])
-        images = sorted(f.name for f in result.findings if f.kind == "image")
+        images = sorted({f.name for f in result.findings if f.kind == "image"} - {
+            "rust:1.99.0-slim-trixie", "gcr.io/distroless/static-debian13:nonroot"})
         self.assertEqual(images, ["docker/buildkit-syft-scanner:1.12.1", "moby/buildkit:v0.34.1"])
 
     def test_r90_unpinned_buildkit_or_generator_images_are_rejected(self):
@@ -776,6 +848,296 @@ class WorkflowImages(RepoCase):
             """
         )
         self.assertError(result, "x.yml:5: image=/generator=", "x.yml:6: image=/generator=", "x.yml:7: install/download command 'docker'")
+
+
+class StepInputs(RepoCase):
+    """`with:` inputs that would make an action fetch something floating."""
+
+    def workflow(self, body: str, extra: dict[str, str] | None = None):
+        files = self.clean_files()
+        files["docker/Dockerfile.server"] = CLEAN_DOCKERFILE
+        files.update(extra or {})
+        files[".github/workflows/x.yml"] = (
+            "jobs:\n  b:\n    runs-on: ubuntu-24.04\n    steps:\n" + textwrap.indent(textwrap.dedent(body), "      ")
+        )
+        return self.evaluate(files)
+
+    def test_r90_setup_buildx_needs_a_pinned_buildkit_image(self):
+        result = self.workflow(
+            f"""\
+            - uses: docker/setup-buildx-action@{SHA} # v4.4.1
+            - name: other
+              uses: docker/setup-buildx-action@{SHA} # v4.4.1
+              with:
+                driver-opts: network=host
+            """
+        )
+        self.assertEqual(sum("setup-buildx-action needs" in e for e in result.errors), 2, result.errors)
+
+    def test_r90_build_push_inputs_that_pull_floating_things_are_rejected(self):
+        result = self.workflow(
+            f"""\
+            - uses: docker/build-push-action@{SHA} # v7.4.0
+              with:
+                context: https://github.com/o/r.git#main
+                file: docker/Dockerfile.server
+                sbom: true
+                cache-from: |
+                  type=gha
+                  type=registry,ref=ghcr.io/o/cache:main
+                  ghcr.io/o/cache:latest
+                build-contexts: base=docker-image://alpine:3
+                build-args: |
+                  VERSION=1
+                  BUILDKIT_SYNTAX=docker/dockerfile:1
+            """
+        )
+        self.assertError(
+            result, "x.yml:7: context", "x.yml:9: sbom must be", "pulls a registry cache without a digest",
+            "x.yml:14: build context", "x.yml:15: build-arg 'BUILDKIT_SYNTAX",
+        )
+        self.assertEqual(sum("pulls a registry cache" in e for e in result.errors), 2, result.errors)
+        self.assertFalse(any("type=gha" in e for e in result.errors))
+
+    def test_r90_pinned_inputs_pass(self):
+        result = self.workflow(
+            f"""\
+            - uses: docker/setup-buildx-action@{SHA} # v4.4.1
+              with:
+                driver-opts: image=moby/buildkit:v0.34.1@sha256:{DIGEST}
+            - uses: docker/build-push-action@{SHA} # v7.4.0
+              with:
+                context: .
+                file: docker/Dockerfile.server
+                sbom: false
+                cache-from: type=registry,ref=ghcr.io/o/cache:main@sha256:{DIGEST}
+                build-args: VERSION=1
+            """
+        )
+        self.assertEqual(result.errors, [])
+
+    def test_r90_runs_on_must_be_a_versioned_label(self):
+        for label, ok in [("ubuntu-24.04", True), ("ubuntu-24.04-arm", True), ("'macos-15'", True),
+                          ("ubuntu-latest", False), ("macos-latest", False), ("[self-hosted, linux]", False),
+                          ("${{ matrix.os }}", False), ("", False)]:
+            files = self.clean_files()
+            files[".github/workflows/x.yml"] = f"jobs:\n  b:\n    runs-on: {label}\n    steps: []\n"
+            result = self.evaluate(files)
+            with self.subTest(label=label):
+                self.assertEqual(not any("runs-on" in e for e in result.errors), ok, result.errors)
+
+    def test_r90_runner_matrix_values_are_checked_too(self):
+        files = self.clean_files()
+        files[".github/workflows/x.yml"] = textwrap.dedent(
+            """\
+            jobs:
+              b:
+                strategy:
+                  matrix:
+                    include:
+                      - { arch: amd64, runner: ubuntu-24.04 }
+                      - arch: arm64
+                        runner: ubuntu-latest
+                runs-on: ${{ matrix.runner }}
+                steps: []
+            """
+        )
+        result = self.evaluate(files)
+        self.assertError(result, "x.yml:8: runner 'ubuntu-latest'")
+        self.assertEqual(sum("runner" in e for e in result.errors), 1, result.errors)
+
+
+class ReferencedDockerfiles(RepoCase):
+    def test_r90_dockerfiles_named_by_workflows_are_scanned_whatever_their_name(self):
+        files = self.clean_files()
+        files["build/server.image"] = "FROM alpine:3\n"
+        files[".github/workflows/x.yml"] = textwrap.dedent(
+            f"""\
+            jobs:
+              b:
+                runs-on: ubuntu-24.04
+                steps:
+                  - uses: docker/build-push-action@{SHA} # v7.4.0
+                    with:
+                      file: build/server.image
+                      sbom: false
+                  - uses: docker/build-push-action@{SHA} # v7.4.0
+                    with:
+                      file: build/missing.image
+            """
+        )
+        result = self.evaluate(files)
+        self.assertError(result, "server.image:1: alpine:3 must be name:tag@sha256", "x.yml:11: file 'build/missing.image'")
+
+    def test_r90_dockerfiles_named_by_compose_files_are_scanned(self):
+        files = self.clean_files()
+        files["deploy/compose.yml"] = "services:\n  a:\n    build:\n      dockerfile: app.build\n"
+        files["deploy/app.build"] = "FROM alpine:3\n"
+        result = self.evaluate(files)
+        self.assertError(result, "app.build:1: alpine:3 must be", "compose.yml:3: build:")
+
+    def test_r90_skip_directories_apply_only_at_the_root(self):
+        files = self.clean_files()
+        files["target/Dockerfile"] = "FROM alpine:3\n"  # build output at the root: skipped
+        files["sub/target/Dockerfile"] = "FROM alpine:3\n"
+        files["sub/.idea/Dockerfile"] = "FROM alpine:3\n"
+        files["web/node_modules/x/Dockerfile"] = "FROM alpine:3\n"  # installed by the checked lock
+        files["other/node_modules/x/Dockerfile"] = "FROM alpine:3\n"  # no lock file next to it
+        files[".claude/worktrees/a/Dockerfile"] = "FROM alpine:3\n"  # agent worktree at the root: skipped
+        files["sub/.claude/Dockerfile"] = "FROM alpine:3\n"
+        result = self.evaluate(files)
+        self.assertError(result, "sub/target/Dockerfile", "sub/.idea/Dockerfile", "other/node_modules/x/Dockerfile",
+                         "sub/.claude/Dockerfile")
+        self.assertFalse(any("/.claude/worktrees/" in e for e in result.errors), result.errors)
+        self.assertFalse(any("/web/node_modules/" in e or e.split(": ")[0].endswith("/target/Dockerfile:1")
+                             and "/sub/" not in e for e in result.errors), result.errors)
+
+
+class ComposeVariants(RepoCase):
+    def test_r90_json_and_example_compose_files_and_quoted_keys(self):
+        files = self.clean_files()
+        files["deploy/stack.json"] = '{"services": {"a": {"image": "nginx:latest"}, "b": {"build": "."}}}'
+        files["deploy/own.json"] = '{"services": {"a": {"image": "ghcr.io/kadledav/vocabulary-training:X"}}}'
+        files["deploy/compose.yml.example"] = 'services:\n  a:\n    "image": "redis:7"\n'
+        files["deploy/other.yaml.example"] = "services:\n  a:\n    'image': redis:7\n"
+        files["data/not-compose.json"] = '{"name": "x"}'
+        result = self.evaluate(files)
+        self.assertError(result, "stack.json: $.services.a.image: nginx:latest must be", "stack.json: $.services.b.build",
+                         "compose.yml.example:3: redis:7 must be", "other.yaml.example:3: redis:7 must be")
+        self.assertFalse(any("own.json" in e or "not-compose" in e for e in result.errors), result.errors)
+
+
+class RedirectingConfig(RepoCase):
+    def test_r90_cargo_config_files_are_rejected_anywhere(self):
+        files = self.clean_files()
+        files[".cargo/config.toml"] = "[source.crates-io]\nreplace-with = 'x'\n"
+        files["crates/a/.cargo/config"] = "[net]\n"
+        result = self.evaluate(files)
+        self.assertError(result, ".cargo/config.toml: cargo configuration", "crates/a/.cargo/config: cargo configuration")
+
+    def test_r90_npmrc_only_allow_listed_keys(self):
+        files = self.clean_files()
+        files["web/.npmrc"] = "# comment\nsave-exact=true\nignore-scripts=true\nregistry=https://example.invalid/\n@x:registry=y\n"
+        result = self.evaluate(files)
+        self.assertError(result, ".npmrc:4: .npmrc setting 'registry'", ".npmrc:5: .npmrc setting '@x:registry'")
+        self.assertEqual(sum(".npmrc setting" in e for e in result.errors), 2)
+
+    def test_r90_toolchain_and_source_overrides_and_cargo_config_flags(self):
+        files = self.clean_files()
+        files[".github/workflows/x.yml"] = textwrap.dedent(
+            """\
+            jobs:
+              b:
+                runs-on: ubuntu-24.04
+                env:
+                  RUSTUP_TOOLCHAIN: nightly
+                  CARGO_SOURCE_CRATES_IO_REPLACE_WITH: mirror
+                steps:
+                  - run: cargo build --locked --config 'patch.crates-io.x.path="x"'
+                  - run: cargo --config=net.offline=true test --locked
+            """
+        )
+        result = self.evaluate(files)
+        self.assertError(result, "x.yml:5: RUSTUP_TOOLCHAIN", "x.yml:6: CARGO_SOURCE_CRATES_IO_REPLACE_WITH",
+                         "x.yml:8: cargo --config", "x.yml:9: cargo --config")
+
+    def test_r90_dockerfile_rustup_target_from_a_variable(self):
+        files = self.clean_files()
+        files["docker/Dockerfile.server"] = CLEAN_DOCKERFILE.replace(
+            "RUN rustup target add x86_64-unknown-linux-musl",
+            'RUN target="$(cat /rust-target)" && rustup target add "$target"',
+        )
+        self.assertEqual(self.evaluate(files).errors, [])
+        files["docker/Dockerfile.server"] = CLEAN_DOCKERFILE.replace(
+            "RUN rustup target add x86_64-unknown-linux-musl", "RUN rustup target add $(curl -s x)"
+        )
+        self.assertError(self.evaluate(files), "install/download command 'rustup'")
+
+
+class PackageLocks(RepoCase):
+    def lock_errors(self, lock: dict, manifest: str = '{"devDependencies": {"typescript": "7.0.2"}}') -> list[str]:
+        import json
+
+        files = self.clean_files()
+        files["web/package.json"] = manifest
+        files["web/package-lock.json"] = json.dumps(lock)
+        return self.evaluate(files).errors
+
+    def entry(self):
+        return npm_entry("typescript", "7.0.2")
+
+    def test_r90_lockfile_version_3_without_legacy_tree(self):
+        root = {"name": "w", "devDependencies": {"typescript": "7.0.2"}}
+        errors = self.lock_errors({"lockfileVersion": 2, "packages": {"": root, "node_modules/typescript": self.entry()},
+                                   "dependencies": {"typescript": {"version": "7.0.2"}}})
+        self.assertTrue(any("lockfileVersion must be 3" in e for e in errors), errors)
+        self.assertTrue(any("legacy `dependencies` tree" in e for e in errors), errors)
+        errors = self.lock_errors({"lockfileVersion": 3})
+        self.assertTrue(any("no `packages` map" in e for e in errors), errors)
+
+    def test_r90_lock_must_match_package_json(self):
+        root = {"name": "w", "devDependencies": {"typescript": "7.0.2"}}
+        ok = {"lockfileVersion": 3, "packages": {"": root, "node_modules/typescript": self.entry()}}
+        self.assertEqual(self.lock_errors(ok), [])
+        errors = self.lock_errors(ok, '{"devDependencies": {"typescript": "7.0.3"}}')
+        self.assertTrue(any("differ from package.json" in e for e in errors), errors)
+        errors = self.lock_errors(ok, '{"devDependencies": {"typescript": "^7.0.2"}}')
+        self.assertTrue(any("must be an exact version" in e for e in errors), errors)
+        missing = {"lockfileVersion": 3, "packages": {"": root}}
+        errors = self.lock_errors(missing)
+        self.assertTrue(any("typescript@7.0.2 of package.json is not in `packages`" in e for e in errors), errors)
+
+
+class Cache(unittest.TestCase):
+    """Immutable lookups are cached on disk; failures are not."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        saved = (dep_age.CACHE_DIR, dep_age.cache_enabled, dep_age.fetch_json, dict(dep_age._cache))
+        dep_age.CACHE_DIR, dep_age.cache_enabled = Path(tmp.name), True
+        dep_age._cache.clear()
+
+        def restore():
+            dep_age.CACHE_DIR, dep_age.cache_enabled, dep_age.fetch_json = saved[:3]
+            dep_age._cache.clear()
+            dep_age._cache.update(saved[3])
+
+        self.addCleanup(restore)
+        self.urls: list[str] = []
+
+    def fake(self, answer):
+        def fetch_json(url, **kwargs):
+            self.urls.append(url)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        dep_age.fetch_json = fetch_json
+
+    def test_r90_crate_dates_are_cached_by_name_and_version(self):
+        self.fake({"version": {"created_at": "2026-01-02T03:04:05Z"}})
+        first = dep_age.crate_published("serde", "1.0.0")
+        dep_age._cache.clear()  # a new run reads the file
+        self.fake(dep_age.LookupFailed("must not be asked again"))
+        self.assertEqual(dep_age.crate_published("serde", "1.0.0"), first)
+        self.assertEqual(len(self.urls), 1)
+        self.assertTrue((dep_age.CACHE_DIR / "crate.json").is_file())
+        with self.assertRaises(dep_age.LookupFailed):
+            dep_age.crate_published("serde", "1.0.1")  # another version is looked up
+
+    def test_r90_failures_are_not_cached(self):
+        self.fake(dep_age.LookupFailed("HTTP 503", 503))
+        with self.assertRaises(dep_age.LookupFailed):
+            dep_age.crate_published("x", "1.0.0")
+        self.fake({"version": {"created_at": "2026-01-02T03:04:05Z"}})
+        self.assertEqual(dep_age.crate_published("x", "1.0.0").year, 2026)
+        self.assertEqual(len(self.urls), 2)
+
+    def test_r90_action_lookups_are_never_cached(self):
+        import inspect
+
+        self.assertNotIn("cached(", inspect.getsource(dep_age.action_published))
 
 
 class ImageDates(unittest.TestCase):
@@ -884,6 +1246,21 @@ class ImageDates(unittest.TestCase):
         dep_age.fetch_json = lambda url, **kw: {"result": [], "fileinfo": {}}
         with self.assertRaises(dep_age.LookupFailed):
             dep_age.debian_published("musl-tools", "9.9")
+
+    def test_r90_debian_date_is_the_latest_over_the_built_architectures(self):
+        def answer(arm64_seen):
+            result = [{"architecture": "amd64", "hash": "h1"}]
+            fileinfo = {"h1": [{"archive_name": "debian", "first_seen": "20260101T000000Z"}]}
+            if arm64_seen:
+                result.append({"architecture": "arm64", "hash": "h2"})
+                fileinfo["h2"] = [{"archive_name": "debian", "first_seen": arm64_seen}]
+            return {"result": result, "fileinfo": fileinfo}
+
+        dep_age.fetch_json = lambda url, **kw: answer("20260301T000000Z")
+        self.assertEqual(dep_age.debian_published("musl", "1").isoformat(), "2026-03-01T00:00:00+00:00")
+        dep_age.fetch_json = lambda url, **kw: answer(None)
+        with self.assertRaisesRegex(dep_age.LookupFailed, "arm64"):
+            dep_age.debian_published("musl", "1")
 
 
 if __name__ == "__main__":

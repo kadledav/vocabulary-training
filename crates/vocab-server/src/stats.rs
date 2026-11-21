@@ -8,7 +8,7 @@ use serde::Serialize;
 use crate::catalog::{self, SourceId, SourceSummary};
 use crate::clock::StudyDay;
 use crate::scheduler::{self, CardState};
-use crate::session::{self, FinishedBlocks, NewAllowance, SessionId};
+use crate::session::{self, BlockKind, FinishedBlocks, NewAllowance, SessionId};
 use crate::settings;
 
 /// Days of the Today forecast.
@@ -25,6 +25,8 @@ pub struct ForecastDay {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ActiveBlock {
     pub id: SessionId,
+    /// `regular`, `extra` or `more_new`.
+    pub kind: BlockKind,
     pub scope_source_id: Option<SourceId>,
     pub block_no: i64,
     pub total: u32,
@@ -48,11 +50,31 @@ pub struct TodayView {
     /// unless included).
     pub new_available: u32,
     pub new_words: NewAllowance,
+    /// Unseen words waiting in the scope (same count as `new_available`:
+    /// not low-priority unless included, word not suspended).
+    pub new_waiting: u32,
+    /// What is left of today's new-word limit (0 while paused).
+    pub new_left_today: u32,
+    /// Why new words are paused: `null` or `"backlog"` (design §6.6).
+    pub new_paused_reason: Option<PauseReason>,
+    /// Cards an extra-practice block (R-63) would serve now in the scope
+    /// (at most a block).
+    pub extra_available: u32,
+    /// Cards due on the next study day in the scope (= `forecast[0].due`).
+    pub due_tomorrow: u32,
     pub active_session: Option<ActiveBlock>,
     /// Blocks finished in all and today (rating legend rule, "Continue").
     pub finished_blocks: FinishedBlocks,
     /// All sources with their reading position (scope chooser).
     pub sources: Vec<SourceSummary>,
+}
+
+/// Why new words are paused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PauseReason {
+    /// More cards due than twice the normal daily load.
+    Backlog,
 }
 
 fn count(n: usize) -> u32 {
@@ -82,7 +104,7 @@ pub fn today(
     // candidates a scope has (G9).
     let scheduled = session::scheduled_in_scope(conn, scope)?;
     let due: Vec<&scheduler::Card> = scheduled.iter().filter(|c| c.is_due_on(day)).collect();
-    let forecast = (1..=FORECAST_DAYS)
+    let forecast: Vec<ForecastDay> = (1..=FORECAST_DAYS)
         .map(|offset| {
             let target = day.add_days(offset);
             ForecastDay {
@@ -100,11 +122,15 @@ pub fn today(
     let settings = settings::get(conn)?;
     let active_session = session::current(conn, day)?.map(|s| ActiveBlock {
         id: s.id,
+        kind: s.kind,
         scope_source_id: s.scope_source_id,
         block_no: s.block_no,
         total: s.total,
         remaining: s.remaining,
     });
+    let new_words = session::new_word_allowance(conn, day, &settings)?;
+    let extra_available = session::extra_available(conn, day, scope, &settings)?;
+    let due_tomorrow = forecast.first().map_or(0, |f| f.due);
     Ok(TodayView {
         study_day: day,
         scope_source_id: scope,
@@ -116,7 +142,12 @@ pub fn today(
         ),
         forecast,
         new_available,
-        new_words: session::new_word_allowance(conn, day, &settings)?,
+        new_waiting: new_available,
+        new_left_today: new_words.quota,
+        new_paused_reason: new_words.paused.then_some(PauseReason::Backlog),
+        extra_available,
+        due_tomorrow,
+        new_words,
         active_session,
         finished_blocks: session::finished_blocks(conn, day)?,
         sources: catalog::sources(conn)?,

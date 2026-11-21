@@ -37,7 +37,9 @@ import { getJson, postJson } from './api.js';
  *             forecast: { day: string, due: number }[], new_available: number, new_words: NewAllowance,
  *             active_session: { id: string, scope_source_id: number | null, block_no: number, total: number,
  *             remaining: number } | null, finished_blocks: { total: number, today: number },
- *             sources: SourceSummary[] }} Today
+ *             sources: SourceSummary[], new_waiting?: number, new_left_today?: number,
+ *             new_paused_reason?: 'backlog' | null, extra_available?: number, due_tomorrow?: number }} Today
+ * @typedef {'start' | 'continue' | 'extra' | 'more_new'} StartKind
  * @typedef {import('./api.js').ApiResult<any>} AnyResult
  */
 
@@ -59,15 +61,42 @@ export function fetchCurrent() {
 }
 
 /**
- * @param {{ kind: 'start' | 'continue', scope: number | null, addNewAnyway?: boolean }} request
+ * A block the Today or Summary screen just started, handed to the practice
+ * screen so it does not fetch it again (usability U4: one round trip on a
+ * slow connection). Taken once.
+ *
+ * @type {{ session: Session, finishedBlocks: number } | null}
+ */
+let started = null;
+
+/**
+ * Start (or resume) a block. `extra` practises words already seen, weakest
+ * first; `more_new` introduces `count` more new words today.
+ *
+ * @param {{ kind: StartKind, scope: number | null, addNewAnyway?: boolean, count?: number, finishedBlocks?: number }} request
  * @returns {Promise<import('./api.js').ApiResult<StartResult>>}
  */
-export function startBlock({ kind, scope, addNewAnyway = false }) {
+export async function startBlock({ kind, scope, addNewAnyway = false, count, finishedBlocks = 0 }) {
   /** @type {Record<string, unknown>} */
   const body = { kind };
   if (scope !== null) body.scope_source_id = scope;
   if (addNewAnyway) body.add_new_anyway = true;
-  return postJson('/api/sessions', body);
+  if (kind === 'more_new' && count !== undefined) body.count = count;
+  /** @type {import('./api.js').ApiResult<StartResult>} */
+  const answer = await postJson('/api/sessions', body);
+  started = answer.ok && answer.data.session ? { session: answer.data.session, finishedBlocks } : null;
+  return answer;
+}
+
+/**
+ * The block just started by `startBlock`, once.
+ *
+ * @returns {{ session: Session, finishedBlocks: number } | null}
+ */
+export function takeStarted() {
+  const value = started;
+  started = null;
+  return value;
 }
 
 /**

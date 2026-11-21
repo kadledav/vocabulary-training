@@ -685,7 +685,8 @@ async fn r54_settings_ranges_are_inclusive() {
     for (patch, ok) in [
         (json!({ "new_per_day": 0 }), true),
         (json!({ "new_per_day": 15 }), true),
-        (json!({ "new_per_day": 16 }), false),
+        (json!({ "new_per_day": 100 }), true),
+        (json!({ "new_per_day": 101 }), false),
         (json!({ "new_per_day": -1 }), false),
         (json!({ "new_per_day": 2.5 }), false),
         (json!({ "block_size": 5 }), true),
@@ -705,7 +706,7 @@ async fn r54_settings_ranges_are_inclusive() {
     let (_, s) = env.get("/api/settings").await;
     assert_eq!(
         (s["new_per_day"].clone(), s["block_size"].clone()),
-        (json!(15), json!(50))
+        (json!(100), json!(50))
     );
     let before = s.clone();
     let (status, _) = settings(&env, json!({ "new_per_day": 3, "block_size": 99 })).await;

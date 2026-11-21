@@ -7,7 +7,7 @@
  * login screen, which returns to the screen afterwards.
  */
 
-import { onUnauthenticated } from './api.js';
+import { onBusy, onUnauthenticated } from './api.js';
 import { goToLogin } from './auth.js';
 import { h, mount } from './dom.js';
 import { startRouter } from './router.js';
@@ -41,10 +41,19 @@ function nav(name) {
   );
 }
 
+// The screens set the scroll position themselves (top on a new screen, the
+// old place when Words is shown again): the browser's own restoring on
+// Back would fight with that.
+if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
+
 if (root) {
   const header = h('header', {});
   const content = h('div', { class: 'content' });
-  root.before(header);
+  const busy = h('p', { class: 'busy-banner', role: 'status', 'data-testid': 'busy' });
+  onBusy((on) => {
+    busy.textContent = on ? 'The server is busy, trying again…' : '';
+  });
+  root.before(header, busy);
   mount(root, content);
   /** @type {(() => void) | null} */
   let leave = null;

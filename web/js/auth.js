@@ -58,11 +58,20 @@ export function takeReturn() {
   return hash && hash.startsWith('#/') && !hash.startsWith(LOGIN_HASH) ? hash : '#/';
 }
 
-/** Show the login screen, coming back to the current screen afterwards. */
+/**
+ * Show the login screen, coming back to the current screen afterwards. The
+ * login replaces the current history entry, so Back after logging in never
+ * shows the login form again.
+ */
 export function goToLogin() {
   if (window.location.hash.startsWith(LOGIN_HASH)) return;
   rememberReturn(window.location.hash || '#/');
-  window.location.hash = LOGIN_HASH;
+  window.location.replace(LOGIN_HASH);
+}
+
+/** After a login or setup: back to the screen that asked, replacing the login entry. */
+export function leaveLogin() {
+  window.location.replace(takeReturn());
 }
 
 /**
@@ -76,6 +85,15 @@ export function login(password) {
 /** @returns {Promise<import('./api.js').ApiResult<{ status: string }>>} */
 export function logout() {
   return postJson('/api/auth/logout', {});
+}
+
+/**
+ * End every session of the owner, on every device (this one included).
+ *
+ * @returns {Promise<import('./api.js').ApiResult<unknown>>}
+ */
+export function logoutEverywhere() {
+  return postJson('/api/auth/logout-all', {});
 }
 
 /**

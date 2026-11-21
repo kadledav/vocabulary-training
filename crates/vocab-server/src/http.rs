@@ -7,25 +7,40 @@
 //! parse, call a module, map errors.
 //!
 //! Body limits and timeouts are set per route group: the default (64 KiB,
-//! 30 s) for everything, larger ones for `/api/import/*` (2 MiB; the commit
-//! may take 120 s). A timeout only stops waiting: database work that already
-//! started finishes in the background (see `workflows`), so the timeout
-//! answer of an import tells the owner that importing again is safe.
+//! 30 s) for everything, larger ones for `/api/import/*` (2.5 MiB; the
+//! commit may take 120 s). A timeout only stops waiting: database work that
+//! already started finishes in the background (see `workflows`), so the
+//! timeout answer of an import tells the owner that importing again is safe.
+//!
+//! Nobody without a session can keep the app from answering (R-83):
+//!
+//! * a request waits only briefly for a slot and is then refused (503 with
+//!   `Retry-After`); a few slots are reserved for requests that carry the
+//!   cookie of a known live session ([`Slots`]);
+//! * the body of a request to a public route (login, setup) must arrive
+//!   within a few seconds; everything else is refused before its body is
+//!   read (no session → 401);
+//! * `/healthz` is served outside the slot pool and never touches the
+//!   database, so the container's health check answers under any load;
+//! * one import is processed at a time, its body included, so imports
+//!   cannot pile up in memory.
 //!
 //! Access control (design §9) is one layer over every route: each route of
 //! the table in [`routes`] is public, needs a session, or needs the import
 //! token; anything else needs a session. State-changing requests must pass
-//! the CSRF guard (Origin + JSON). The `auth` module does the checks.
+//! the CSRF guard (Origin + JSON), and API requests a browser labels as
+//! cross-site or same-site are refused. The `auth` module does the checks.
 //!
 //! [`serve`] owns the connection level: a header read timeout (which also
-//! closes idle keep-alive connections) and a cap on open connections, so a
-//! client that trickles bytes cannot hold sockets forever (slowloris).
+//! closes idle keep-alive connections), a cap on open connections and a
+//! lower cap per peer address, so a client that opens sockets or trickles
+//! bytes cannot hold them all (slowloris).
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
@@ -38,20 +53,21 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodFilter, MethodRouter, on};
 use axum::{Json, Router};
 use http_body_util::BodyExt;
-use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::rt::TokioIo;
 use hyper_util::server::graceful::GracefulShutdown;
 use hyper_util::service::TowerToHyperService;
 use jiff::SignedDuration;
 use serde::Deserialize;
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::auth::{Auth, AuthError, CsrfRejection, SessionCheck};
+use crate::auth::{self, Auth, AuthError, CsrfRejection, SessionCheck};
 use crate::catalog::{self, SourceId, WordId, WordQuery};
 use crate::clock::{Clock, DayRule, Moment, SystemClock};
 use crate::config::Limits;
 use crate::db::{Db, DbError};
 use crate::importer::Via;
+use crate::keep_alive;
 use crate::rate_limit::RateLimit;
 use crate::scheduler::{AnswerMatch, RawGrade};
 use crate::session::{self, RateInput, SessionError, SessionId, StartKind, StartRequest};
@@ -62,9 +78,13 @@ use crate::workflows::{self, WorkflowError};
 
 const HEALTHZ_PATH: &str = "/healthz";
 
+/// `require-trusted-types-for`: the page builds its DOM with nodes and text
+/// only, so every string-to-code sink (`innerHTML` and friends) is simply
+/// forbidden; no policy is defined, so none can be used.
 const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; style-src 'self'; \
      img-src 'self' data:; media-src 'self'; connect-src 'self'; object-src 'none'; \
-     base-uri 'none'; frame-ancestors 'none'; form-action 'self'";
+     base-uri 'none'; frame-ancestors 'none'; form-action 'self'; \
+     require-trusted-types-for 'script'";
 
 /// Header names are lowercase, as `HeaderName::from_static` requires.
 const SECURITY_HEADERS: &[(&str, &str)] = &[
@@ -74,6 +94,8 @@ const SECURITY_HEADERS: &[(&str, &str)] = &[
     // POSTs, which the CSRF guard (§9.3) must refuse. Nothing leaves the site.
     ("referrer-policy", "same-origin"),
     ("cross-origin-opener-policy", "same-origin"),
+    // No other origin may embed or read anything the app serves.
+    ("cross-origin-resource-policy", "same-origin"),
     (
         "permissions-policy",
         "camera=(), microphone=(), geolocation=()",
@@ -96,6 +118,11 @@ const PREVIEW_TIMEOUT_MESSAGE: &str =
 /// than a connection reset; anything larger is cut off.
 const DRAIN_FACTOR: usize = 4;
 const TIMEOUT_MESSAGE: &str = "The request took too long";
+/// What a client that was refused for load should wait, in seconds.
+const RETRY_AFTER_BUSY_SECS: u64 = 5;
+/// Most request log lines per second; the rest are counted, not written
+/// (a flood of requests must not turn into a flood of log, R-83).
+const LOG_LINES_PER_SECOND: u32 = 20;
 
 /// Body limit of login, setup and password change (§9.4).
 const LOGIN_BODY_BYTES: usize = 2 * 1024;
@@ -121,6 +148,12 @@ pub struct AppState {
     auth: Arc<Auth>,
     /// Body limit of the import routes (set by [`app`] from the limits).
     import_body_bytes: usize,
+    /// One import (preview or commit) at a time, its body included.
+    import_turn: Arc<Semaphore>,
+    /// How long an import waits for its turn before it is refused.
+    import_wait: Duration,
+    /// Time the body of an import request may take to arrive.
+    body_read_timeout: Duration,
 }
 
 impl AppState {
@@ -130,12 +163,16 @@ impl AppState {
 
     /// With a controllable clock (tests).
     pub fn with_clock(db: Db, clock: Arc<dyn Clock>, day_rule: DayRule, auth: Arc<Auth>) -> Self {
+        let limits = Limits::default();
         Self {
             db,
             clock,
             day_rule,
             auth,
-            import_body_bytes: Limits::default().import_body_bytes,
+            import_body_bytes: limits.import_body_bytes,
+            import_turn: Arc::new(Semaphore::new(1)),
+            import_wait: limits.slot_wait(),
+            body_read_timeout: limits.request_timeout(),
         }
     }
 
@@ -212,16 +249,24 @@ impl Verb {
 /// Route groups share a body limit, a timeout and possibly a rate limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Group {
+    /// `/healthz`: outside the slot pool, no body, no database.
+    Health,
     Standard,
+    /// Small bodies that hold a password, sent inside a session.
     Login,
+    /// Login and setup: the same small bodies from anyone, so the body
+    /// must also arrive quickly.
+    PublicLogin,
     ImportPreview,
     ImportCommit,
     Connector,
 }
 
-const GROUPS: [Group; 5] = [
+/// The groups served from the slot pool ([`Group::Health`] is not).
+const POOLED_GROUPS: [Group; 6] = [
     Group::Standard,
     Group::Login,
+    Group::PublicLogin,
     Group::ImportPreview,
     Group::ImportCommit,
     Group::Connector,
@@ -258,10 +303,10 @@ where
 /// The route table (design §8).
 fn endpoints() -> Vec<Endpoint> {
     use Access::{ImportToken, Public, Session};
-    use Group::{Connector, ImportCommit, ImportPreview, Login, Standard};
+    use Group::{Connector, Health, ImportCommit, ImportPreview, Login, PublicLogin, Standard};
     use Verb::{Get, Patch, Post};
     vec![
-        endpoint(Standard, Public, Get, HEALTHZ_PATH, healthz),
+        endpoint(Health, Public, Get, HEALTHZ_PATH, healthz),
         endpoint(
             Standard,
             Public,
@@ -277,9 +322,10 @@ fn endpoints() -> Vec<Endpoint> {
             web_assets::asset,
         ),
         endpoint(Standard, Public, Get, "/api/auth/setup", setup_status),
-        endpoint(Login, Public, Post, "/api/auth/setup", setup),
-        endpoint(Login, Public, Post, "/api/auth/login", login),
+        endpoint(PublicLogin, Public, Post, "/api/auth/setup", setup),
+        endpoint(PublicLogin, Public, Post, "/api/auth/login", login),
         endpoint(Standard, Session, Post, "/api/auth/logout", logout),
+        endpoint(Standard, Session, Post, "/api/auth/logout-all", logout_all),
         endpoint(Standard, Session, Get, "/api/auth/me", me),
         endpoint(Login, Session, Post, "/api/auth/password", change_password),
         endpoint(
@@ -360,6 +406,8 @@ fn endpoints() -> Vec<Endpoint> {
 pub fn app(state: AppState, limits: &Limits) -> Router {
     let state = AppState {
         import_body_bytes: limits.import_body_bytes,
+        import_wait: limits.slot_wait(),
+        body_read_timeout: limits.request_timeout(),
         ..state
     };
     let standard = TimeoutPolicy {
@@ -377,16 +425,19 @@ pub fn app(state: AppState, limits: &Limits) -> Router {
             .or_default()
             .push((e.verb.method(), e.access));
     }
-    let mut routes = Router::new();
-    for group in GROUPS {
+    let group_router = |group: Group| {
         let mut router: Router<AppState> = Router::new();
         for e in endpoints.iter().filter(|e| e.group == group) {
             router = router.route(e.path, e.handler.clone());
         }
-        let router = router.with_state(state.clone());
+        router.with_state(state.clone())
+    };
+    let mut routes = Router::new();
+    for group in POOLED_GROUPS {
+        let router = group_router(group);
         let (body_bytes, timeout, rate) = match group {
-            Group::Standard => (limits.body_bytes, standard, None),
-            Group::Login => (LOGIN_BODY_BYTES, standard, None),
+            Group::Health | Group::Standard => (limits.body_bytes, standard, None),
+            Group::Login | Group::PublicLogin => (LOGIN_BODY_BYTES, standard, None),
             Group::ImportPreview => (
                 limits.import_body_bytes,
                 TimeoutPolicy {
@@ -406,6 +457,17 @@ pub fn app(state: AppState, limits: &Limits) -> Router {
             Group::Connector => (CONNECTOR_BODY_BYTES, standard, Some(&connector_limit)),
         };
         let mut router = with_limits(router, body_bytes, timeout);
+        if group == Group::PublicLogin {
+            // Added last, so it runs first: the body has its own short
+            // deadline, and the request timeout covers what follows.
+            router = router.layer(middleware::from_fn_with_state(
+                BodyDeadline {
+                    within: limits.public_body_read_timeout(),
+                    max_bytes: body_bytes,
+                },
+                buffer_body_in_time,
+            ));
+        }
         if let Some(limit) = rate {
             router = router.layer(middleware::from_fn_with_state(
                 (Arc::clone(limit), Arc::clone(&state.clock)),
@@ -414,13 +476,19 @@ pub fn app(state: AppState, limits: &Limits) -> Router {
         }
         routes = routes.merge(router);
     }
+    let slots = Slots::new(
+        limits,
+        Some((Arc::clone(&state.auth), Arc::clone(&state.clock))),
+    );
+    let health = group_router(Group::Health);
     let guard = Guard {
         state,
         access: Arc::new(access),
     };
     harden(
         routes.layer(middleware::from_fn_with_state(guard, protect)),
-        limits,
+        health,
+        slots,
     )
 }
 
@@ -438,15 +506,19 @@ fn with_limits(routes: Router, body_bytes: usize, timeout: TimeoutPolicy) -> Rou
         .layer(middleware::from_fn_with_state(timeout, limit_time))
 }
 
-/// Wrap `routes` with the concurrency limit, logging and security headers.
+/// Wrap `routes` with the concurrency limit, then add the `health` routes
+/// (which therefore never wait for a slot), logging and security headers.
 /// The last layer added is the outermost, so the headers are set on every
 /// response, including timeouts, overload answers and 404s.
-fn harden(routes: Router, limits: &Limits) -> Router {
-    let slots = Arc::new(Semaphore::new(limits.max_concurrent_requests));
+fn harden(routes: Router, health: Router, slots: Slots) -> Router {
     routes
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(slots, limit_concurrency))
-        .layer(middleware::from_fn(log_request))
+        .merge(health)
+        .layer(middleware::from_fn_with_state(
+            Arc::new(LogBudget::new(LOG_LINES_PER_SECOND)),
+            log_request,
+        ))
         .layer(middleware::from_fn(security_headers))
 }
 
@@ -460,19 +532,14 @@ async fn not_found() -> Response {
     error_response(StatusCode::NOT_FOUND, "not_found", "Not found")
 }
 
-/// Liveness: the process serves requests and its database connection answers.
-async fn healthz(State(state): State<AppState>) -> Response {
-    match state.db.ping().await {
-        Ok(()) => Json(serde_json::json!({ "status": "ok" })).into_response(),
-        Err(err) => {
-            tracing::error!(error = %err, "health check: database unavailable");
-            error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "unavailable",
-                "Unavailable",
-            )
-        }
-    }
+/// Liveness: the process accepts connections and serves requests. It asks
+/// nothing of the database (whose single connection a long import may hold)
+/// and needs no request slot, so it answers at once whatever else is going
+/// on; a container that is merely busy is never restarted for it. The
+/// database is checked when the app starts, and a failing one shows in
+/// every request's log line.
+async fn healthz() -> Response {
+    Json(serde_json::json!({ "status": "ok" })).into_response()
 }
 
 // ── authentication (design §9) ─────────────────────────────────────────────
@@ -579,6 +646,15 @@ fn auth_error(err: &AuthError) -> Response {
             retry_after(&mut response, *retry_after_secs);
             response
         }
+        AuthError::SessionEnded => {
+            let mut response = error_response(
+                StatusCode::UNAUTHORIZED,
+                "session_ended",
+                "Too many wrong passwords: this device was logged out. Log in again.",
+            );
+            set_cookie(&mut response, &auth::expired_session_cookie());
+            response
+        }
         AuthError::SetupRequired => error_response(
             StatusCode::CONFLICT,
             "setup_required",
@@ -681,7 +757,8 @@ async fn change_password(
         )
         .await
     {
-        Ok(()) => ok_status().into_response(),
+        // Every session ended; this device continues with a new one.
+        Ok(cookie) => with_session_cookie(&cookie),
         Err(err) => auth_error(&err),
     }
 }
@@ -710,6 +787,7 @@ struct ConnectorTokenBody {
 /// one stops working. Needs the current password.
 async fn create_connector_token(
     State(state): State<AppState>,
+    headers: HeaderMap,
     body: Result<Json<ConnectorTokenBody>, JsonRejection>,
 ) -> Response {
     let body = match body {
@@ -723,7 +801,7 @@ async fn create_connector_token(
     };
     match state
         .auth
-        .create_connector_token(&state.db, &state.clock, body.current_password)
+        .create_connector_token(&state.db, &state.clock, &headers, body.current_password)
         .await
     {
         Ok(token) => Json(serde_json::json!({ "token": token })).into_response(),
@@ -733,6 +811,19 @@ async fn create_connector_token(
 
 async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
     match state.auth.logout(&state.db, &headers).await {
+        Ok(cookie) => {
+            let mut response = ok_status().into_response();
+            set_cookie(&mut response, &cookie);
+            response
+        }
+        Err(err) => internal_error(&err),
+    }
+}
+
+/// `POST /api/auth/logout-all`: "log out everywhere". Every session ends,
+/// this device's too; the answer removes its cookie.
+async fn logout_all(State(state): State<AppState>) -> Response {
+    match state.auth.logout_all(&state.db).await {
         Ok(cookie) => {
             let mut response = ok_status().into_response();
             set_cookie(&mut response, &cookie);
@@ -785,14 +876,30 @@ fn too_large() -> Response {
     )
 }
 
+fn body_timeout() -> Response {
+    error_response(
+        StatusCode::REQUEST_TIMEOUT,
+        "timeout",
+        "The request body did not arrive in time.",
+    )
+}
+
+/// The server has no room for the request right now.
+fn busy(code: &str, message: &str) -> Response {
+    let mut response = error_response(StatusCode::SERVICE_UNAVAILABLE, code, message);
+    retry_after(&mut response, RETRY_AFTER_BUSY_SECS);
+    response
+}
+
 /// Read the body of an import request: JSON `{"text": "…"}` of at most
-/// `limit` bytes. An oversized body is still read to its end (up to
-/// [`DRAIN_FACTOR`] × `limit`) and discarded, so the client receives the
-/// JSON 413 instead of a connection reset.
+/// `limit` bytes, which must arrive within `within`. An oversized body is
+/// still read to its end (up to [`DRAIN_FACTOR`] × `limit`) and discarded,
+/// so the client receives the JSON 413 instead of a connection reset.
 async fn read_import_request(
     headers: &HeaderMap,
     body: Body,
     limit: usize,
+    within: Duration,
 ) -> Result<ImportRequest, Box<Response>> {
     let is_json = headers
         .get(header::CONTENT_TYPE)
@@ -814,30 +921,38 @@ async fn read_import_request(
     if declared.is_some_and(|n| n > drain_limit) {
         return Err(Box::new(too_large()));
     }
-    let mut body = body;
-    let mut bytes: Vec<u8> = Vec::new();
-    let mut total: usize = 0;
-    while let Some(frame) = body.frame().await {
-        let Ok(frame) = frame else {
-            return Err(Box::new(error_response(
-                StatusCode::BAD_REQUEST,
-                "bad_request",
-                "The request body could not be read.",
-            )));
-        };
-        if let Ok(data) = frame.into_data() {
-            total = total.saturating_add(data.len());
-            if total > drain_limit {
-                return Err(Box::new(too_large()));
-            }
-            if total <= limit {
-                bytes.extend_from_slice(&data);
+    let read = async {
+        let mut body = body;
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut total: usize = 0;
+        while let Some(frame) = body.frame().await {
+            let Ok(frame) = frame else {
+                return Err(Box::new(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "bad_request",
+                    "The request body could not be read.",
+                )));
+            };
+            if let Ok(data) = frame.into_data() {
+                total = total.saturating_add(data.len());
+                if total > drain_limit {
+                    return Err(Box::new(too_large()));
+                }
+                if total <= limit {
+                    bytes.extend_from_slice(&data);
+                }
             }
         }
-    }
-    if total > limit {
-        return Err(Box::new(too_large()));
-    }
+        if total > limit {
+            return Err(Box::new(too_large()));
+        }
+        Ok(bytes)
+    };
+    let bytes = match tokio::time::timeout(within, read).await {
+        Ok(bytes) => bytes?,
+        Err(_) => return Err(Box::new(body_timeout())),
+    };
+    // Straight into the one string: no JSON tree of the body is built.
     serde_json::from_slice(&bytes).map_err(|_| {
         Box::new(error_response(
             StatusCode::BAD_REQUEST,
@@ -847,26 +962,71 @@ async fn read_import_request(
     })
 }
 
-async fn import_preview(State(state): State<AppState>, headers: HeaderMap, body: Body) -> Response {
-    let request = match read_import_request(&headers, body, state.import_body_bytes).await {
-        Ok(request) => request,
-        Err(response) => return *response,
-    };
-    match workflows::preview_import(&state.db, &request.text, state.moment()).await {
-        Ok(report) => Json(report).into_response(),
-        Err(err) => workflow_error(&err),
+impl AppState {
+    /// Wait (briefly) for the import turn, then read the request. The turn
+    /// is taken first, so at most one import body is in memory at a time.
+    async fn import_request(
+        &self,
+        headers: &HeaderMap,
+        body: Body,
+    ) -> Result<(OwnedSemaphorePermit, ImportRequest), Box<Response>> {
+        let turn = Arc::clone(&self.import_turn).acquire_owned();
+        let Ok(Ok(turn)) = tokio::time::timeout(self.import_wait, turn).await else {
+            return Err(Box::new(busy(
+                "busy",
+                "Another import is being processed. Try again in a moment.",
+            )));
+        };
+        let request = read_import_request(
+            headers,
+            body,
+            self.import_body_bytes,
+            self.body_read_timeout,
+        )
+        .await?;
+        Ok((turn, request))
     }
 }
 
-async fn import_commit(State(state): State<AppState>, headers: HeaderMap, body: Body) -> Response {
-    let request = match read_import_request(&headers, body, state.import_body_bytes).await {
-        Ok(request) => request,
+/// Run an import in its own task that keeps the import turn until the work
+/// is really done, also when the request stops waiting for it (timeout).
+async fn run_import<F>(turn: OwnedSemaphorePermit, work: F) -> Response
+where
+    F: Future<Output = Result<crate::importer::ImportReport, WorkflowError>> + Send + 'static,
+{
+    let task = tokio::spawn(async move {
+        let _turn = turn;
+        work.await
+    });
+    match task.await {
+        Ok(Ok(report)) => Json(report).into_response(),
+        Ok(Err(err)) => workflow_error(&err),
+        Err(err) => internal_error(&err),
+    }
+}
+
+async fn import_preview(State(state): State<AppState>, headers: HeaderMap, body: Body) -> Response {
+    let (turn, request) = match state.import_request(&headers, body).await {
+        Ok(ready) => ready,
         Err(response) => return *response,
     };
-    match workflows::commit_import(&state.db, &request.text, Via::Paste, state.moment()).await {
-        Ok(report) => Json(report).into_response(),
-        Err(err) => workflow_error(&err),
-    }
+    let now = state.moment();
+    run_import(turn, async move {
+        workflows::preview_import(&state.db, &request.text, now).await
+    })
+    .await
+}
+
+async fn import_commit(State(state): State<AppState>, headers: HeaderMap, body: Body) -> Response {
+    let (turn, request) = match state.import_request(&headers, body).await {
+        Ok(ready) => ready,
+        Err(response) => return *response,
+    };
+    let now = state.moment();
+    run_import(turn, async move {
+        workflows::commit_import(&state.db, &request.text, Via::Paste, now).await
+    })
+    .await
 }
 
 async fn import_recent(State(state): State<AppState>) -> Response {
@@ -1071,6 +1231,8 @@ struct StartBody {
     kind: StartKind,
     #[serde(default)]
     add_new_anyway: bool,
+    /// `more_new` only.
+    count: Option<u32>,
 }
 
 async fn start_session(
@@ -1082,7 +1244,8 @@ async fn start_session(
         Err(rejection) => {
             return rejected_body(
                 &rejection,
-                "The body must be JSON {\"kind\": \"start\"|\"continue\", \"scope_source_id\"?, \"add_new_anyway\"?}.",
+                "The body must be JSON {\"kind\": \"start\"|\"continue\"|\"extra\"|\"more_new\", \
+                 \"scope_source_id\"?, \"add_new_anyway\"?, \"count\"?}.",
             );
         }
     };
@@ -1090,6 +1253,7 @@ async fn start_session(
         scope: body.scope_source_id.map(SourceId::new),
         kind: body.kind,
         add_new_anyway: body.add_new_anyway,
+        count: body.count,
     };
     let now = state.moment();
     respond(
@@ -1284,6 +1448,18 @@ fn unauthenticated() -> Response {
 /// connector; CSRF guard and (unless public) a live session for the rest.
 async fn protect(State(guard): State<Guard>, request: Request, next: Next) -> Response {
     let auth = &guard.state.auth;
+    let forbidden_origin = || {
+        error_response(
+            StatusCode::FORBIDDEN,
+            "forbidden_origin",
+            "The request does not come from this app.",
+        )
+    };
+    if request.uri().path().starts_with("/api/")
+        && Auth::check_fetch_site(request.headers()).is_err()
+    {
+        return forbidden_origin();
+    }
     let access = guard.access_of(&request);
     if access == Access::ImportToken {
         match auth
@@ -1306,13 +1482,7 @@ async fn protect(State(guard): State<Guard>, request: Request, next: Next) -> Re
     }
     match auth.check_csrf(request.method(), request.headers()) {
         Ok(()) => {}
-        Err(CsrfRejection::Origin) => {
-            return error_response(
-                StatusCode::FORBIDDEN,
-                "forbidden_origin",
-                "The request does not come from this app.",
-            );
-        }
+        Err(CsrfRejection::Origin) => return forbidden_origin(),
         Err(CsrfRejection::ContentType) => {
             return error_response(
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -1381,7 +1551,74 @@ async fn security_headers(request: Request, next: Next) -> Response {
     response
 }
 
-async fn log_request(request: Request, next: Next) -> Response {
+/// At most `per_second` request log lines a second; what is over is counted
+/// and reported in one line when the next second starts.
+#[derive(Debug)]
+struct LogBudget {
+    per_second: u32,
+    state: Mutex<LogWindow>,
+}
+
+#[derive(Debug)]
+struct LogWindow {
+    started: Instant,
+    written: u32,
+    suppressed: u64,
+}
+
+/// What [`LogBudget::admit`] decided for one line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Admission {
+    /// Write the line.
+    write: bool,
+    /// Lines not written in the second that just ended (to report once).
+    suppressed_before: u64,
+}
+
+impl LogBudget {
+    fn new(per_second: u32) -> Self {
+        Self {
+            per_second,
+            state: Mutex::new(LogWindow {
+                started: Instant::now(),
+                written: 0,
+                suppressed: 0,
+            }),
+        }
+    }
+
+    fn admit(&self, now: Instant) -> Admission {
+        let mut window = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut suppressed_before = 0;
+        if now.duration_since(window.started) >= Duration::from_secs(1) {
+            suppressed_before = window.suppressed;
+            *window = LogWindow {
+                started: now,
+                written: 0,
+                suppressed: 0,
+            };
+        }
+        let write = window.written < self.per_second;
+        if write {
+            window.written += 1;
+        } else {
+            window.suppressed += 1;
+        }
+        Admission {
+            write,
+            suppressed_before,
+        }
+    }
+}
+
+async fn log_request(
+    State(budget): State<Arc<LogBudget>>,
+    request: Request,
+    next: Next,
+) -> Response {
     let started = Instant::now();
     let method = request.method().clone();
     // The route template (e.g. `/api/words/{id}`), never the concrete path or query.
@@ -1390,13 +1627,24 @@ async fn log_request(request: Request, next: Next) -> Response {
         .get::<MatchedPath>()
         .map_or_else(|| "(unmatched)".to_owned(), |path| path.as_str().to_owned());
     let response = next.run(request).await;
-    tracing::info!(
-        method = %method,
-        route = %route,
-        status = response.status().as_u16(),
-        duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-        "request"
-    );
+    let status = response.status().as_u16();
+    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    if route == HEALTHZ_PATH {
+        // Asked every few seconds by the container runtime: noise at info.
+        tracing::debug!(method = %method, route = %route, status, duration_ms, "request");
+        return response;
+    }
+    let admission = budget.admit(Instant::now());
+    if admission.suppressed_before > 0 {
+        tracing::warn!(
+            suppressed = admission.suppressed_before,
+            "suppressed {} request log lines",
+            admission.suppressed_before
+        );
+    }
+    if admission.write {
+        tracing::info!(method = %method, route = %route, status, duration_ms, "request");
+    }
     response
 }
 
@@ -1411,20 +1659,157 @@ async fn limit_time(
     }
 }
 
-async fn limit_concurrency(
-    State(slots): State<Arc<Semaphore>>,
+/// How the body of a request to a public route must arrive.
+#[derive(Debug, Clone, Copy)]
+struct BodyDeadline {
+    within: Duration,
+    max_bytes: usize,
+}
+
+/// Read the whole (small) body before the handler runs, within the
+/// deadline: an unauthenticated client that sends a request head and then
+/// stalls loses its slot after seconds, not after the request timeout.
+async fn buffer_body_in_time(
+    State(deadline): State<BodyDeadline>,
     request: Request,
     next: Next,
 ) -> Response {
-    match slots.acquire().await {
-        Ok(_permit) => next.run(request).await,
-        Err(_) => error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "overloaded",
-            "Server is shutting down",
+    let (parts, body) = request.into_parts();
+    let read = axum::body::to_bytes(body, deadline.max_bytes);
+    match tokio::time::timeout(deadline.within, read).await {
+        Ok(Ok(bytes)) => {
+            next.run(Request::from_parts(parts, Body::from(bytes)))
+                .await
+        }
+        // Over the limit (or a broken body): the same answer as from the
+        // body limit of the other routes.
+        Ok(Err(_)) => error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "too_large",
+            "The request is too large.",
         ),
+        Err(_) => body_timeout(),
     }
 }
+
+/// The request slots (R-83): `general` ones for anyone and a few
+/// `reserved` ones that only requests of a known live session may take, so
+/// requests without a session can never occupy every slot.
+#[derive(Debug, Clone)]
+struct Slots {
+    general: Arc<Semaphore>,
+    reserved: Arc<Semaphore>,
+    /// How long a request waits for a slot before it is refused.
+    wait: Duration,
+    /// Who knows the live sessions (`None`: nobody gets a reserved slot).
+    sessions: Option<(Arc<Auth>, Arc<dyn Clock>)>,
+}
+
+impl Slots {
+    fn new(limits: &Limits, sessions: Option<(Arc<Auth>, Arc<dyn Clock>)>) -> Self {
+        let reserved = limits
+            .reserved_session_slots
+            .min(limits.max_concurrent_requests.saturating_sub(1));
+        Self {
+            general: Arc::new(Semaphore::new(limits.max_concurrent_requests - reserved)),
+            reserved: Arc::new(Semaphore::new(reserved)),
+            wait: limits.slot_wait(),
+            sessions,
+        }
+    }
+
+    /// A slot for a request with these headers, or `None` when none became
+    /// free in time.
+    async fn acquire(&self, headers: &HeaderMap) -> Option<OwnedSemaphorePermit> {
+        if let Ok(permit) = Arc::clone(&self.general).try_acquire_owned() {
+            return Some(permit);
+        }
+        let known_session = self
+            .sessions
+            .as_ref()
+            .is_some_and(|(auth, clock)| auth.has_known_session(headers, clock.now()));
+        let general = Arc::clone(&self.general).acquire_owned();
+        let permit = async {
+            if known_session {
+                tokio::select! {
+                    permit = general => permit,
+                    permit = Arc::clone(&self.reserved).acquire_owned() => permit,
+                }
+            } else {
+                general.await
+            }
+        };
+        tokio::time::timeout(self.wait, permit).await.ok()?.ok()
+    }
+}
+
+async fn limit_concurrency(State(slots): State<Slots>, request: Request, next: Next) -> Response {
+    match slots.acquire(request.headers()).await {
+        Some(_permit) => next.run(request).await,
+        None => busy("overloaded", "The server is busy. Try again in a moment."),
+    }
+}
+
+/// Open connections per peer address (R-83).
+#[derive(Debug)]
+struct PeerLimit {
+    max: usize,
+    open: Mutex<HashMap<IpAddr, usize>>,
+}
+
+/// One counted connection of a peer; dropping it frees the place.
+#[derive(Debug)]
+struct PeerConnection {
+    limit: Arc<PeerLimit>,
+    peer: IpAddr,
+}
+
+impl PeerLimit {
+    fn new(max: usize) -> Arc<Self> {
+        Arc::new(Self {
+            max,
+            open: Mutex::new(HashMap::new()),
+        })
+    }
+
+    fn counts(&self) -> std::sync::MutexGuard<'_, HashMap<IpAddr, usize>> {
+        self.open
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Count a new connection of `peer`, unless it has `max` open already.
+    fn admit(self: &Arc<Self>, peer: IpAddr) -> Option<PeerConnection> {
+        // An IPv4 client on a dual-stack socket is the same peer.
+        let peer = peer.to_canonical();
+        let mut open = self.counts();
+        let count = open.entry(peer).or_insert(0);
+        if *count >= self.max {
+            return None;
+        }
+        *count += 1;
+        Some(PeerConnection {
+            limit: Arc::clone(self),
+            peer,
+        })
+    }
+}
+
+impl Drop for PeerConnection {
+    fn drop(&mut self) {
+        let mut open = self.limit.counts();
+        if let Some(count) = open.get_mut(&self.peer) {
+            *count -= 1;
+            if *count == 0 {
+                open.remove(&self.peer);
+            }
+        }
+    }
+}
+
+/// What a connection over the per-peer cap is told before it is closed.
+const TOO_MANY_CONNECTIONS: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 5\r\n\
+Connection: close\r\nContent-Length: 0\r\n\r\n";
 
 /// Serve `app` on `listener` until `shutdown` resolves; then stop accepting
 /// and give open requests up to the request timeout to finish.
@@ -1434,14 +1819,8 @@ pub async fn serve(
     limits: &Limits,
     shutdown: impl Future<Output = ()>,
 ) -> std::io::Result<()> {
-    let mut http1 = hyper::server::conn::http1::Builder::new();
-    http1
-        .timer(TokioTimer::new())
-        // Applies to every request head, including the wait for the next
-        // request on a keep-alive connection: idle connections are closed too.
-        .header_read_timeout(limits.header_read_timeout())
-        .keep_alive(true);
     let connections = Arc::new(Semaphore::new(limits.max_connections));
+    let peers = PeerLimit::new(limits.max_connections_per_peer);
     let graceful = GracefulShutdown::new();
     let mut shutdown = std::pin::pin!(shutdown);
 
@@ -1453,9 +1832,9 @@ pub async fn serve(
             }
             () = &mut shutdown => break,
         };
-        let stream = tokio::select! {
+        let (stream, peer) = tokio::select! {
             accepted = listener.accept() => match accepted {
-                Ok((stream, _peer)) => stream,
+                Ok(accepted) => accepted,
                 Err(err) => {
                     // E.g. EMFILE: back off instead of spinning or exiting.
                     tracing::warn!(error = %err, "accept failed");
@@ -1465,6 +1844,26 @@ pub async fn serve(
             },
             () = &mut shutdown => break,
         };
+        let Some(peer_connection) = peers.admit(peer.ip()) else {
+            // One address may not hold every connection. Best effort: the
+            // answer fits the socket buffer of a fresh connection.
+            let _ = stream.try_write(TOO_MANY_CONNECTIONS);
+            continue;
+        };
+        // Per connection: a head must arrive within the head deadline of its
+        // first byte; between requests the connection may idle for the
+        // keep-alive time (`keep_alive`). Idle connections of one address
+        // stay bounded by the per-peer cap.
+        let (stream, timer) = keep_alive::wrap(
+            stream,
+            limits.header_read_timeout(),
+            limits.keep_alive_idle(),
+        );
+        let mut http1 = hyper::server::conn::http1::Builder::new();
+        http1
+            .timer(timer)
+            .header_read_timeout(limits.header_read_timeout())
+            .keep_alive(true);
         let connection =
             http1.serve_connection(TokioIo::new(stream), TowerToHyperService::new(app.clone()));
         let connection = graceful.watch(connection);
@@ -1472,6 +1871,7 @@ pub async fn serve(
             if let Err(err) = connection.await {
                 tracing::debug!(error = %err, "connection closed with error");
             }
+            drop(peer_connection);
             drop(permit);
         });
     }
@@ -1555,7 +1955,11 @@ mod tests {
             duration: limits.request_timeout(),
             message,
         };
-        harden(with_limits(routes, body_bytes, timeout), limits)
+        harden(
+            with_limits(routes, body_bytes, timeout),
+            Router::new(),
+            Slots::new(limits, None),
+        )
     }
 
     fn post_bytes(len: usize) -> Request {
@@ -1690,5 +2094,144 @@ mod tests {
             assert!(!text.contains(secret), "{text}");
             assert!(text.ends_with("(***)"), "{text}");
         }
+    }
+
+    /// B4: at most `per_second` request lines a second; the rest are
+    /// counted and reported once when the next second starts.
+    #[test]
+    fn r83_request_log_lines_are_rate_limited() {
+        let budget = LogBudget::new(20);
+        let start = Instant::now();
+        let mut written = 0;
+        for i in 0..1000u64 {
+            let admission = budget.admit(start + Duration::from_micros(i * 900));
+            assert_eq!(admission.suppressed_before, 0);
+            written += u32::from(admission.write);
+        }
+        assert_eq!(written, 20, "20 of 1000 lines within one second");
+        // The first line of the next second reports what was left out, once.
+        let next = budget.admit(start + Duration::from_millis(1000));
+        assert_eq!(
+            next,
+            Admission {
+                write: true,
+                suppressed_before: 980
+            }
+        );
+        let after = budget.admit(start + Duration::from_millis(1001));
+        assert_eq!(
+            after,
+            Admission {
+                write: true,
+                suppressed_before: 0
+            }
+        );
+        // A quiet second has nothing to report.
+        let quiet = budget.admit(start + Duration::from_millis(5000));
+        assert_eq!(quiet.suppressed_before, 0);
+    }
+
+    /// B1: the per-peer connection cap counts per address.
+    #[test]
+    fn r83_connections_are_counted_per_peer_address() {
+        let limit = PeerLimit::new(2);
+        let proxy: IpAddr = "192.0.2.7".parse().expect("ip");
+        let mapped: IpAddr = "::ffff:192.0.2.7".parse().expect("ip");
+        let local: IpAddr = Ipv4Addr::LOCALHOST.into();
+        let first = limit.admit(proxy).expect("first");
+        let second = limit
+            .admit(mapped)
+            .expect("the same peer over a dual-stack socket");
+        assert!(limit.admit(proxy).is_none(), "the peer is at its cap");
+        // Another address (the health check on loopback) is not affected.
+        let health = limit.admit(local).expect("another peer");
+        drop(first);
+        let third = limit.admit(proxy).expect("a place is free again");
+        assert!(limit.admit(proxy).is_none());
+        drop((second, third, health));
+        assert!(limit.counts().is_empty(), "nothing is kept for gone peers");
+    }
+
+    /// B1: a request waits only briefly for a slot; routes outside the
+    /// pool (the health check) never wait.
+    #[tokio::test]
+    async fn r83_requests_beyond_the_slots_are_refused_after_a_short_wait() {
+        let limits = Limits {
+            max_concurrent_requests: 2,
+            reserved_session_slots: 1,
+            slot_wait_ms: 100,
+            request_timeout_secs: 5,
+            ..Limits::default()
+        };
+        let health = Router::new().route("/health", get(|| async { "ok" }));
+        let routes = Router::new().route(
+            "/slow",
+            get(|| async {
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                "done"
+            }),
+        );
+        let timeout = TimeoutPolicy {
+            duration: limits.request_timeout(),
+            message: TIMEOUT_MESSAGE,
+        };
+        // Nobody is known as a session here: one general slot in all.
+        let router = harden(
+            with_limits(routes, limits.body_bytes, timeout),
+            health,
+            Slots::new(&limits, None),
+        );
+        let request = |uri: &str| {
+            Request::builder()
+                .uri(uri)
+                .body(Body::empty())
+                .expect("request")
+        };
+        let slow = tokio::spawn(router.clone().oneshot(request("/slow")));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let started = Instant::now();
+        let refused = router
+            .clone()
+            .oneshot(request("/slow"))
+            .await
+            .expect("response");
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            refused
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("5")
+        );
+        assert!(
+            refused
+                .headers()
+                .contains_key(header::CONTENT_SECURITY_POLICY)
+        );
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(90) && waited < Duration::from_millis(400),
+            "{waited:?}"
+        );
+        let body = to_bytes(refused.into_body(), 1024).await.expect("body");
+        assert!(String::from_utf8_lossy(&body).contains("\"overloaded\""));
+
+        let started = Instant::now();
+        let healthy = router
+            .clone()
+            .oneshot(request("/health"))
+            .await
+            .expect("response");
+        assert_eq!(healthy.status(), StatusCode::OK);
+        assert!(started.elapsed() < Duration::from_millis(50));
+
+        assert_eq!(
+            slow.await.expect("join").expect("response").status(),
+            StatusCode::OK
+        );
+        // The slot is free again.
+        let again = router.oneshot(request("/slow")).await.expect("response");
+        assert_eq!(again.status(), StatusCode::OK);
     }
 }

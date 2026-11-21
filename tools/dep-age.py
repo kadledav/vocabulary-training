@@ -4,42 +4,68 @@
 The owner's rule: no release published less than 14 days before the run may be
 used anywhere, transitive dependencies included. This script checks every pin
 it can find and exits non-zero on any violation, on any lookup it cannot
-complete, and on anything it cannot verify (fail closed):
+complete, and on anything it cannot verify (fail closed).
+
+Threat model: it catches *accidental* young or unpinned dependencies (added by
+an agent, by Renovate or by copy-paste), not a committer who sets out to hide
+one. The command checks below are a deny-list of known installer/downloader
+tokens (cargo install, npm, pip, curl, docker, …) whose every use must match
+one of the verified forms; a tool it does not know is not detected, and
+deliberate shell obfuscation is out of scope (review covers that).
 
 * every Cargo.lock      crates.io packages (incl. transitive)        -> crates.io API
                         entries without a source must be workspace members
-* every package-lock.json  npm packages (incl. transitive); the `resolved`
-                        tarball URL must be registry.npmjs.org and name the
-                        same package and version; `integrity` is required -> npm `time` map
+* every package-lock.json  lockfileVersion 3 (`packages` map, no legacy
+                        `dependencies` tree), root entry = package.json's
+                        exact dependencies; npm packages (incl. transitive);
+                        the `resolved` tarball URL must be registry.npmjs.org
+                        and name the same package and version; `integrity`
+                        is required                                   -> npm `time` map
 * rust-toolchain.toml   the pinned Rust release                      -> static.rust-lang.org
-* Dockerfiles (`Dockerfile*`, `*.dockerfile`, `Containerfile`):
+* Dockerfiles (`Dockerfile*`, `*.dockerfile`, `Containerfile`, and any file a
+  workflow or compose file builds with `file:` / `dockerfile:`):
     - every `FROM` / `COPY --from` image must be `name:tag@sha256:<digest>`
       (or an earlier stage, or `scratch`)                            -> registry
     - `apt-get install` only with exact `package=version` pins       -> snapshot.debian.org
-      and, for a real install, a preceding dry-run proof
+      (dated by its first appearance for every built architecture,
+      DEBIAN_ARCHES) and, for a real install, a preceding dry-run proof
       `test "$(apt-get install -s <same pins> | grep -c '^Inst ')" = N`;
       apt sources only `https://snapshot.debian.org/archive/…/<timestamp>`
       (required when apt installs anything; the timestamp is dated)
     - `# syntax=` directives and `RUN --mount=…,from=` images like `FROM`;
       heredocs, `BUILDKIT_*` arguments and `ONBUILD` are errors
-    - other install/download commands only in these forms: `apt-get update`,
-      `rustup target add <target>`; other URLs and downloads
+    - known install/download commands only in these forms: `apt-get update`,
+      `rustup target add <target or "$VAR">`; other URLs and downloads
       (curl, wget, pip, …) are errors
-* M6: `ADD` from a URL only as `ADD --checksum=sha256:<hex> <GitHub release
-  asset URL> <dest>`, checksum = GitHub's digest, dated by the upload -> GitHub API
-* everywhere: `cargo update|generate-lockfile|add` are errors, and cargo
-  commands that resolve dependencies must use `--locked`
-* compose files (`compose*.yml`, `docker-compose*.yml`, any YAML file with
-  top-level `services:`; `include:`/`extends:` are errors): every `image:` must be
+    - `ADD` from a URL only as `ADD --checksum=sha256:<hex> <GitHub release
+      asset URL> <dest>`: the checksum must equal GitHub's digest of the
+      asset, dated by the asset's upload                           -> GitHub API
+* everywhere: `cargo update|generate-lockfile|add` are errors, cargo commands
+  that resolve dependencies must use `--locked`, `cargo --config` is an error;
+  settings that redirect downloads (registry/source variables, CARGO_HOME,
+  RUSTUP_TOOLCHAIN, PLAYWRIGHT_*, npm_config_*) are errors; any
+  `.cargo/config*` file is an error; `.npmrc` may only set NPMRC_KEYS
+* compose files (`compose*.yml`, `docker-compose*.yml`, also `*.yml.example`,
+  any YAML or JSON file with top-level `services`; `include:`/`extends:` are
+  errors): every `image:` (quoted keys too) must be
   `name:tag@sha256:<digest>`                                         -> registry
   (the project's own images, built from this repo, are exempt: OWN_IMAGES)
 * every file under .github/ (and local actions it references), line by line
   (comments stripped per physical line, folded blocks split as YAML does):
     - every `uses` must be exactly `uses: owner/repo[/path]@<40-hex SHA> # vX.Y.Z`
-      (tag must point to the SHA; age = later of release date and commit date)
+      (tag must point to the SHA; age = later of release date and commit date;
+      only HTTP 404 means "no release", any other error fails)
       or `uses: ./local/path` (whose files are scanned the same way);
     - every `*version*:` key must be exactly `node-version: X.Y.Z`   -> nodejs.org
-    - install/download commands are allowed only in these forms:
+    - `runs-on:` only versioned labels (ALLOWED_RUNNERS, never `*-latest`), or
+      `${{ matrix.runner }}` / `${{ inputs.runner }}` with every `runner:`
+      value in the file on that list;
+    - step inputs: `docker/setup-buildx-action` needs `driver-opts:
+      image=<pinned>`; `sbom:` only `false` or `generator=<pinned>`;
+      `context:` only a local path; `cache-from:` registry refs and
+      `build-contexts:` images only by digest; no `BUILDKIT_*` build-args;
+      `file:`/`dockerfile:` must name a file in the repo (checked as above);
+    - known install/download commands are allowed only in these forms:
         cargo install --locked <crate> --version X.Y.Z               -> crates.io API
         rustup toolchain install          (installs rust-toolchain.toml's version)
         npm ci --ignore-scripts / npm run <script>   (lock file checked above)
@@ -47,7 +73,7 @@ complete, and on anything it cannot verify (fail closed):
                                           (browsers of the Playwright version in the
                                           lock file; --no-install never fetches another
                                           version; no --with-deps, i.e. no OS packages)
-      anything else (pip, npx, yarn, curl, docker, `| sh`, …) is an error;
+      other uses of those tokens (pip, npx, yarn, curl, docker, `| sh`, …) are errors;
     - `name:tag@sha256:<digest>` image references (e.g. the BuildKit image in
       `driver-opts: image=…`, the SBOM generator in `sbom: generator=…`) are
       dated; `image=` / `generator=` without a digest are errors -> registry
@@ -55,9 +81,16 @@ complete, and on anything it cannot verify (fail closed):
 * dependency manifests the gate cannot check (requirements.txt, yarn.lock,
   go.mod, …) are errors until support is added.
 
+Directories skipped: SKIP_DIRS only at the repository root, and anywhere a
+`node_modules` that sits next to a (checked) package-lock.json.
+
 Image dates: gcr.io's upload time of the digest; elsewhere the newest
 `created` time of the image configs behind the digest (images without a real
 creation time, e.g. reproducible builds dated 1970, cannot be dated: error).
+
+Immutable lookups (crate/npm/Rust/Node versions, image digests, Debian
+packages) are cached in .cache/dep-age/ (ignored by git; `--no-cache` or
+DEP_AGE_CACHE=<dir> to change); action tags are looked up on every run.
 
 Standard library only. Set GITHUB_TOKEN to raise the GitHub API rate limit
 (CI does this automatically). Self-tests: tools/tests/test_dep_age.py.
@@ -82,7 +115,20 @@ from pathlib import Path
 USER_AGENT = "dep-age-check/1.0 (dependency age gate; python urllib)"
 CRATES_IO = "registry+https://github.com/rust-lang/crates.io-index"
 NPM_REGISTRY = "https://registry.npmjs.org/"
-SKIP_DIRS = {".git", "node_modules", "target", ".idea", "dev-data"}
+# Skipped only directly under the repository root (build output, VCS data,
+# this tool's cache); the same names deeper down are scanned. Anywhere, a
+# `node_modules` next to a package-lock.json is skipped: that lock file is
+# what installs it, and it is checked.
+# `.claude`: local agent worktrees (other checkouts of this repository).
+SKIP_DIRS = {".git", "node_modules", "target", ".idea", "dev-data", ".cache", ".claude"}
+# runs-on labels: versioned GitHub-hosted runner images only (never *-latest,
+# never self-hosted). `${{ matrix.runner }}` / `${{ inputs.runner }}` are
+# allowed when every `runner:` value in the file is on this list too.
+ALLOWED_RUNNERS = {"ubuntu-24.04", "ubuntu-24.04-arm", "macos-15"}
+RUNNER_REFERENCES = {"${{ matrix.runner }}", "${{ inputs.runner }}"}
+# The only .npmrc settings allowed: none of them changes where packages come
+# from or which versions are installed.
+NPMRC_KEYS = {"save-exact", "ignore-scripts", "engine-strict", "fund", "audit", "update-notifier"}
 SEMVER = r"\d+\.\d+\.\d+"
 # Images built from this repository (not third-party dependencies): compose
 # files may reference them with any tag/digest, e.g. a placeholder.
@@ -90,7 +136,12 @@ OWN_IMAGES = {"ghcr.io/kadledav/vocabulary-training", "ghcr.io/kadledav/vocabula
 
 
 class LookupFailed(Exception):
-    """A registry lookup failed; the gate fails closed."""
+    """A registry lookup failed; the gate fails closed. `status` is the HTTP
+    status when the server answered with an error, else None."""
+
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 @dataclass
@@ -140,7 +191,7 @@ def fetch(url: str, *, min_interval: float = 0.0, headers: dict[str, str] | None
                 time.sleep(delay)
                 delay *= 2
                 continue
-            raise LookupFailed(f"GET {url}: HTTP {err.code}") from err
+            raise LookupFailed(f"GET {url}: HTTP {err.code}", err.code) from err
         except (urllib.error.URLError, TimeoutError) as err:
             if attempt < 4:
                 time.sleep(delay)
@@ -164,44 +215,102 @@ def end_of_day(day: str) -> dt.datetime:
     return dt.datetime(d.year, d.month, d.day, 23, 59, 59, tzinfo=dt.timezone.utc)
 
 
+# ── cache of immutable facts ─────────────────────────────────────────────────
+#
+# Publish dates of a crate/npm/Rust/Node version, of an image digest and of a
+# Debian package version never change once known, so successful lookups are
+# kept in CACHE_DIR (one JSON file per kind, keyed by name and version or
+# digest; ignored by git) and repeated runs do not spend registry rate limits.
+# Failures are never cached, and neither is anything that can change: which
+# commit an action's tag points to and its release are looked up every run.
+
+CACHE_DIR = Path(os.environ.get("DEP_AGE_CACHE") or Path(__file__).resolve().parent.parent / ".cache" / "dep-age")
+cache_enabled = True
+_cache: dict[str, dict[str, str]] = {}
+
+
+def _cache_file(kind: str) -> Path:
+    return CACHE_DIR / f"{kind}.json"
+
+
+def cached(kind: str, key: str, lookup) -> dt.datetime:
+    """`lookup()`, or its earlier result for (kind, key) from the cache."""
+    if not cache_enabled:
+        return lookup()
+    if kind not in _cache:
+        try:
+            loaded = json.loads(_cache_file(kind).read_text())
+            _cache[kind] = {k: v for k, v in loaded.items() if isinstance(v, str)} if isinstance(loaded, dict) else {}
+        except (OSError, ValueError):
+            _cache[kind] = {}
+    entries = _cache[kind]
+    if key in entries:
+        try:
+            return parse_ts(entries[key])
+        except ValueError:
+            del entries[key]
+    value = lookup()
+    entries[key] = value.isoformat()
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = _cache_file(kind).with_suffix(".tmp")
+        tmp.write_text(json.dumps(entries, indent=0, sort_keys=True))
+        tmp.replace(_cache_file(kind))
+    except OSError as err:
+        print(f"dep-age: cannot write the cache {CACHE_DIR}: {err}", file=sys.stderr)
+    return value
+
+
 # ── registry lookups (replaced by fakes in the self-tests) ───────────────────
 
 
 def crate_published(name: str, version: str) -> dt.datetime:
-    # crates.io asks API clients for at most one request per second.
-    data = fetch_json(f"https://crates.io/api/v1/crates/{name}/{version}", min_interval=1.0)
-    return parse_ts(data["version"]["created_at"])  # type: ignore[index]
+    def lookup() -> dt.datetime:
+        # crates.io asks API clients for at most one request per second.
+        data = fetch_json(f"https://crates.io/api/v1/crates/{name}/{version}", min_interval=1.0)
+        return parse_ts(data["version"]["created_at"])  # type: ignore[index]
+
+    return cached("crate", f"{name}@{version}", lookup)
 
 
 _npm_cache: dict[str, dict] = {}
 
 
 def npm_published(name: str, version: str) -> dt.datetime:
-    if name not in _npm_cache:
-        quoted = urllib.parse.quote(name, safe="@").replace("/", "%2f")
-        _npm_cache[name] = fetch_json(NPM_REGISTRY + quoted)  # type: ignore[assignment]
-    times = _npm_cache[name].get("time", {})
-    if version not in times:
-        raise LookupFailed("no publish time in the npm registry")
-    return parse_ts(times[version])
+    def lookup() -> dt.datetime:
+        if name not in _npm_cache:
+            quoted = urllib.parse.quote(name, safe="@").replace("/", "%2f")
+            _npm_cache[name] = fetch_json(NPM_REGISTRY + quoted)  # type: ignore[assignment]
+        times = _npm_cache[name].get("time", {})
+        if version not in times:
+            raise LookupFailed("no publish time in the npm registry")
+        return parse_ts(times[version])
+
+    return cached("npm", f"{name}@{version}", lookup)
 
 
 def rust_published(version: str) -> dt.datetime:
-    manifest = tomllib.loads(fetch(f"https://static.rust-lang.org/dist/channel-rust-{version}.toml").decode())
-    return end_of_day(manifest["date"])
+    def lookup() -> dt.datetime:
+        manifest = tomllib.loads(fetch(f"https://static.rust-lang.org/dist/channel-rust-{version}.toml").decode())
+        return end_of_day(manifest["date"])
+
+    return cached("rust", version, lookup)
 
 
 _node_index: list[dict] | None = None
 
 
 def node_published(version: str) -> dt.datetime:
-    global _node_index
-    if _node_index is None:
-        _node_index = fetch_json("https://nodejs.org/dist/index.json")  # type: ignore[assignment]
-    for rel in _node_index or []:
-        if rel["version"] == f"v{version}":
-            return end_of_day(rel["date"])
-    raise LookupFailed("not in the nodejs.org release index")
+    def lookup() -> dt.datetime:
+        global _node_index
+        if _node_index is None:
+            _node_index = fetch_json("https://nodejs.org/dist/index.json")  # type: ignore[assignment]
+        for rel in _node_index or []:
+            if rel["version"] == f"v{version}":
+                return end_of_day(rel["date"])
+        raise LookupFailed("not in the nodejs.org release index")
+
+    return cached("node", version, lookup)
 
 
 def github_api(path: str) -> object:
@@ -239,13 +348,17 @@ def action_published(repo: str, sha: str, tag: str) -> dt.datetime:
         try:
             release = github_api(f"/repos/{repo}/releases/tags/{urllib.parse.quote(tag)}")
             dates.append(parse_ts(release["published_at"]))  # type: ignore[index]
-        except LookupFailed:
-            pass  # no GitHub release for this tag: commit (and tag) date only
+        except LookupFailed as err:
+            # Only "not found" means there is no GitHub release for this tag
+            # (then the commit and tag dates count); a rate limit, an outage
+            # or any other error fails the lookup (fail closed).
+            if err.status != 404:
+                raise
         _action_cache[key] = max(dates)
     return _action_cache[key]
 
 
-# M6: a file attached to a GitHub release, pinned by its SHA-256 (ADD --checksum).
+# a file attached to a GitHub release, pinned by its SHA-256 (ADD --checksum).
 GITHUB_RELEASE_ASSET = re.compile(
     r"^https://github\.com/(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/releases/download/"
     r"(?P<tag>[A-Za-z0-9_.+-]+)/(?P<asset>[A-Za-z0-9_.+-]+)$"
@@ -268,7 +381,7 @@ def release_asset_published(repo: str, tag: str, asset: str, sha256: str) -> dt.
                 return max(parse_ts(item["created_at"]), parse_ts(item["updated_at"]))
         raise LookupFailed(f"no asset {asset} in release {tag} of {repo}")
 
-    return lookup()  # M6: this version has no lookup cache
+    return cached("release-asset", f"{repo}@{tag}/{asset}#{sha256}", lookup)
 
 
 def check_add_url(args: str, where: str, result: "Result") -> None:
@@ -356,10 +469,12 @@ def check_package_lock(path: Path, result: Result) -> None:
     except (json.JSONDecodeError, OSError) as err:
         result.errors.append(f"{path}: cannot read: {err}")
         return
-    if lock.get("lockfileVersion", 0) < 2:
-        result.errors.append(f"{path}: lockfileVersion < 2 is not supported")
+    for problem in package_lock_problems(lock, path.parent / "package.json"):
+        result.errors.append(f"{path}: {problem}")
+    packages = lock.get("packages") if isinstance(lock, dict) else None
+    if not isinstance(packages, dict):
         return
-    for key, pkg in lock.get("packages", {}).items():
+    for key, pkg in packages.items():
         if key == "":
             continue
         where = f"{path}: {key}"
@@ -383,6 +498,45 @@ def check_package_lock(path: Path, result: Result) -> None:
             result.errors.append(f"{where}: missing sha512 integrity")
             continue
         result.add("npm", name, version, lambda n=name, v=version: npm_published(n, v), str(path))
+
+
+DEPENDENCY_FIELDS = ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies")
+
+
+def package_lock_problems(lock: object, manifest: Path) -> list[str]:
+    """A package-lock.json the gate can trust to be complete: lockfileVersion
+    3 (a `packages` map only, no legacy `dependencies` tree that npm could
+    fall back to), whose root entry declares exactly the dependencies of
+    package.json, each exact and present in the map at that version."""
+    if not isinstance(lock, dict):
+        return ["not a JSON object"]
+    problems = []
+    if lock.get("lockfileVersion") != 3:
+        problems.append(f"lockfileVersion must be 3 (found {lock.get('lockfileVersion')!r}); run npm install with npm >= 9")
+    if "dependencies" in lock:
+        problems.append("legacy `dependencies` tree (lockfileVersion 1/2) is not allowed; only `packages`")
+    packages = lock.get("packages")
+    if not isinstance(packages, dict) or not isinstance(packages.get(""), dict):
+        return problems + ["no `packages` map with a root entry \"\""]
+    try:
+        declared = json.loads(manifest.read_text())
+    except (OSError, ValueError) as err:
+        return problems + [f"cannot read {manifest.name} next to it: {err}"]
+    root = packages[""]
+    for kind in DEPENDENCY_FIELDS:
+        wanted = declared.get(kind) or {} if isinstance(declared, dict) else {}
+        locked = root.get(kind) or {}
+        if wanted != locked:
+            problems.append(f"{kind} of the root entry differ from {manifest.name}: {locked} != {wanted}")
+        for name, spec in wanted.items() if isinstance(wanted, dict) else []:
+            entry = packages.get(f"node_modules/{name}")
+            if not isinstance(spec, str) or not re.fullmatch(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?", spec):
+                problems.append(f"{manifest.name}: {name} {spec!r} must be an exact version")
+            elif not isinstance(entry, dict) or entry.get("version") != spec:
+                problems.append(f"{name}@{spec} of {manifest.name} is not in `packages` at that version")
+    if len(packages) == 1 and any(declared.get(k) for k in DEPENDENCY_FIELDS if isinstance(declared, dict)):
+        problems.append("`packages` has no entries besides the root")
+    return problems
 
 
 # ── Rust toolchain ───────────────────────────────────────────────────────────
@@ -426,7 +580,7 @@ COMMAND_TOKENS = re.compile(
 # Settings that redirect where installers download from (or what they install).
 REDIRECT_ENV = re.compile(
     r"\b(?:PLAYWRIGHT_[A-Z0-9_]*|npm_config_[A-Za-z0-9_]*|NPM_CONFIG_[A-Z0-9_]*|CARGO_[A-Z0-9_]*REGISTR[A-Z0-9_]*"
-    r"|RUSTUP_DIST_SERVER|RUSTUP_UPDATE_ROOT)\b"
+    r"|CARGO_SOURCE_[A-Z0-9_]*|CARGO_HOME|RUSTUP_DIST_SERVER|RUSTUP_UPDATE_ROOT|RUSTUP_TOOLCHAIN)\b"
 )
 TRAILING_BACKSLASH = re.compile(r"\\\s*$")
 BLOCK_SCALAR = re.compile(r"^(?P<indent>\s*)(?:-\s+)*(?:[\w\"'.-]+\s*:\s*)?(?P<style>[|>])[-+0-9]*\s*(?:#.*)?$")
@@ -529,14 +683,12 @@ def logical_commands(lines: list[str]) -> list[tuple[int, str]]:
     return out
 
 
-CARGO_RESOLVING = re.compile(r"\bcargo\s+(?:\+\S+\s+)?(build|test|run|check|clippy|fetch|doc|bench|tree|deny)\b")
+CARGO_RESOLVING = re.compile(r"\bcargo\s+(?:\+\S+\s+)?(build|test|run|check|clippy|fetch|doc|bench|tree|deny|metadata)\b")
 
 
-def unlocked_cargo(text: str) -> list[str]:
-    """cargo subcommands that resolve dependencies but lack `--locked`
-    (without it cargo may rewrite Cargo.lock with newer releases). Only
-    commands are looked at: a segment that starts with cargo (after `run:`,
-    a list dash or `VAR=value` assignments), not names or other values."""
+def cargo_commands(text: str) -> list[str]:
+    """The cargo commands in `text`: segments that start with cargo (after
+    `run:`, a list dash or `VAR=value` assignments), not names or values."""
     found = []
     for segment in re.split(r"&&|\|\||;|\||\$\(|`", text):
         words = segment.strip()
@@ -547,16 +699,39 @@ def unlocked_cargo(text: str) -> list[str]:
                 continue
             words = words[key.end():].strip()
         words = re.sub(r"^(?:(?:[A-Za-z_][A-Za-z0-9_]*=\S*|env|time|nice|command|exec|then|do|else|!)\s+)+", "", words)
+        if re.match(r"cargo\b", words):
+            found.append(words)
+    return found
+
+
+def unlocked_cargo(text: str) -> list[str]:
+    """cargo subcommands that resolve dependencies but lack `--locked`
+    (without it cargo may rewrite Cargo.lock with newer releases)."""
+    found = []
+    for words in cargo_commands(text):
         m = CARGO_RESOLVING.match(words)
         if m and not re.search(r"(^|\s)(--locked|--version|-V)(\s|$)", words):
             found.append(m.group(1))
     return found
 
 
+def cargo_problems(text: str) -> list[str]:
+    """Everything wrong with the cargo commands in `text`: a missing
+    `--locked`, and `--config` (which can replace the registry or patch
+    crates, like a .cargo/config.toml)."""
+    problems = [f"cargo {sub} must use --locked" for sub in unlocked_cargo(text)]
+    problems += [
+        "cargo --config can redirect where crates come from; not allowed"
+        for words in cargo_commands(text)
+        if re.search(r"(^|\s)--config(=|\s|$)", words)
+    ]
+    return problems
+
+
 def check_commands(lineno: int, text: str, path: Path, result: Result) -> None:
     where = f"{path}:{lineno}"
-    for sub in unlocked_cargo(text):
-        result.errors.append(f"{where}: cargo {sub} must use --locked")
+    for problem in cargo_problems(text):
+        result.errors.append(f"{where}: {problem}")
     allowed_spans: list[tuple[int, int]] = []
     for pattern in ALLOWED_COMMANDS:
         for m in pattern.finditer(text):
@@ -569,7 +744,10 @@ def check_commands(lineno: int, text: str, path: Path, result: Result) -> None:
             result.errors.append(f"{where}: install/download command {m.group(0)!r} is not an allowed verified form")
 
 
-def scan_github_file(path: Path, root: Path, result: Result, queue: list[Path]) -> None:
+def scan_github_file(path: Path, root: Path, result: Result, queue: list[Path],
+                     dockerfiles: list[Path] | None = None) -> None:
+    """Check one file under .github/ (or a local action); local actions it
+    uses go to `queue`, Dockerfiles its steps build go to `dockerfiles`."""
     raw = path.read_bytes()
     try:
         text = raw.decode("utf-8")
@@ -607,11 +785,143 @@ def scan_github_file(path: Path, root: Path, result: Result, queue: list[Path]) 
             if pattern.search(line):
                 result.errors.append(f"{where}: {why}")
 
+        check_runners(strip_comment(line), where, result)
+
         images = list(IMAGE_REF.finditer(line))
         for m in images:
             add_image(result, m.group("name"), m.group("tag"), m.group("digest"), where)
         if re.search(r"\b(image|generator)\s*=", line) and len(images) != len(re.findall(r"\b(?:image|generator)\s*=", line)):
             result.errors.append(f"{where}: image=/generator= must be name:tag@sha256:<digest>")
+
+    for lineno, action, inputs in step_inputs(lines):
+        check_step_inputs(f"{path}:{lineno}", action, inputs, root, result, dockerfiles)
+
+
+RUNS_ON = re.compile(r"^\s*(?:-\s+)?[\"']?runs-on[\"']?\s*:(?P<value>.*)$")
+RUNNER_KEY = re.compile(r"(?:^|[\s{,-])[\"']?runner[\"']?\s*:(?P<value>[^,}]*)")
+
+
+def unquote(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1].strip()
+    return value
+
+
+def check_runners(line: str, where: str, result: Result) -> None:
+    """`runs-on:` names a versioned runner image of ALLOWED_RUNNERS (or the
+    matrix/input `runner`, whose every value is checked the same way)."""
+    m = RUNS_ON.match(line)
+    if m:
+        value = unquote(m.group("value"))
+        if value not in ALLOWED_RUNNERS and value not in RUNNER_REFERENCES:
+            result.errors.append(
+                f"{where}: runs-on {value or '(on the next lines)'!r} is not a versioned runner label "
+                f"({', '.join(sorted(ALLOWED_RUNNERS))}, or {' / '.join(sorted(RUNNER_REFERENCES))})"
+            )
+    for m in RUNNER_KEY.finditer(line):
+        value = unquote(m.group("value"))
+        if not value:
+            continue  # a mapping (e.g. the declaration of a `runner` input), not a label
+        if value not in ALLOWED_RUNNERS:
+            result.errors.append(f"{where}: runner {value or '(empty)'!r} is not one of {', '.join(sorted(ALLOWED_RUNNERS))}")
+
+
+def step_inputs(lines: list[str]) -> list[tuple[int, str, dict[str, tuple[int, str]]]]:
+    """(line, action, {input: (line, value)}) of every `uses:` (inputs from
+    its `with:` block, if any): the step's keys are the lines at the column of its `uses:`; block
+    scalar and continuation lines of an input are joined with newlines."""
+    out = []
+    for i, line in enumerate(lines):
+        m = USES_LINE.match(strip_comment(line))
+        if not m:
+            continue
+        column = line.index("uses")
+        start = i
+        if not re.match(r"^\s*-\s", line):
+            # Back to the step's `- ` line (keys before `uses:`), not into
+            # the previous step.
+            while start > 0:
+                prev = lines[start - 1]
+                dash = re.match(r"^\s*-\s+", prev)
+                if not prev.strip() or (indent_of(prev) >= column and not dash):
+                    start -= 1
+                    continue
+                if dash and len(dash.group(0)) == column:
+                    start -= 1
+                break
+        end = i + 1
+        while end < len(lines) and (not lines[end].strip() or indent_of(lines[end]) >= column):
+            end += 1
+        with_line = None
+        for j in range(start, end):
+            text = lines[j]
+            if re.match(r"^\s*(?:-\s+)?with\s*:\s*(#.*)?$", text) and text.index("with") == column:
+                with_line = j
+        inputs: dict[str, tuple[int, str]] = {}
+        j = end if with_line is None else with_line + 1
+        key_indent = None
+        current = None
+        while j < end:
+            text = lines[j]
+            if text.strip() and indent_of(text) <= column:
+                break
+            if text.strip() and not text.lstrip().startswith("#"):
+                if key_indent is None:
+                    key_indent = indent_of(text)
+                km = re.match(r"^\s*[\"']?([\w-]+)[\"']?\s*:(?:\s+(.*))?$", text)
+                if indent_of(text) == key_indent and km:
+                    current = km.group(1)
+                    value = unquote(strip_comment(km.group(2) or ""))
+                    if re.fullmatch(r"[|>][-+0-9]*", value):
+                        value = ""
+                    inputs[current] = (j + 1, value)
+                elif current is not None:
+                    line_no, value = inputs[current]
+                    inputs[current] = (line_no, (value + "\n" + strip_comment(text).strip()).strip())
+            j += 1
+        out.append((i + 1, m.group("target").split("@", 1)[0], inputs))
+    return out
+
+
+def check_step_inputs(where: str, action: str, inputs: dict[str, tuple[int, str]], root: Path,
+                      result: Result, dockerfiles: list[Path] | None) -> None:
+    """Inputs of an action step that make it fetch something floating."""
+    base = where.rsplit(":", 1)[0]
+
+    def error(key: str, message: str) -> None:
+        line = inputs[key][0] if key in inputs else where.rsplit(":", 1)[1]
+        result.errors.append(f"{base}:{line}: {message}")
+
+    if action == "docker/setup-buildx-action":
+        opts = inputs.get("driver-opts", (0, ""))[1]
+        if not re.search(r"(^|[\s,])image=" + IMAGE_REF.pattern, opts):
+            error("driver-opts", "setup-buildx-action needs `driver-opts: image=<buildkit>:tag@sha256:<digest>` "
+                                 "(otherwise it pulls the floating moby/buildkit image)")
+    for key, (_, value) in inputs.items():
+        if key == "sbom" and value != "false" and not value.startswith("generator="):
+            error(key, "sbom must be `false` or `generator=<image>:tag@sha256:<digest>` (true uses a floating generator image)")
+        elif key == "context" and not re.fullmatch(r"[\w./-]+", value):
+            error(key, f"context {value!r} must be a local path (a remote or computed context cannot be verified)")
+        elif key == "cache-from":
+            for entry in filter(None, re.split(r"[\n]", value)):
+                registry = "type=registry" in entry or "type=" not in entry
+                if registry and "@sha256:" not in entry:
+                    error(key, f"cache-from {entry!r} pulls a registry cache without a digest")
+        elif key == "build-contexts":
+            for entry in filter(None, value.split("\n")):
+                if "://" in entry and not re.search(r"docker-image://\S+@sha256:[0-9a-f]{64}", entry):
+                    error(key, f"build context {entry!r} must be local or a docker-image:// pinned by digest")
+        elif key == "build-args":
+            for entry in filter(None, value.split("\n")):
+                if entry.strip().startswith("BUILDKIT_"):
+                    error(key, f"build-arg {entry.strip()!r} controls BuildKit (frontend images, …); not allowed")
+        elif key in ("file", "dockerfile"):
+            target = (root / value).resolve() if value and "${{" not in value else None
+            if target is None or root.resolve() not in target.parents or not target.is_file():
+                error(key, f"{key} {value!r} must name a Dockerfile in the repository (it is checked like one)")
+            elif dockerfiles is not None:
+                dockerfiles.append(target)
 
 
 def check_uses(target: str, tag: str | None, where: str, root: Path, result: Result, queue: list[Path]) -> None:
@@ -718,6 +1028,10 @@ _image_cache: dict[tuple[str, str], dt.datetime] = {}
 
 def image_published(name: str, digest: str) -> dt.datetime:
     """When the image `name@digest` was published (see the module docstring)."""
+    return cached("image", f"{name}@{digest}", lambda: _image_published(name, digest))
+
+
+def _image_published(name: str, digest: str) -> dt.datetime:
     key = (name, digest)
     if key in _image_cache:
         return _image_cache[key]
@@ -751,23 +1065,35 @@ def image_published(name: str, digest: str) -> dt.datetime:
     return published
 
 
+# The platforms the images are built for (docker/Dockerfile.server is built
+# natively for each), i.e. the architectures whose .debs get installed.
+DEBIAN_ARCHES = ("amd64", "arm64")
+
+
 def debian_published(package: str, version: str) -> dt.datetime:
-    """First time the amd64 (or arch-independent) .deb appeared in the Debian archive."""
-    url = (
-        "https://snapshot.debian.org/mr/binary/"
-        f"{urllib.parse.quote(package, safe='')}/{urllib.parse.quote(version, safe='')}/binfiles?fileinfo=1"
-    )
-    data = fetch_json(url, min_interval=1.0)
-    seen = [
-        info["first_seen"]
-        for item in data.get("result", [])  # type: ignore[union-attr]
-        if item.get("architecture") in ("amd64", "all")
-        for info in data.get("fileinfo", {}).get(item["hash"], [])  # type: ignore[union-attr]
-        if info.get("archive_name") in ("debian", "debian-security")
-    ]
-    if not seen:
-        raise LookupFailed("not in snapshot.debian.org for amd64")
-    return min(dt.datetime.strptime(s, "%Y%m%dT%H%M%SZ").replace(tzinfo=dt.timezone.utc) for s in seen)
+    """When the .deb was in the Debian archive for every built architecture:
+    per architecture (or `all`) its first appearance, then the latest of those."""
+    def lookup() -> dt.datetime:
+        url = (
+            "https://snapshot.debian.org/mr/binary/"
+            f"{urllib.parse.quote(package, safe='')}/{urllib.parse.quote(version, safe='')}/binfiles?fileinfo=1"
+        )
+        data = fetch_json(url, min_interval=1.0)
+        dates = []
+        for arch in DEBIAN_ARCHES:
+            seen = [
+                info["first_seen"]
+                for item in data.get("result", [])  # type: ignore[union-attr]
+                if item.get("architecture") in (arch, "all")
+                for info in data.get("fileinfo", {}).get(item["hash"], [])  # type: ignore[union-attr]
+                if info.get("archive_name") in ("debian", "debian-security")
+            ]
+            if not seen:
+                raise LookupFailed(f"not in snapshot.debian.org for {arch}")
+            dates.append(min(dt.datetime.strptime(s, "%Y%m%dT%H%M%SZ").replace(tzinfo=dt.timezone.utc) for s in seen))
+        return max(dates)
+
+    return cached("debian", f"{package}={version}/{'+'.join(DEBIAN_ARCHES)}", lookup)
 
 
 def add_image(result: "Result", name: str, tag: str, digest: str, where: str) -> None:
@@ -789,7 +1115,10 @@ SNAPSHOT_URL = re.compile(
 URL = re.compile(r"\b(?:https?|ftp|git|ssh)://\S+")
 DOCKER_ALLOWED = [
     re.compile(rf"\bapt-get update{END}"),
-    re.compile(rf"\brustup target add [a-z0-9_-]+{END}"),
+    # A target triple, or a shell variable holding one (the musl target of
+    # the platform being built): rustup only adds the standard library of
+    # the image's own, dated Rust release.
+    re.compile(rf"\brustup target add (?:[a-z0-9_-]+|\"\$[A-Za-z_][A-Za-z0-9_]*\"){END}"),
 ]
 
 
@@ -934,15 +1263,15 @@ def check_dockerfile(path: Path, result: Result) -> None:
             for source in re.findall(r"--from=(\S+)", args):
                 check_from_source(source, stages, where, "--from=", result)
             if instruction == "ADD" and re.search(r"\b(https?|git|ssh)://|git@", args):
-                check_add_url(args, where, result)  # M6: only checksum-pinned GitHub release assets
+                check_add_url(args, where, result)  # only checksum-pinned GitHub release assets
         elif instruction == "RUN":
             for mount in re.findall(r"--mount=(\S+)", args):
                 for option in mount.split(","):
                     key, _, value = option.partition("=")
                     if key == "from":
                         check_from_source(value, stages, where, "--mount from=", result)
-            for sub in unlocked_cargo(args):
-                result.errors.append(f"{where}: cargo {sub} must use --locked")
+            for problem in cargo_problems(args):
+                result.errors.append(f"{where}: {problem}")
             # Package sources: only snapshot.debian.org at a fixed (dated) time.
             for url in URL.findall(args):
                 snap = SNAPSHOT_URL.match(url) or SNAPSHOT_URL.match(url.rstrip("'\""))
@@ -980,11 +1309,14 @@ COMPOSE_IMAGE = re.compile(r"^\s*(?:-\s+)?[\"']?image[\"']?\s*:\s*[\"']?(?P<ref>
 TOP_LEVEL_SERVICES = re.compile(r"^[\"']?services[\"']?\s*:", re.M)
 
 
-def check_compose(path: Path, result: Result) -> None:
+def check_compose(path: Path, result: Result, dockerfiles: list[Path] | None = None) -> None:
     try:
         text = path.read_text()
     except (OSError, UnicodeDecodeError) as err:
         result.errors.append(f"{path}: cannot read: {err}")
+        return
+    if path.suffix.lower() == ".json":
+        check_compose_json(path, text, result)
         return
     if not TOP_LEVEL_SERVICES.search(text):
         result.errors.append(f"{path}: no top-level services; cannot be verified")
@@ -996,6 +1328,13 @@ def check_compose(path: Path, result: Result) -> None:
             result.errors.append(f"{where}: build: in compose files is not checked by the age gate")
         if re.search(r"^\s*(?:-\s+)?[\"']?(include|extends)[\"']?\s*:", line) or re.search(r"\b(include|extends)\b\s*:", line):
             result.errors.append(f"{where}: include/extends pull in other compose files; not allowed")
+        ref = re.match(r"^\s*(?:-\s+)?[\"']?dockerfile[\"']?\s*:\s*[\"']?([^\s\"'#]*)", line)
+        if ref:
+            target = (path.parent / ref.group(1)).resolve()
+            if target.is_file() and dockerfiles is not None:
+                dockerfiles.append(target)
+            else:
+                result.errors.append(f"{where}: dockerfile {ref.group(1)!r} not found next to the compose file; cannot be verified")
         if not re.search(r"\bimage\b", line):
             continue
         m = COMPOSE_IMAGE.match(line)
@@ -1013,16 +1352,63 @@ def check_compose(path: Path, result: Result) -> None:
         add_image(result, im.group("name"), im.group("tag"), im.group("digest"), where)
 
 
-def is_compose(path: Path) -> bool:
-    """Named like a compose file, or any other YAML file with top-level services."""
-    if COMPOSE.match(path.name.lower()):
-        return True
-    if path.suffix.lower() not in (".yml", ".yaml"):
-        return False
+def check_compose_json(path: Path, text: str, result: Result) -> None:
+    """A compose file in JSON (valid YAML too): the same rules, structurally."""
     try:
-        return bool(TOP_LEVEL_SERVICES.search(path.read_text(errors="replace")))
+        doc = json.loads(text)
+    except ValueError as err:
+        result.errors.append(f"{path}: cannot parse: {err}")
+        return
+    if not isinstance(doc, dict) or not isinstance(doc.get("services"), dict):
+        result.errors.append(f"{path}: no top-level services; cannot be verified")
+        return
+
+    def walk(node: object, where: str) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                here = f"{path}: {where}.{key}"
+                if key in ("include", "extends"):
+                    result.errors.append(f"{here}: include/extends pull in other compose files; not allowed")
+                elif key == "build":
+                    result.errors.append(f"{here}: build: in compose files is not checked by the age gate")
+                elif key == "image":
+                    ref = value if isinstance(value, str) else ""
+                    if ref.split("@", 1)[0].rsplit(":", 1)[0] in OWN_IMAGES:
+                        continue
+                    im = IMAGE_REF.fullmatch(ref)
+                    if im:
+                        add_image(result, im.group("name"), im.group("tag"), im.group("digest"), here)
+                    else:
+                        result.errors.append(f"{here}: {ref or '(empty)'} must be name:tag@sha256:<digest>")
+                else:
+                    walk(value, f"{where}.{key}")
+        elif isinstance(node, list):
+            for i, item in enumerate(node):
+                walk(item, f"{where}[{i}]")
+
+    walk(doc, "$")
+
+
+YAML_EXAMPLE = re.compile(r"\.ya?ml(\.example|\.sample|\.dist)?$", re.I)
+
+
+def is_compose(path: Path) -> bool:
+    """Named like a compose file (also `….yml.example`), or any other YAML
+    file (`.yml`, `.yml.example`, …) or JSON file with top-level services."""
+    name = path.name.lower()
+    if COMPOSE.match(name) or COMPOSE.match(re.sub(r"\.(example|sample|dist)$", "", name)):
+        return True
+    try:
+        if YAML_EXAMPLE.search(name):
+            return bool(TOP_LEVEL_SERVICES.search(path.read_text(errors="replace")))
+        if name.endswith(".json"):
+            doc = json.loads(path.read_text(errors="replace"))
+            return isinstance(doc, dict) and "services" in doc
     except OSError:
         return True  # unreadable: let check_compose report it (fail closed)
+    except ValueError:
+        return False  # not JSON at all: not a compose file
+    return False
 
 
 # ── unsupported manifests (fail closed) ──────────────────────────────────────
@@ -1045,9 +1431,31 @@ COMPOSE = re.compile(r"^(docker-)?compose.*\.ya?ml$", re.I)
 
 def walk(root: Path):
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
+        here = Path(dirpath)
+        dirnames[:] = sorted(
+            d for d in dirnames
+            if not (here == root and d in SKIP_DIRS)
+            and not (d == "node_modules" and (here / "package-lock.json").is_file())
+        )
         for f in sorted(filenames):
-            yield Path(dirpath) / f
+            yield here / f
+
+
+def check_npmrc(path: Path, result: Result) -> None:
+    """Only settings that change nothing about what npm installs (NPMRC_KEYS)."""
+    try:
+        lines = path.read_text().splitlines()
+    except (OSError, UnicodeDecodeError) as err:
+        result.errors.append(f"{path}: cannot read: {err}")
+        return
+    for lineno, line in enumerate(lines, 1):
+        text = line.strip()
+        if not text or text[0] in "#;":
+            continue
+        key = text.split("=", 1)[0].strip()
+        if key not in NPMRC_KEYS:
+            result.errors.append(f"{path}:{lineno}: .npmrc setting {key!r} is not on the allow-list "
+                                 f"({', '.join(sorted(NPMRC_KEYS))}); it may change where packages come from")
 
 
 def is_workspace_root(path: Path) -> bool:
@@ -1062,9 +1470,15 @@ def evaluate(root: Path) -> Result:
     root = root.resolve()
     files = list(walk(root))
     github = root / ".github"
+    dockerfiles: list[Path] = []  # referenced by workflows and compose files
+    checked: set[Path] = set()
     for path in files:
         name = path.name
-        if name == "Cargo.lock":
+        if path.parent.name == ".cargo" and name.lower().startswith("config"):
+            result.errors.append(f"{path}: cargo configuration can replace registries and patch crates; not allowed")
+        elif name == ".npmrc":
+            check_npmrc(path, result)
+        elif name == "Cargo.lock":
             check_cargo_lock(path, result)
         elif name == "Cargo.toml" and not (path.parent / "Cargo.lock").exists() and is_workspace_root(path):
             result.errors.append(f"{path}: workspace without Cargo.lock: commit the lock file")
@@ -1076,8 +1490,9 @@ def evaluate(root: Path) -> Result:
             check_rust_toolchain(path, result)
         elif DOCKERFILE.match(name):
             check_dockerfile(path, result)
+            checked.add(path.resolve())
         elif github not in path.parents and is_compose(path):
-            check_compose(path, result)
+            check_compose(path, result, dockerfiles)
         elif UNSUPPORTED.match(name):
             result.errors.append(f"{path}: dependency manifest the age gate cannot check yet; extend tools/dep-age.py")
 
@@ -1088,7 +1503,12 @@ def evaluate(root: Path) -> Result:
         if path in seen:
             continue
         seen.add(path)
-        scan_github_file(path, root, result, queue)
+        scan_github_file(path, root, result, queue, dockerfiles)
+    # Dockerfiles that are built, whatever their name.
+    for path in dockerfiles:
+        if path.resolve() not in checked:
+            checked.add(path.resolve())
+            check_dockerfile(path, result)
     return result
 
 
@@ -1098,7 +1518,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--min-age-days", type=float, default=14.0)
     parser.add_argument("--now", help="evaluate as of this UTC time (ISO 8601), default: now")
     parser.add_argument("--verbose", "-v", action="store_true", help="list every checked item")
+    parser.add_argument("--no-cache", action="store_true", help="look everything up again (no .cache/dep-age)")
     args = parser.parse_args(argv)
+    global cache_enabled
+    if args.no_cache:
+        cache_enabled = False
 
     now = parse_ts(args.now) if args.now else dt.datetime.now(dt.timezone.utc)
     result = evaluate(args.root)

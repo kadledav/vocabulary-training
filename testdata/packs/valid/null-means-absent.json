@@ -1,0 +1,60 @@
+{
+  "format": "vocab-pack",
+  "format_version": 1,
+  "pack_id": "test-general--2026-11-17--1",
+  "exported_at": null,
+  "part": null,
+  "source": {
+    "id": "test-general",
+    "type": "general",
+    "title": null,
+    "author": null,
+    "series": null,
+    "series_number": null,
+    "url": null
+  },
+  "words": [
+    {
+      "headword": "hum",
+      "meaning": "A low, steady, continuous sound.",
+      "czech": [
+        "bzučet",
+        "hučet"
+      ],
+      "usefulness": 6,
+      "sentences": [
+        {
+          "en": "The old kettle [[hummed]] on the stove all morning.",
+          "cs": "Stará konvice celé dopoledne [[bzučela]] na sporáku.",
+          "origin": "example",
+          "location": null
+        },
+        {
+          "en": "Somewhere down the hall a pipe [[hummed]] again.",
+          "cs": "Někde dole na chodbě zase [[bzučela]] trubka.",
+          "origin": "example"
+        },
+        {
+          "en": "Nobody noticed that the radio [[hummed]] quietly.",
+          "cs": "Nikdo si nevšiml, že rádio tiše [[bzučela]].",
+          "origin": "example"
+        }
+      ],
+      "grammar": null,
+      "forms": null,
+      "pronunciation": null,
+      "speak": null,
+      "goal": null,
+      "accepted": null,
+      "confusables": null,
+      "hint": null,
+      "spelling": null,
+      "spelling_note": null,
+      "note": null,
+      "tag": null,
+      "icon": null,
+      "seq": null
+    }
+  ],
+  "reading_position": null
+}

@@ -4,10 +4,12 @@
 *
 !Cargo.toml
 !Cargo.lock
+!LICENSE
+!THIRD-PARTY-NOTICES.txt
 !crates/
 !web/index.html
 !web/css/
 !web/js/
-# Dockerfile.tts: the project licence and the image's licence files.
-!LICENSE
+!web/img/
+# Dockerfile.tts: the TTS image's licence files.
 !docker/tts-licenses/
