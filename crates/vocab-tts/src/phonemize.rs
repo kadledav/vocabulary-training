@@ -287,7 +287,7 @@ impl fmt::Debug for Phonemizer {
 }
 
 /// Where the pronunciations of a text's words came from (word counts).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Tally {
     /// From the voice's own lexicon (also numbers read as words).
     pub lexicon: usize,

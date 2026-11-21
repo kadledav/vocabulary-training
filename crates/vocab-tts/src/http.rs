@@ -8,11 +8,14 @@
 //!   the fallback dictionary or spelled letter by letter), `X-Words-Spelled`,
 //!   `X-Frontend` and `X-Engine` (versions, for the app's clip identity);
 //!   `400` invalid request/text/voice/speed, `413` body over
-//!   4 KiB, `415` not JSON, `422` nothing speakable, `503` busy or timeout.
+//!   4 KiB, `415` not JSON, `422` nothing speakable, `500`
+//!   `synthesis_failed` or `engine_crashed` (the engine process died on
+//!   this text), `503` busy or timeout.
 //! * `GET /v1/voices` → the voices and their accents, and the front-end and
 //!   engine versions (the app's clip identity).
-//! * `GET /healthz` → `200` once the model is loaded (it is loaded before
-//!   the listener opens).
+//! * `GET /healthz` → `200` once the start self-test spoke (before the
+//!   listener opens), `503` `engine_failed` while the engine process cannot
+//!   be started (until a start succeeds).
 //!
 //! No authentication: the container is reachable only from the app, on an
 //! internal network without a route anywhere else (R-83). Every input is
@@ -52,8 +55,12 @@ const VOICES_PATH: &str = "/v1/voices";
 /// A 600-character text is at most 2400 bytes of UTF-8 (JSON escapes of
 /// control characters cannot occur in a valid text).
 const BODY_BYTES: usize = 4 * 1024;
-/// A synthesis takes seconds; waiting behind others a little longer.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// The longest accepted text takes about 25 s at one thread of a fast CPU
+/// (int8 model), and a NAS CPU limited to half a core may need ten times
+/// that, plus loading the model: slow but working synthesis must finish.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+/// Open requests get this long to finish when the service stops.
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CONNECTIONS: usize = 32;
 const MAX_CONCURRENT_REQUESTS: usize = 16;
@@ -86,8 +93,16 @@ async fn not_found() -> Response {
     error(StatusCode::NOT_FOUND, "not_found", "Not found")
 }
 
-async fn healthz() -> Response {
-    Json(serde_json::json!({ "status": "ok" })).into_response()
+async fn healthz(State(speaker): State<Arc<Speaker>>) -> Response {
+    if speaker.healthy() {
+        Json(serde_json::json!({ "status": "ok" })).into_response()
+    } else {
+        error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "engine_failed",
+            "the engine cannot be started (see the log)",
+        )
+    }
 }
 
 async fn voices() -> Response {
@@ -219,6 +234,14 @@ async fn speak(
                 .insert(header::RETRY_AFTER, HeaderValue::from(BUSY_RETRY_SECS));
             response
         }
+        Err(err @ SpeakError::Crashed(_)) => {
+            tracing::error!(error = %err, text_chars = chars, text_sha256 = %fingerprint, voice = voice.id(), "synthesis crashed");
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "engine_crashed",
+                "the engine process died while speaking this text",
+            )
+        }
         Err(err) => {
             tracing::error!(error = %err, text_chars = chars, text_sha256 = %fingerprint, voice = voice.id(), "synthesis failed");
             error(
@@ -317,7 +340,7 @@ async fn limit_concurrency(
 
 /// Serve `app` on `listener` until `shutdown` resolves, with a header read
 /// timeout (which also closes idle keep-alive connections) and a cap on
-/// open connections; then give open requests up to the request timeout.
+/// open connections; then give open requests a few seconds.
 pub async fn serve(
     listener: TcpListener,
     app: Router,
@@ -360,7 +383,7 @@ pub async fn serve(
         });
     }
     drop(listener);
-    if tokio::time::timeout(REQUEST_TIMEOUT, graceful.shutdown())
+    if tokio::time::timeout(SHUTDOWN_WAIT, graceful.shutdown())
         .await
         .is_err()
     {

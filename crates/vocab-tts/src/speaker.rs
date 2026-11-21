@@ -1,15 +1,23 @@
-//! The speaking pipeline: text → phonemes → engine → clip.
+//! The speaking pipeline: text → phonemes → engine → clip, and the queue
+//! in front of it.
 //!
-//! One synthesis at a time (the engine uses all its threads for one
-//! request); a few more requests may wait, anything beyond is refused at
-//! once as busy, so a flood cannot queue unbounded work. The work runs on
-//! the blocking pool and keeps its slot until it is finished, also when the
+//! [`Speaker`] is the queue: one synthesis at a time (the engine uses all
+//! its threads for one request); a few more requests may wait, anything
+//! beyond is refused at once as busy, so a flood cannot queue unbounded
+//! work. A request keeps its slot until its work is finished, also when the
 //! client has gone (a timed-out request does not free capacity that is
-//! still in use).
+//! still in use); the work itself is cancelled.
+//!
+//! Where the work runs is a [`Backend`]: [`Local`] runs the pipeline in this
+//! process (the engine process itself, and the tests), `crate::worker` in
+//! an engine process that is started on demand and ends when idle.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
 use crate::engine::{Cancel, EngineError, Synthesizer};
@@ -17,24 +25,38 @@ use crate::phonemize::{Phonemizer, Tally};
 use crate::postprocess::{self, Clip, PostError};
 use crate::speech::{SpeakText, Speed, Voice};
 
-/// Pipeline state shared by all requests.
+/// The queue in front of a [`Backend`], shared by all requests.
 pub struct Speaker {
-    phonemizer: Phonemizer,
-    engine: Mutex<Box<dyn Synthesizer>>,
+    backend: Arc<dyn Backend>,
     slots: Arc<Semaphore>,
 }
 
 impl std::fmt::Debug for Speaker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Speaker")
-            .field("phonemizer", &self.phonemizer)
+            .field("backend", &self.backend)
             .field("free_slots", &self.slots.available_permits())
-            .finish_non_exhaustive()
+            .finish()
+    }
+}
+
+/// The work of one request, running until it ends.
+pub type Work = Pin<Box<dyn Future<Output = Result<Spoken, SpeakError>> + Send>>;
+
+/// Where the pipeline runs. One piece of work at a time is enough (the
+/// [`Speaker`] allows only one to run); work must end soon after `cancel`.
+pub trait Backend: Send + Sync + std::fmt::Debug {
+    fn speak(self: Arc<Self>, text: SpeakText, voice: Voice, speed: Speed, cancel: Cancel) -> Work;
+
+    /// Whether the engine works (as far as it is known): false after the
+    /// engine failed to start, until it starts again.
+    fn healthy(&self) -> bool {
+        true
     }
 }
 
 /// A spoken text with what the log may say about it.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Spoken {
     pub clip: Clip,
     /// Where the words' pronunciations came from.
@@ -61,6 +83,12 @@ pub enum SpeakError {
     TooLong(usize),
     #[error("nobody waits for the audio any more")]
     Cancelled,
+    /// The engine process failed (it did not start, or it answered nonsense).
+    #[error("engine process: {0}")]
+    Worker(String),
+    /// The engine process died while it worked on this text.
+    #[error("the engine process died while speaking ({0})")]
+    Crashed(String),
 }
 
 /// Most phoneme symbols one request may make (≈ 60 s of speech; a normal
@@ -81,10 +109,9 @@ impl Drop for CancelOnDrop {
 
 impl Speaker {
     /// `waiting`: requests that may wait while one is being synthesised.
-    pub fn new(phonemizer: Phonemizer, engine: Box<dyn Synthesizer>, waiting: usize) -> Arc<Self> {
+    pub fn new(backend: Arc<dyn Backend>, waiting: usize) -> Arc<Self> {
         Arc::new(Self {
-            phonemizer,
-            engine: Mutex::new(engine),
+            backend,
             slots: Arc::new(Semaphore::new(waiting + 1)),
         })
     }
@@ -92,7 +119,7 @@ impl Speaker {
     /// Speak `text`; `Busy` at once when all slots (one running, `waiting`
     /// waiting) are taken. If this future is dropped (request timeout,
     /// client gone), the work is cancelled: skipped if it has not reached
-    /// the engine, stopped after the current chunk if it has.
+    /// the engine, stopped as soon as possible if it has.
     pub async fn speak(
         self: &Arc<Self>,
         text: SpeakText,
@@ -102,16 +129,44 @@ impl Speaker {
         let permit = Arc::clone(&self.slots)
             .try_acquire_owned()
             .map_err(|_| SpeakError::Busy)?;
-        let this = Arc::clone(self);
         let cancel = Cancel::new();
         let _guard = CancelOnDrop(cancel.clone());
-        tokio::task::spawn_blocking(move || {
-            let result = this.speak_cancellable(&text, voice, speed, &cancel);
+        let work = Arc::clone(&self.backend).speak(text, voice, speed, cancel);
+        tokio::spawn(async move {
+            let result = work.await;
             drop(permit);
             result
         })
         .await
         .map_err(|_| SpeakError::Task)?
+    }
+
+    /// See [`Backend::healthy`].
+    pub fn healthy(&self) -> bool {
+        self.backend.healthy()
+    }
+}
+
+/// The pipeline in this process: the lexicons and the loaded engine.
+pub struct Local {
+    phonemizer: Phonemizer,
+    engine: Mutex<Box<dyn Synthesizer>>,
+}
+
+impl std::fmt::Debug for Local {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Local")
+            .field("phonemizer", &self.phonemizer)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Local {
+    pub fn new(phonemizer: Phonemizer, engine: Box<dyn Synthesizer>) -> Arc<Self> {
+        Arc::new(Self {
+            phonemizer,
+            engine: Mutex::new(engine),
+        })
     }
 
     /// The pipeline, on the calling thread, never cancelled.
@@ -167,6 +222,19 @@ impl Speaker {
             phoneme_symbols: phonemes.symbol_count(),
             synthesis_ms,
             postprocess_ms: elapsed_ms(started),
+        })
+    }
+}
+
+impl Backend for Local {
+    /// On the blocking pool (the engine computes for seconds).
+    fn speak(self: Arc<Self>, text: SpeakText, voice: Voice, speed: Speed, cancel: Cancel) -> Work {
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                self.speak_cancellable(&text, voice, speed, &cancel)
+            })
+            .await
+            .map_err(|_| SpeakError::Task)?
         })
     }
 }

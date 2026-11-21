@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use vocab_tts::engine;
 use vocab_tts::phonemize::Phonemizer;
-use vocab_tts::speaker::{SpeakError, Speaker};
+use vocab_tts::speaker::{Local, SpeakError};
 use vocab_tts::speech::{SpeakText, Speed, Voice};
 
 /// `token` repeated, separated by spaces, as often as fits 600 characters.
@@ -27,8 +27,8 @@ fn up_to_600(token: &str) -> String {
 fn r84_the_worst_accepted_texts_never_break_the_engine() {
     let dir = PathBuf::from(std::env::var("VOCAB_TTS_MODEL_DIR").expect("VOCAB_TTS_MODEL_DIR"));
     let phonemizer = Phonemizer::load(&dir).expect("phonemizer");
-    let engine = engine::load(&dir, 2).expect("engine");
-    let speaker = Speaker::new(phonemizer, engine, 0);
+    let engine = engine::load(&dir, 1).expect("engine");
+    let speaker = Local::new(phonemizer, engine);
     let compound = ["internationalization"; 3].join("-");
     let spelled = "zxqvbnmkjhgfdcwplrtsxqvbnmkjhgfdcwplrtszxqvbnmkjhgfdcwplrtszxqvb";
     let texts = [

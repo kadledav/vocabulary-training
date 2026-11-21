@@ -77,12 +77,27 @@ impl Pcm {
     }
 }
 
-/// A finished clip.
-#[derive(Clone, PartialEq)]
+/// A finished clip. Serialisable, so that it can come from the engine
+/// process (`crate::worker`); the MP3 bytes as hex.
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Clip {
+    #[serde(with = "hex_bytes")]
     mp3: Vec<u8>,
     duration_ms: u64,
     loudness_lufs: f64,
+}
+
+mod hex_bytes {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&hex::encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        hex::decode(text).map_err(D::Error::custom)
+    }
 }
 
 impl std::fmt::Debug for Clip {

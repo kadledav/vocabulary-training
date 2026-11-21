@@ -15,7 +15,7 @@ use vocab_tts::engine::{Cancel, EngineError, Synthesizer};
 use vocab_tts::http;
 use vocab_tts::phonemize::{Lexicon, Phonemes, Phonemizer, parse_symbols};
 use vocab_tts::postprocess::Pcm;
-use vocab_tts::speaker::Speaker;
+use vocab_tts::speaker::{Local, Speaker};
 use vocab_tts::speech::{Speed, Voice};
 
 pub const RATE: u32 = 24_000;
@@ -80,7 +80,10 @@ pub fn phonemizer() -> Phonemizer {
 }
 
 pub fn app_with(engine: FakeEngine, waiting: usize) -> Router {
-    http::app(Speaker::new(phonemizer(), Box::new(engine), waiting))
+    http::app(Speaker::new(
+        Local::new(phonemizer(), Box::new(engine)),
+        waiting,
+    ))
 }
 
 pub fn app() -> (Router, Arc<Mutex<Vec<Call>>>) {
