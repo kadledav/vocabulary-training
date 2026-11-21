@@ -130,6 +130,27 @@ class Notices(unittest.TestCase):
         expression = notices.split("Combined licence expression: ", 1)[1].split("\n", 1)[0]
         self.assertIsNone(licenses.label_problem((root / licenses.DOCKERFILE).read_text(), expression))
 
+    def test_r83_tts_image_label_and_notices_agree(self):
+        root = TOOLS.parent
+        image = licenses.IMAGES["tts"]
+        notices = (root / image.output).read_text()
+        expression = notices.split("Combined licence expression: ", 1)[1].split("\n", 1)[0]
+        self.assertIsNone(licenses.label_problem((root / image.dockerfile).read_text(), expression, image.dockerfile))
+        # What the Dockerfile adds besides crates is listed with its licence.
+        for component in ("ONNX Runtime", "LAME 3.100", "CMUdict", "Kokoro-82M", "kissfft", "Eigen", "abseil"):
+            self.assertIn(component, notices)
+        for spdx in ("LGPL-2.0-or-later", "MPL-2.0", "BSL-1.0", "BSD-2-Clause"):
+            self.assertIn(spdx, expression)
+        # ONNX Runtime's own notices, which the TTS notices refer to, are shipped.
+        self.assertIn(licenses.ORT_NOTICES, (root / image.dockerfile).read_text())
+
+    def test_deprecated_ids_and_lgpl_texts(self):
+        self.assertEqual(licenses.choose("LGPL-3.0"), ["LGPL-3.0-only"])
+        self.assertEqual(licenses.classify("LICENSE", "GNU LESSER GENERAL PUBLIC LICENSE\n  Version 3, 29 June 2007"),
+                         {"LGPL-3.0-only", "GPL"})
+        self.assertIn("LGPL-2.0-or-later",
+                      licenses.classify("COPYING", "GNU LIBRARY GENERAL PUBLIC LICENSE\n Version 2, June 1991"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -33,6 +33,10 @@ not ignored) breaks one of these rules. Every file is scanned as text
              (code only: comments are ignored);
 * R-90       every Dockerfile's `FROM rust:<X>…` uses the release pinned in
              rust-toolchain.toml (the image build does not read that file);
+             every sherpa-onnx static library a Dockerfile adds
+             (`…/sherpa-onnx/releases/download/v<X>/sherpa-onnx-v<X>-…`) is
+             the version of the `sherpa-onnx` crate in Cargo.lock (the
+             crate's FFI must match the libraries it links);
 * R-91       renovate.json: top-level minimumReleaseAge "14 days", every
              minimumReleaseAge anywhere equal to "14 days", only known presets,
              internalChecksFilter "strict" everywhere, no automerge, no
@@ -148,11 +152,12 @@ ALLOWED_HOSTS = {
     "github.com", "githubusercontent.com", "ghcr.io", "gcr.io", "crates.io", "npmjs.org", "debian.org",
     "docker.io", "docker.com", "anthropic.com", "rust-lang.org", "renovatebot.com", "json-schema.org",
     "nodejs.org", "opencontainers.org", "sqlite.org", "llvm.org", "playwright.dev",
+    "pythonhosted.org", "pypi.org",
 }
 CONFIG_SUFFIXES = {".yml", ".yaml", ".toml", ".json", ".ini", ".cfg", ".conf", ".env", ".example", ".npmrc",
                    ".dockerignore", ".gitignore"}
 # Generated or third-party text: licence texts name their authors.
-PERSONAL_DATA_EXEMPT = {"THIRD-PARTY-NOTICES.txt", "LICENSE"}
+PERSONAL_DATA_EXEMPT = {"THIRD-PARTY-NOTICES.txt", "LICENSE", "docker/tts-licenses/THIRD-PARTY-NOTICES.txt"}
 
 FIXTURE_DIRS = {"testdata", "test-data", "test_data", "fixtures", "__fixtures__"}
 FIXTURE_KEYS = r"id|pack_id|slug|source_slug|source_id"
@@ -238,6 +243,7 @@ def check(root: Path, files: list[str]) -> list[str]:
 
     problems += check_renovate(root)
     problems += check_rust_images(root, files)
+    problems += check_sherpa_libraries(root, files)
     return problems
 
 
@@ -338,6 +344,33 @@ def check_rust_images(root: Path, files: list[str]) -> list[str]:
                 problems.append(
                     f"{rel}:{line_of(m.string, m.start())}: rust:{m.group('version')} does not match "
                     f"rust-toolchain.toml channel {channel!r} (R-90)"
+                )
+    return problems
+
+
+SHERPA_LIBRARY = re.compile(
+    r"sherpa-onnx/releases/download/v(?P<tag>[0-9][0-9A-Za-z.+-]*)/sherpa-onnx-v(?P<file>[0-9][0-9A-Za-z.+-]*?)-[a-z]"
+)
+SHERPA_CRATE = re.compile(r'^\[\[package\]\]\nname = "sherpa-onnx"\nversion = "(?P<version>[^"]+)"', re.M)
+
+
+def check_sherpa_libraries(root: Path, files: list[str]) -> list[str]:
+    """The sherpa-onnx static libraries in Dockerfiles must be the release of
+    the sherpa-onnx crate in Cargo.lock."""
+    lock = root / "Cargo.lock"
+    m = SHERPA_CRATE.search(lock.read_text()) if lock.is_file() else None
+    crate = m.group("version") if m else None
+    problems = []
+    for rel in files:
+        if not DOCKERFILE_NAME.search(rel) or not (root / rel).is_file():
+            continue
+        text = (root / rel).read_text(errors="replace")
+        for lib in SHERPA_LIBRARY.finditer(text):
+            versions = {lib.group("tag"), lib.group("file")}
+            if versions != {crate}:
+                problems.append(
+                    f"{rel}:{line_of(text, lib.start())}: sherpa-onnx libraries v{'/'.join(sorted(versions))} "
+                    f"do not match the sherpa-onnx crate {crate!r} in Cargo.lock (R-90)"
                 )
     return problems
 

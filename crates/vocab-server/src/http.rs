@@ -61,6 +61,7 @@ use serde::Deserialize;
 use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::audio::Audio;
 use crate::auth::{self, Auth, AuthError, CsrfRejection, SessionCheck};
 use crate::catalog::{self, SourceId, WordId, WordQuery};
 use crate::clock::{Clock, DayRule, Moment, SystemClock};
@@ -154,6 +155,8 @@ pub struct AppState {
     import_wait: Duration,
     /// Time the body of an import request may take to arrive.
     body_read_timeout: Duration,
+    /// Neural audio; `None` without `VOCAB_TTS_URL` (browser speech only).
+    audio: Option<Audio>,
 }
 
 impl AppState {
@@ -173,7 +176,15 @@ impl AppState {
             import_turn: Arc::new(Semaphore::new(1)),
             import_wait: limits.slot_wait(),
             body_read_timeout: limits.request_timeout(),
+            audio: None,
         }
+    }
+
+    /// With neural audio (`VOCAB_TTS_URL` set).
+    #[must_use]
+    pub fn with_audio(mut self, audio: Audio) -> Self {
+        self.audio = Some(audio);
+        self
     }
 
     /// Now, with its study day.
@@ -389,6 +400,16 @@ fn endpoints() -> Vec<Endpoint> {
             Post,
             "/api/sessions/{id}/finish",
             finish_session,
+        ),
+        endpoint(Standard, Session, Get, "/api/audio/status", audio_status),
+        endpoint(Standard, Session, Post, "/api/audio/retry", audio_retry),
+        endpoint(Standard, Session, Get, "/api/audio/words/{id}", audio_word),
+        endpoint(
+            Standard,
+            Session,
+            Get,
+            "/api/audio/clips/{file}",
+            audio_clip,
         ),
         endpoint(Standard, Session, Get, "/api/settings", get_settings),
         endpoint(Standard, Session, Patch, "/api/settings", patch_settings),
@@ -1023,10 +1044,16 @@ async fn import_commit(State(state): State<AppState>, headers: HeaderMap, body: 
         Err(response) => return *response,
     };
     let now = state.moment();
-    run_import(turn, async move {
+    let audio = state.audio.clone();
+    let response = run_import(turn, async move {
         workflows::commit_import(&state.db, &request.text, Via::Paste, now).await
     })
-    .await
+    .await;
+    // New words and sentences get their clips (the worker syncs).
+    if let Some(audio) = audio {
+        audio.wake();
+    }
+    response
 }
 
 async fn import_recent(State(state): State<AppState>) -> Response {
@@ -1404,12 +1431,183 @@ async fn patch_settings(
             );
         }
     };
-    respond(
-        state
-            .db
-            .write(move |tx| Ok::<_, ApiError>(settings::update(tx, &patch)?))
-            .await,
-    )
+    let voice_changed = patch.voice.is_some();
+    let result = state
+        .db
+        .write(move |tx| Ok::<_, ApiError>(settings::update(tx, &patch)?))
+        .await;
+    if voice_changed
+        && result.is_ok()
+        && let Some(audio) = &state.audio
+    {
+        audio.wake();
+    }
+    respond(result)
+}
+
+// ── audio (design §10.3) ────────────────────────────────────────────────────
+
+/// `GET /api/audio/status`: clip counts for Settings.
+async fn audio_status(State(state): State<AppState>) -> Response {
+    let Some(audio) = &state.audio else {
+        return Json(serde_json::json!({ "enabled": false })).into_response();
+    };
+    match audio.status().await {
+        Ok(status) => {
+            let mut value = serde_json::to_value(status).unwrap_or_default();
+            value["enabled"] = serde_json::Value::Bool(true);
+            Json(value).into_response()
+        }
+        Err(err) => internal_error(&err),
+    }
+}
+
+/// `POST /api/audio/retry`: failed clips are queued again.
+async fn audio_retry(State(state): State<AppState>) -> Response {
+    let Some(audio) = &state.audio else {
+        return error_response(
+            StatusCode::CONFLICT,
+            "audio_disabled",
+            "Neural audio is not configured.",
+        );
+    };
+    match audio.retry_failed().await {
+        Ok(count) => Json(serde_json::json!({ "retried": count })).into_response(),
+        Err(err) => internal_error(&err),
+    }
+}
+
+/// `GET /api/audio/words/{id}`: the clips of a word and its sentences.
+async fn audio_word(
+    State(state): State<AppState>,
+    id: Result<Path<i64>, PathRejection>,
+) -> Response {
+    let Ok(Path(id)) = id else {
+        return not_found().await;
+    };
+    let Some(audio) = &state.audio else {
+        return Json(serde_json::json!({ "enabled": false })).into_response();
+    };
+    match audio.word_clips(WordId::new(id)).await {
+        Ok(Some(clips)) => {
+            let mut value = serde_json::to_value(clips).unwrap_or_default();
+            value["enabled"] = serde_json::Value::Bool(true);
+            Json(value).into_response()
+        }
+        Ok(None) => not_found().await,
+        Err(err) => internal_error(&err),
+    }
+}
+
+/// A byte range of a clip: `Range: bytes=a-b | a- | -n` (one range only;
+/// anything else is answered with the whole clip, as HTTP allows).
+fn byte_range(header: Option<&HeaderValue>, len: u64) -> Option<Result<(u64, u64), ()>> {
+    let spec = header?.to_str().ok()?.strip_prefix("bytes=")?.trim();
+    if spec.contains(',') {
+        return None;
+    }
+    let (start, end) = spec.split_once('-')?;
+    let range = match (start.trim(), end.trim()) {
+        ("", suffix) => {
+            let n: u64 = suffix.parse().ok()?;
+            if n == 0 || len == 0 {
+                return Some(Err(()));
+            }
+            (len.saturating_sub(n), len - 1)
+        }
+        (start, "") => (start.parse().ok()?, len.saturating_sub(1)),
+        (start, end) => {
+            let (start, end): (u64, u64) = (start.parse().ok()?, end.parse().ok()?);
+            if end < start {
+                return None;
+            }
+            (start, end.min(len.saturating_sub(1)))
+        }
+    };
+    Some(if range.0 < len { Ok(range) } else { Err(()) })
+}
+
+/// `GET /api/audio/clips/{hash}.mp3`: a clip file. Clips never change (the
+/// hash names the content): private, immutable caching, ETag = hash, and
+/// byte ranges (iOS Safari plays `<audio>` only with them).
+async fn audio_clip(
+    State(state): State<AppState>,
+    file: Result<Path<String>, PathRejection>,
+    headers: HeaderMap,
+) -> Response {
+    let Ok(Path(file)) = file else {
+        return not_found().await;
+    };
+    let (Some(audio), Some(hash)) = (&state.audio, file.strip_suffix(".mp3")) else {
+        return not_found().await;
+    };
+    if !Audio::is_clip_hash(hash) {
+        return not_found().await;
+    }
+    let etag = format!("\"{hash}\"");
+    let cache = |response: &mut Response| {
+        let headers = response.headers_mut();
+        headers.insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, max-age=31536000, immutable"),
+        );
+        if let Ok(value) = HeaderValue::from_str(&etag) {
+            headers.insert(header::ETAG, value);
+        }
+        headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    };
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(',').any(|t| t.trim() == etag || t.trim() == "*"))
+    {
+        let mut response = StatusCode::NOT_MODIFIED.into_response();
+        cache(&mut response);
+        return response;
+    }
+    let audio = audio.clone();
+    let owned = hash.to_owned();
+    let bytes = tokio::task::spawn_blocking(move || -> std::io::Result<Option<Vec<u8>>> {
+        let Some(mut file) = audio.open_clip(&owned)? else {
+            return Ok(None);
+        };
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(Some(bytes))
+    })
+    .await;
+    let bytes = match bytes {
+        Ok(Ok(Some(bytes))) => bytes,
+        Ok(Ok(None)) => return not_found().await,
+        Ok(Err(err)) => return internal_error(&err),
+        Err(err) => return internal_error(&err),
+    };
+    let len = bytes.len() as u64;
+    let mut response = match byte_range(headers.get(header::RANGE), len) {
+        None => (StatusCode::OK, bytes).into_response(),
+        Some(Ok((start, end))) => {
+            let part = bytes
+                [usize::try_from(start).unwrap_or(0)..=usize::try_from(end).unwrap_or(0)]
+                .to_vec();
+            let mut response = (StatusCode::PARTIAL_CONTENT, part).into_response();
+            if let Ok(value) = HeaderValue::from_str(&format!("bytes {start}-{end}/{len}")) {
+                response.headers_mut().insert(header::CONTENT_RANGE, value);
+            }
+            response
+        }
+        Some(Err(())) => {
+            let mut response = StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+            if let Ok(value) = HeaderValue::from_str(&format!("bytes */{len}")) {
+                response.headers_mut().insert(header::CONTENT_RANGE, value);
+            }
+            return response;
+        }
+    };
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static("audio/mpeg"));
+    cache(&mut response);
+    response
 }
 
 // ── middleware ──────────────────────────────────────────────────────────────

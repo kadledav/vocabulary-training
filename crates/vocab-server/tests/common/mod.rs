@@ -153,6 +153,8 @@ pub struct Env {
     pub db: Db,
     pub clock: Arc<ManualClock>,
     pub router: axum::Router,
+    /// Neural audio, when the env was made with a TTS endpoint.
+    pub audio: Option<vocab_server::audio::Audio>,
     pack_no: std::cell::Cell<u32>,
 }
 
@@ -167,21 +169,44 @@ pub fn env() -> Env {
 /// A fresh app on the database in `dir` (a "restart" when the directory
 /// was used before).
 pub fn env_in(dir: tempfile::TempDir, now: &str) -> Env {
+    env_with_audio(dir, now, None)
+}
+
+/// [`env_in`] with neural audio from the TTS service at `tts` (the worker
+/// is not started: tests drive `sync`/`work_one` themselves).
+pub fn env_with_audio(
+    dir: tempfile::TempDir,
+    now: &str,
+    tts: Option<vocab_server::audio::TtsEndpoint>,
+) -> Env {
     let db = Db::open(dir.path()).expect("db");
     let clock = Arc::new(ManualClock::new(ts(now)));
     let (auth, code) = long_auth();
-    let state = AppState::with_clock(
+    let mut state = AppState::with_clock(
         db.clone(),
         Arc::clone(&clock) as Arc<dyn Clock>,
         prague(),
         auth,
     );
+    let audio = tts.map(|endpoint| {
+        vocab_server::audio::Audio::new(
+            db.clone(),
+            &dir.path().join("cache"),
+            endpoint,
+            Arc::clone(&clock) as Arc<dyn Clock>,
+        )
+        .expect("audio")
+    });
+    if let Some(audio) = &audio {
+        state = state.with_audio(audio.clone());
+    }
     let router = logged_in(http::app(state, &Limits::default()), code);
     Env {
         dir,
         db,
         clock,
         router,
+        audio,
         pack_no: std::cell::Cell::new(0),
     }
 }

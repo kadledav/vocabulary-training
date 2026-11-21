@@ -4,15 +4,17 @@
 #    version in Cargo.toml and its commit is on main; if the version tag
 #    already exists in GHCR (a re-run), nothing is built again.
 # 2. checks: every CI check (ci.yml).
-# 3. image-amd64 / image-arm64: each platform is built ONCE, natively on its
-#    own runner (no QEMU), with SLSA provenance (mode=max) and an SBOM,
-#    pushed by digest only (untagged), pulled back and smoke-tested there
-#    (release-image.yml).
-# 4. publish: the two tested images are merged into one multi-platform index
-#    `sha-<short>` (no rebuild) and the version tag X.Y.Z is added to that
-#    index; an existing version tag is never moved. Never `latest`.
-# 5. notes: the reference `X.Y.Z@digest` goes into the job summary and,
-#    once, into the GitHub release notes. Deploy by tag AND digest.
+# 3. image-amd64 / image-arm64 (app) and tts-amd64 / tts-arm64 (TTS image
+#    ghcr.io/kadledav/vocabulary-training-tts): each image and platform is
+#    built ONCE, natively on its own runner (no QEMU), with SLSA provenance
+#    (mode=max) and an SBOM, pushed by digest only (untagged), pulled back
+#    and smoke-tested there (release-image.yml; tools/tts-smoke.py for TTS).
+# 4. publish / publish-tts: the two tested images of each are merged into
+#    one multi-platform index `sha-<short>` (no rebuild) and the version tag
+#    X.Y.Z is added to that index; an existing version tag is never moved.
+#    Never `latest`.
+# 5. notes: both references `X.Y.Z@digest` go into the job summary and,
+#    once each, into the GitHub release notes. Deploy by tag AND digest.
 #
 # Every action is pinned by commit SHA, the BuildKit and SBOM-generator images
 # by digest; tools/dep-age.py dates all of them (R-90).
@@ -40,6 +42,7 @@ jobs:
       number: ${{ steps.prepare.outputs.version }}
       short: ${{ steps.prepare.outputs.short }}
       existing: ${{ steps.prepare.outputs.existing }}
+      existing_tts: ${{ steps.prepare_tts.outputs.existing }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -54,6 +57,14 @@ jobs:
           GHCR_USER: ${{ github.actor }}
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 tools/release-promote.py prepare --repository ghcr.io/kadledav/vocabulary-training --tag "$TAG" --commit "$COMMIT"
+      - name: Whether the TTS image of the version is published
+        id: prepare_tts
+        env:
+          TAG: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
+          GHCR_USER: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 tools/release-promote.py prepare --repository ghcr.io/kadledav/vocabulary-training-tts --tag "$TAG" --commit "$COMMIT"
 
   checks:
     name: CI checks
@@ -71,6 +82,7 @@ jobs:
       packages: write
     uses: ./.github/workflows/release-image.yml
     with:
+      kind: server
       platform: linux/amd64
       runner: ubuntu-24.04
       number: ${{ needs.prepare.outputs.number }}
@@ -84,6 +96,35 @@ jobs:
       packages: write
     uses: ./.github/workflows/release-image.yml
     with:
+      kind: server
+      platform: linux/arm64
+      runner: ubuntu-24.04-arm
+      number: ${{ needs.prepare.outputs.number }}
+
+  tts-amd64:
+    name: TTS image linux/amd64
+    needs: [prepare, checks]
+    if: needs.prepare.outputs.existing_tts == ''
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/release-image.yml
+    with:
+      kind: tts
+      platform: linux/amd64
+      runner: ubuntu-24.04
+      number: ${{ needs.prepare.outputs.number }}
+
+  tts-arm64:
+    name: TTS image linux/arm64
+    needs: [prepare, checks]
+    if: needs.prepare.outputs.existing_tts == ''
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/release-image.yml
+    with:
+      kind: tts
       platform: linux/arm64
       runner: ubuntu-24.04-arm
       number: ${{ needs.prepare.outputs.number }}
@@ -119,11 +160,45 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 tools/release-promote.py publish --repository ghcr.io/kadledav/vocabulary-training --version "$NUMBER" --short "$SHORT" --digest "$AMD64" --digest "$ARM64"
 
+  publish-tts:
+    name: merge the tested TTS images, tag X.Y.Z
+    needs: [prepare, tts-amd64, tts-arm64]
+    if: needs.prepare.outputs.existing_tts == ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.publish.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: One index sha-<short> of both tested TTS images, then the version tag
+        id: publish
+        env:
+          NUMBER: ${{ needs.prepare.outputs.number }}
+          SHORT: ${{ needs.prepare.outputs.short }}
+          AMD64: ${{ needs.tts-amd64.outputs.digest }}
+          ARM64: ${{ needs.tts-arm64.outputs.digest }}
+          GHCR_USER: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 tools/release-promote.py publish --repository ghcr.io/kadledav/vocabulary-training-tts --version "$NUMBER" --short "$SHORT" --digest "$AMD64" --digest "$ARM64"
+
   notes:
-    name: digest into the release notes
-    needs: [prepare, publish]
+    name: digests into the release notes
+    needs: [prepare, publish, publish-tts]
     # Also on a re-run of an already published version (publish skipped).
-    if: always() && needs.prepare.result == 'success' && (needs.publish.result == 'success' || (needs.publish.result == 'skipped' && needs.prepare.outputs.existing != ''))
+    if: >-
+      always() && needs.prepare.result == 'success'
+      && (needs.publish.result == 'success' || (needs.publish.result == 'skipped' && needs.prepare.outputs.existing != ''))
+      && (needs.publish-tts.result == 'success' || (needs.publish-tts.result == 'skipped' && needs.prepare.outputs.existing_tts != ''))
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -132,7 +207,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Reference tag and digest in the summary and the release notes
+      - name: Reference tag and digest of the app image in the summary and the release notes
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -140,3 +215,11 @@ jobs:
           NUMBER: ${{ needs.prepare.outputs.number }}
           DIGEST: ${{ needs.publish.outputs.digest || needs.prepare.outputs.existing }}
         run: python3 tools/release-promote.py notes --repository ghcr.io/kadledav/vocabulary-training --tag "$TAG" --version "$NUMBER" --digest "$DIGEST"
+      - name: Reference tag and digest of the TTS image in the summary and the release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          NUMBER: ${{ needs.prepare.outputs.number }}
+          DIGEST: ${{ needs.publish-tts.outputs.digest || needs.prepare.outputs.existing_tts }}
+        run: python3 tools/release-promote.py notes --repository ghcr.io/kadledav/vocabulary-training-tts --tag "$TAG" --version "$NUMBER" --digest "$DIGEST" --image tts

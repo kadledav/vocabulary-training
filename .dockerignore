@@ -1,6 +1,6 @@
-# Build context of docker/Dockerfile.server: only what the release build of
-# vocab-server needs (allow-list). Everything else (target/, node_modules/,
-# .git/, data, docs, tests' artefacts) stays out of the context.
+# Build context of docker/Dockerfile.server and docker/Dockerfile.tts: only
+# what their release builds need (allow-list). Everything else (target/,
+# node_modules/, .git/, data, docs, tests' artefacts) stays out of the context.
 *
 !Cargo.toml
 !Cargo.lock
@@ -11,3 +11,5 @@
 !web/css/
 !web/js/
 !web/img/
+# Dockerfile.tts: the TTS image's licence files.
+!docker/tts-licenses/

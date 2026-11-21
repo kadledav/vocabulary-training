@@ -111,7 +111,8 @@ class FakeRegistries:
             name: getattr(dep_age, name)
             for name in (
                 "crate_published", "npm_published", "rust_published", "node_published", "action_published",
-                "image_published", "debian_published",
+                "image_published", "debian_published", "release_asset_published", "commit_published",
+                "pypi_file_published",
             )
         }
         dep_age.crate_published = lambda n, v: self._date(n, v)
@@ -121,6 +122,9 @@ class FakeRegistries:
         dep_age.action_published = lambda repo, sha, tag: self._date(repo, sha, tag)
         dep_age.image_published = lambda name, digest: self._date(name, digest)
         dep_age.debian_published = lambda pkg, version: self._date(pkg, version)
+        dep_age.release_asset_published = lambda repo, tag, asset, sha256: self._date(asset, tag, sha256)
+        dep_age.commit_published = lambda repo, sha: self._date(repo, sha)
+        dep_age.pypi_file_published = lambda project, version, file, sha256: self._date(project, version, file)
         return self
 
     def __exit__(self, *exc):
@@ -539,6 +543,82 @@ class ActionDates(unittest.TestCase):
             self.run_with(r)
 
 
+class CommitDates(unittest.TestCase):
+    def test_r90_commit_date_and_existence(self):
+        saved, saved_cache = dep_age.github_api, dep_age.cache_enabled
+        dep_age.cache_enabled = False
+        try:
+            dep_age.github_api = lambda path: {"sha": SHA, "commit": {"committer": {"date": "2025-10-24T17:40:26Z"}}}
+            self.assertEqual(dep_age.commit_published("o/r", SHA).isoformat(), "2025-10-24T17:40:26+00:00")
+            dep_age.github_api = lambda path: {"sha": "0" * 40, "commit": {"committer": {"date": "2025-10-24T17:40:26Z"}}}
+            with self.assertRaises(dep_age.LookupFailed):
+                dep_age.commit_published("o/r", SHA)
+        finally:
+            dep_age.github_api, dep_age.cache_enabled = saved, saved_cache
+
+
+class ReleaseAssetDates(unittest.TestCase):
+    """release_asset_published: GitHub's digest must be the pinned checksum;
+    the age is the asset's upload (a re-upload counts)."""
+
+    def run_with(self, release):
+        saved, saved_cache = dep_age.github_api, dep_age.cache_enabled
+        dep_age.cache_enabled = False
+        dep_age.github_api = lambda path: release if path == "/repos/o/r/releases/tags/v1" else {}
+        try:
+            return dep_age.release_asset_published("o/r", "v1", "a.tar.bz2", DIGEST)
+        finally:
+            dep_age.github_api, dep_age.cache_enabled = saved, saved_cache
+
+    def asset(self, **override):
+        base = {"name": "a.tar.bz2", "digest": f"sha256:{DIGEST}",
+                "created_at": "2026-10-26T09:08:26Z", "updated_at": "2026-10-26T09:08:34Z"}
+        base.update(override)
+        return {"published_at": "2023-11-21T07:43:51Z", "assets": [{"name": "other"}, base]}
+
+    def test_r90_upload_time_of_the_asset_is_its_date(self):
+        self.assertEqual(self.run_with(self.asset()).isoformat(), "2026-10-26T09:08:34+00:00")
+        reuploaded = self.asset(updated_at="2026-11-20T00:00:00Z")
+        self.assertEqual(self.run_with(reuploaded).isoformat(), "2026-11-20T00:00:00+00:00")
+
+    def test_r90_digest_must_match_and_be_known(self):
+        for release in [self.asset(digest=f"sha256:{DIGEST2}"), self.asset(digest=None),
+                        {"assets": [{"name": "other"}]}, {}]:
+            with self.subTest(release), self.assertRaises(dep_age.LookupFailed):
+                self.run_with(release)
+
+
+class PypiFileDates(unittest.TestCase):
+    """pypi_file_published: PyPI's sha256 must be the pinned checksum; the
+    age is the file's upload."""
+
+    FILE = "tool-1.2.0-py3-none-any.whl"
+
+    def run_with(self, release):
+        saved, saved_cache = dep_age.fetch_json, dep_age.cache_enabled
+        dep_age.cache_enabled = False
+        dep_age.fetch_json = lambda url, **kw: release if url == "https://pypi.org/pypi/tool/1.2.0/json" else {}
+        try:
+            return dep_age.pypi_file_published("tool", "1.2.0", self.FILE, DIGEST)
+        finally:
+            dep_age.fetch_json, dep_age.cache_enabled = saved, saved_cache
+
+    def file(self, **override):
+        base = {"filename": self.FILE, "digests": {"sha256": DIGEST}, "yanked": False,
+                "upload_time_iso_8601": "2026-07-25T01:21:59.123456Z"}
+        base.update(override)
+        return {"urls": [{"filename": "other.whl"}, base]}
+
+    def test_r90_upload_time_of_the_file_is_its_date(self):
+        self.assertEqual(self.run_with(self.file()).isoformat(), "2026-07-25T01:21:59.123456+00:00")
+
+    def test_r90_digest_must_match_and_the_file_exist(self):
+        for release in [self.file(digests={"sha256": DIGEST2}), self.file(digests={}), self.file(yanked=True),
+                        {"urls": [{"filename": "other.whl"}]}, {}]:
+            with self.subTest(release), self.assertRaises(dep_age.LookupFailed):
+                self.run_with(release)
+
+
 DIGEST = "a" * 64
 DIGEST2 = "b" * 64
 
@@ -689,6 +769,65 @@ class Dockerfiles(RepoCase):
         )
         # The pinned image of line 5 is still dated.
         self.assertIn("alpine:3.20", {f.name for f in result.findings if f.kind == "image"})
+
+    def test_r90_add_of_a_checksum_pinned_github_release_asset_is_dated(self):
+        url = "https://github.com/o/r/releases/download/v2.0.1/lib-linux-x64.tar.bz2"
+        result = self.dockerfile(CLEAN_DOCKERFILE + f"ADD --checksum=sha256:{DIGEST} {url} /archives/\n")
+        self.assertEqual(result.errors, [])
+        assets = [(f.kind, f.name, f.version) for f in result.findings if f.kind == "asset"]
+        self.assertEqual(assets, [("asset", "o/r/lib-linux-x64.tar.bz2", "v2.0.1")])
+        young = self.dockerfile(CLEAN_DOCKERFILE + f"ADD --checksum=sha256:{DIGEST} {url} /archives/\n",
+                                young={"lib-linux-x64.tar.bz2"})
+        self.assertIn(YOUNG, {f.published for f in young.findings if f.kind == "asset"})
+
+    def test_r90_add_of_a_checksum_pinned_file_at_a_commit_is_dated(self):
+        url = f"https://raw.githubusercontent.com/o/dict/{SHA}/data/words.dict"
+        result = self.dockerfile(CLEAN_DOCKERFILE + f"ADD --checksum=sha256:{DIGEST} {url} /archives/\n")
+        self.assertEqual(result.errors, [])
+        commits = [(f.name, f.version) for f in result.findings if f.kind == "commit"]
+        self.assertEqual(commits, [("o/dict/data/words.dict", SHA[:12])])
+        young = self.dockerfile(CLEAN_DOCKERFILE + f"ADD --checksum=sha256:{DIGEST} {url} /archives/\n", young={"o/dict"})
+        self.assertIn(YOUNG, {f.published for f in young.findings if f.kind == "commit"})
+        for bad in [f"https://raw.githubusercontent.com/o/dict/master/words.dict",
+                    f"https://raw.githubusercontent.com/o/dict/{SHA[:12]}/words.dict",
+                    f"https://raw.githubusercontent.com/o/dict/{SHA}/../x"]:
+            with self.subTest(bad):
+                self.assertError(self.dockerfile(CLEAN_DOCKERFILE + f"ADD --checksum=sha256:{DIGEST} {bad} /x\n"),
+                                 "ADD from a URL must be")
+        no_checksum = self.dockerfile(CLEAN_DOCKERFILE + f"ADD {url} /x\n")
+        self.assertError(no_checksum, "ADD from a URL must be")
+
+    def test_r90_add_of_a_checksum_pinned_pypi_file_is_dated(self):
+        url = ("https://files.pythonhosted.org/packages/f3/17/" + "4e" * 30
+               + "/onnxruntime-1.28.0-cp311-cp311-manylinux_2_28_x86_64.whl")
+        result = self.dockerfile(CLEAN_DOCKERFILE + f"ADD --checksum=sha256:{DIGEST} {url} /archives/\n")
+        self.assertEqual(result.errors, [])
+        found = [(f.kind, f.name, f.version) for f in result.findings if f.kind == "pypi"]
+        self.assertEqual(found, [("pypi", "onnxruntime/onnxruntime-1.28.0-cp311-cp311-manylinux_2_28_x86_64.whl", "1.28.0")])
+        young = self.dockerfile(CLEAN_DOCKERFILE + f"ADD --checksum=sha256:{DIGEST} {url} /archives/\n",
+                                young={"onnxruntime"})
+        self.assertIn(YOUNG, {f.published for f in young.findings if f.kind == "pypi"})
+        for bad in ["https://files.pythonhosted.org/packages/f3/17/abc/onnxruntime-1.28.0-cp311-none-any.whl",
+                    "https://files.pythonhosted.org/packages/f3/17/" + "4e" * 30 + "/../x.whl",
+                    "https://pypi.example.invalid/packages/f3/17/" + "4e" * 30 + "/onnxruntime-1.28.0-py3-none-any.whl"]:
+            with self.subTest(bad):
+                self.assertError(self.dockerfile(CLEAN_DOCKERFILE + f"ADD --checksum=sha256:{DIGEST} {bad} /x\n"),
+                                 "ADD from a URL must be")
+        self.assertError(self.dockerfile(CLEAN_DOCKERFILE + f"ADD {url} /x\n"), "ADD from a URL must be")
+
+    def test_r90_add_from_a_url_without_checksum_or_from_elsewhere_is_rejected(self):
+        url = "https://github.com/o/r/releases/download/v1/a.tar.gz"
+        for line in [
+            f"ADD {url} /x",
+            f"ADD --checksum=sha256:{DIGEST[:10]} {url} /x",
+            f"ADD --checksum=sha256:{DIGEST} https://example.invalid/a.tar.gz /x",
+            f"ADD --checksum=sha256:{DIGEST} https://github.com/o/r/archive/refs/heads/main.tar.gz /x",
+            f"ADD --checksum=sha256:{DIGEST} --chmod=755 {url} /x",
+            f"ADD --checksum=sha256:{DIGEST} {url} {url} /x",
+            f"ADD --checksum=sha256:{DIGEST} git@github.com:o/r.git /x",
+        ]:
+            with self.subTest(line):
+                self.assertError(self.dockerfile(CLEAN_DOCKERFILE + line + "\n"), "ADD from a URL must be")
 
     def test_r90_redirecting_settings_in_dockerfiles_are_rejected(self):
         result = self.dockerfile(CLEAN_DOCKERFILE + "ENV RUSTUP_DIST_SERVER=https://example.invalid\n")

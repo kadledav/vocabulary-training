@@ -35,8 +35,15 @@ deliberate shell obfuscation is out of scope (review covers that).
     - `# syntax=` directives and `RUN --mount=…,from=` images like `FROM`;
       heredocs, `BUILDKIT_*` arguments and `ONBUILD` are errors
     - known install/download commands only in these forms: `apt-get update`,
-      `rustup target add <target or "$VAR">`; `ADD <url>`, other URLs and
-      downloads (curl, wget, pip, …) are errors
+      `rustup target add <target or "$VAR">`; other URLs and downloads
+      (curl, wget, pip, …) are errors
+    - `ADD` from a URL only as `ADD --checksum=sha256:<hex> <URL> <dest>`
+      with a GitHub release asset URL (the checksum must equal GitHub's
+      digest of the asset; dated by the asset's upload) or a file of a
+      repository at a full commit SHA on raw.githubusercontent.com (the
+      content of a commit never changes; dated by the commit) -> GitHub API,
+      or a PyPI release file on files.pythonhosted.org (the checksum must
+      equal PyPI's SHA-256 of that file; dated by its upload) -> PyPI JSON
 * everywhere: `cargo update|generate-lockfile|add` are errors, cargo commands
   that resolve dependencies must use `--locked`, `cargo --config` is an error;
   settings that redirect downloads (registry/source variables, CARGO_HOME,
@@ -353,6 +360,110 @@ def action_published(repo: str, sha: str, tag: str) -> dt.datetime:
                 raise
         _action_cache[key] = max(dates)
     return _action_cache[key]
+
+
+# a file attached to a GitHub release, pinned by its SHA-256 (ADD --checksum).
+GITHUB_RELEASE_ASSET = re.compile(
+    r"^https://github\.com/(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/releases/download/"
+    r"(?P<tag>[A-Za-z0-9_.+-]+)/(?P<asset>[A-Za-z0-9_.+-]+)$"
+)
+# a file of a GitHub repository at a commit (raw content of that commit).
+GITHUB_RAW_AT_COMMIT = re.compile(
+    r"^https://raw\.githubusercontent\.com/(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/"
+    r"(?P<sha>[0-9a-f]{40})/(?P<path>(?!\.)[A-Za-z0-9_.+-]+(?:/(?!\.)[A-Za-z0-9_.+-]+)*)$"
+)
+# a file of a PyPI release (a wheel or sdist), named <project>-<version>-….
+PYPI_FILE = re.compile(
+    r"^https://files\.pythonhosted\.org/packages/[0-9a-f]{2}/[0-9a-f]{2}/[0-9a-f]{60}/"
+    r"(?P<file>(?P<project>[A-Za-z0-9_.]+)-(?P<version>[0-9][A-Za-z0-9_.+!]*)(?:-[A-Za-z0-9_.+]+)*\.(?:whl|tar\.gz))$"
+)
+ADD_CHECKSUM = re.compile(r"^--checksum=sha256:(?P<sha256>[0-9a-f]{64})$")
+
+
+def pypi_file_published(project: str, version: str, file: str, sha256: str) -> dt.datetime:
+    """When the file of a PyPI release was uploaded, after checking that
+    PyPI's SHA-256 of it is the pinned checksum (PyPI never lets a file name
+    be reused, so the upload is the file's date)."""
+    def lookup() -> dt.datetime:
+        release = fetch_json(f"https://pypi.org/pypi/{urllib.parse.quote(project)}/{urllib.parse.quote(version)}/json")
+        files = release.get("urls", []) if isinstance(release, dict) else []
+        for item in files:
+            if item.get("filename") == file:
+                if item.get("digests", {}).get("sha256") != sha256:
+                    raise LookupFailed(f"PyPI's sha256 of {file} is not the pinned one")
+                if item.get("yanked"):
+                    raise LookupFailed(f"{file} was yanked")
+                return parse_ts(item["upload_time_iso_8601"])
+        raise LookupFailed(f"no file {file} in {project} {version} on PyPI")
+
+    return cached("pypi-file", f"{project}=={version}/{file}#{sha256}", lookup)
+
+
+def release_asset_published(repo: str, tag: str, asset: str, sha256: str) -> dt.datetime:
+    """When the release asset was uploaded (the later of its creation and
+    last update: a re-upload under the same name counts as new), after
+    checking that GitHub's digest of the asset is the pinned checksum. An
+    asset without a digest, or a digest that differs, fails the lookup."""
+    def lookup() -> dt.datetime:
+        release = github_api(f"/repos/{repo}/releases/tags/{urllib.parse.quote(tag)}")
+        assets = release.get("assets", []) if isinstance(release, dict) else []
+        for item in assets:
+            if item.get("name") == asset:
+                if item.get("digest") != f"sha256:{sha256}":
+                    raise LookupFailed(f"GitHub's digest of {asset} is {item.get('digest')!r}, not the pinned sha256")
+                return max(parse_ts(item["created_at"]), parse_ts(item["updated_at"]))
+        raise LookupFailed(f"no asset {asset} in release {tag} of {repo}")
+
+    return cached("release-asset", f"{repo}@{tag}/{asset}#{sha256}", lookup)
+
+
+def commit_published(repo: str, sha: str) -> dt.datetime:
+    """The committer date of a commit (its content never changes; a commit
+    whose date is faked into the past is out of scope, see the module
+    docstring)."""
+    def lookup() -> dt.datetime:
+        commit = github_api(f"/repos/{repo}/commits/{sha}")
+        if not isinstance(commit, dict) or commit.get("sha") != sha:
+            raise LookupFailed(f"commit {sha} not found in {repo}")
+        return parse_ts(commit["commit"]["committer"]["date"])
+
+    return cached("commit", f"{repo}@{sha}", lookup)
+
+
+def check_add_url(args: str, where: str, result: "Result") -> None:
+    """`ADD --checksum=sha256:<hex> <URL> <dest>`, URL a GitHub release asset
+    or a file at a commit: the only forms of ADD from a URL (the build
+    verifies the checksum; the gate compares it with GitHub's digest of an
+    asset and dates the asset or the commit)."""
+    words = args.split()
+    flags = [w for w in words if w.startswith("--")]
+    rest = [w for w in words if not w.startswith("--")]
+    checksum = ADD_CHECKSUM.match(flags[0]) if len(flags) == 1 else None
+    url = GITHUB_RELEASE_ASSET.match(rest[0]) if len(rest) == 2 else None
+    raw = GITHUB_RAW_AT_COMMIT.match(rest[0]) if len(rest) == 2 else None
+    pypi = PYPI_FILE.match(rest[0]) if len(rest) == 2 else None
+    if checksum and pypi:
+        project, version, file = pypi.group("project"), pypi.group("version"), pypi.group("file")
+        sha256 = checksum.group("sha256")
+        result.add("pypi", f"{project}/{file}", version,
+                   lambda: pypi_file_published(project, version, file, sha256), where)
+        return
+    if checksum and raw:
+        repo, sha = raw.group("repo"), raw.group("sha")
+        result.add("commit", f"{repo}/{raw.group('path')}", sha[:12],
+                   lambda: commit_published(repo, sha), where)
+        return
+    if not checksum or not url:
+        result.errors.append(
+            f"{where}: ADD from a URL must be `ADD --checksum=sha256:<hex> "
+            f"https://github.com/<owner>/<repo>/releases/download/<tag>/<asset> <dest>` or "
+            f"`… https://raw.githubusercontent.com/<owner>/<repo>/<commit sha>/<path> <dest>` or "
+            f"`… https://files.pythonhosted.org/packages/…/<project>-<version>-….whl <dest>`"
+        )
+        return
+    repo, tag, asset, sha256 = url.group("repo"), url.group("tag"), url.group("asset"), checksum.group("sha256")
+    result.add("asset", f"{repo}/{asset}", tag,
+               lambda: release_asset_published(repo, tag, asset, sha256), where)
 
 
 # ── Cargo ────────────────────────────────────────────────────────────────────
@@ -1214,7 +1325,7 @@ def check_dockerfile(path: Path, result: Result) -> None:
             for source in re.findall(r"--from=(\S+)", args):
                 check_from_source(source, stages, where, "--from=", result)
             if instruction == "ADD" and re.search(r"\b(https?|git|ssh)://|git@", args):
-                result.errors.append(f"{where}: ADD from a URL is not checked by the age gate yet")
+                check_add_url(args, where, result)  # only checksum-pinned GitHub release assets
         elif instruction == "RUN":
             for mount in re.findall(r"--mount=(\S+)", args):
                 for option in mount.split(","):

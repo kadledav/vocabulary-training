@@ -1,6 +1,6 @@
 # Execution Plan — phase 1
 
-Status: **v0.1.0 deployed; v0.1.1 committed on `main` (owner pushes and tags); M6 neural TTS finished and reviewed on branch `m6-tts` as v0.2.0, waiting for v0.1.1 to be released first** — then merge `m6-tts` into `main`, push, CI (first amd64 build of the TTS image), tag v0.2.0. Remaining milestones: M7–M12.
+Status: **v0.1.1 released (tag pushed 2026-11-21); M6 neural TTS merged into `main` as v0.2.0** — owner pushes, CI gives the first amd64 build of the TTS image, then tag v0.2.0 and add the `vocabulary-tts` service to the home stack. Remaining milestones: M7–M12.
 Guarantor: Claude (main session). The guarantor does not write application code; it briefs agents, runs verification commands, reviews, and decides.
 
 Inputs: `docs/requirements.md` (v1.0) · `docs/design/architecture.md` (after guarantor review) · `docs/research/training-ui.md` · `docs/claude-export-instructions.md` · `docs/vocab-pack.schema.json`

@@ -13,6 +13,7 @@ const FIXTURE: &str = include_str!("fixtures/schema_v1_synthetic.sql");
 /// Every table of design §4.2.
 const TABLES: &[&str] = &[
     "audio_clip",
+    "audio_engine",
     "auth_owner",
     "auth_session",
     "auth_throttle",
@@ -69,7 +70,7 @@ fn r85_empty_database_migrates_to_v1_with_foreign_keys_and_integrity_ok() {
     let version: u32 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("user_version");
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
 
     let mut stmt = conn
         .prepare("SELECT name, strict FROM pragma_table_list WHERE schema = 'main' AND name NOT LIKE 'sqlite_%' ORDER BY name")
@@ -99,6 +100,15 @@ fn r85_synthetic_fixture_satisfies_every_constraint() {
     let db = Db::open(&data).expect("open");
     rt.block_on(db.write(|tx| tx.execute_batch(FIXTURE).map_err(DbError::from)))
         .expect("fixture inserts");
+    // Tables of later migrations (the fixture also serves the v1 schema).
+    rt.block_on(db.write(|tx| {
+        tx.execute_batch(
+            "INSERT INTO audio_engine (id, frontend, engine, checked_at) \
+             VALUES (1, 'g2p-2', 'kokoro-test', '2026-11-17T10:00:00Z');",
+        )
+        .map_err(DbError::from)
+    }))
+    .expect("later tables");
 
     let conn = inspect(&data);
     for table in TABLES {
@@ -248,7 +258,7 @@ fn r85_reopening_is_idempotent() {
     let version: u32 = inspect(&data)
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("user_version");
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
 }
 
 #[test]
@@ -261,7 +271,7 @@ fn r85_newer_schema_is_refused() {
     match Db::open(&data) {
         Err(DbError::SchemaTooNew {
             found: 99,
-            known: 5,
+            known: 6,
         }) => {}
         other => panic!("expected SchemaTooNew, got {other:?}"),
     }
@@ -333,7 +343,7 @@ fn r85_v1_database_with_data_migrates_to_v2() {
     let version: u32 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("user_version");
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
     let (headword, spelling): (String, Option<i64>) = conn
         .query_row(
             "SELECT headword, spelling FROM word WHERE id = 1",
@@ -387,7 +397,7 @@ fn r85_v2_database_with_data_migrates_to_v3() {
     let version: u32 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("user_version");
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
     let (items, with_format): (i64, i64) = conn
         .query_row(
             "SELECT count(*), count(format) FROM session_item",
@@ -447,7 +457,7 @@ fn r85_v4_database_with_data_migrates_to_v5() {
     let version: u32 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("user_version");
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
     let defaulted: Vec<(String, bool)> = conn
         .prepare("SELECT slug, title_defaulted FROM source ORDER BY id")
         .expect("prepare")

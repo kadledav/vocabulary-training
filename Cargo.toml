@@ -1,12 +1,13 @@
 [workspace]
 resolver = "3"
-members = ["crates/vocab-pack", "crates/vocab-server"]
-# `vocab-tts` (M6) will be a member but not a default member, so that a plain
-# `cargo build` on the Mac does not need the sherpa-onnx archive (design §14.1).
+members = ["crates/vocab-pack", "crates/vocab-server", "crates/vocab-tts"]
+# `vocab-tts` is a member but not a default member, so that a plain `cargo
+# build` does not need the sherpa-onnx static libraries (design §14.1,
+# docs/design/tts-spike.md, "Building").
 default-members = ["crates/vocab-pack", "crates/vocab-server"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.99"
 license = "MIT"
@@ -27,6 +28,9 @@ fsrs = { version = "=6.6.2", default-features = false }
 # Random practice-session ids (design §4.2 `practice_session.id`).
 getrandom = "=0.4.3"
 hex = "=0.4.3"
+# Response heads of the TTS service (`audio` client); already in the lock
+# file via hyper.
+httparse = "=1.10.1"
 # Reading request bodies frame by frame (import body limit with draining).
 http-body-util = "=0.1.5"
 # The server loop uses hyper directly for connection-level limits (header read
@@ -44,6 +48,12 @@ rustix = { version = "=1.1.6", default-features = false, features = ["std", "fs"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
 sha2 = "=0.11.1"
+# vocab-tts (design §10, §16.2): the TTS engine (Kokoro through the
+# sherpa-onnx C API, statically linked; the default `static` feature only),
+# EBU R128 loudness and the LAME MP3 encoder.
+sherpa-onnx = "=2.0.1"
+ebur128 = "=0.1.11"
+mp3lame-encoder = "=0.2.5"
 # Constant-time comparison of connector token and setup code digests (design §9).
 subtle = "=2.6.1"
 thiserror = "=2.0.21"
@@ -61,6 +71,8 @@ tower = { version = "=0.5.3", default-features = false, features = ["util"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+# `vocab_tts_engine`: vocab-tts with the sherpa-onnx engine (src/engine.rs).
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(vocab_tts_engine)"] }
 missing_debug_implementations = "warn"
 
 [workspace.lints.clippy]

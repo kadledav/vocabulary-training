@@ -20,7 +20,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
   new_per_day: 5,
   block_size: 20,
   voice: 'us',
-  autoplay: true,
+  autoplay: false,
   speed: '1',
   theme: 'dark',
   legend: 'auto',

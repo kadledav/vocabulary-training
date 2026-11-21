@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Third-party notices of the vocab-server binary: THIRD-PARTY-NOTICES.txt.
+"""Third-party notices of the two images (IMAGES): the vocab-server image
+(THIRD-PARTY-NOTICES.txt) and the TTS image
+(docker/tts-licenses/THIRD-PARTY-NOTICES.txt).
 
 Usage:
-  python3 tools/licenses.py            write THIRD-PARTY-NOTICES.txt
-  python3 tools/licenses.py --check    fail if it (or the image's licence
-                                       label) is out of date with Cargo.lock
-  python3 tools/licenses.py --label    print the combined licence expression
+  python3 tools/licenses.py            write both notices files
+  python3 tools/licenses.py --check    fail if a notices file (or an image's
+                                       licence label) is out of date
+  python3 tools/licenses.py --label [--image tts]
+                                       print an image's combined expression
 
 The crates are those linked into `vocab-server` on the release targets
 (x86_64/aarch64 musl): the normal (not dev, not build) dependencies of the
@@ -16,13 +19,21 @@ the crate's sources in the local cargo registry (the directory of its
 manifest). A crate without a matching file gets the standard text of the
 SPDX id, with the crate's authors as copyright holders (only MIT is known;
 anything else is an error to resolve here). Identical texts are printed once.
-Besides the crates, the binary contains the Rust standard library, musl libc,
-LLVM's libunwind (both linked statically by the musl targets) and SQLite
-(bundled by libsqlite3-sys); they are listed as EXTRAS.
+Besides the crates, the server binary contains the Rust standard library,
+musl libc, LLVM's libunwind (both linked statically by the musl targets) and
+SQLite (bundled by libsqlite3-sys); they are listed as extras. The TTS
+image's extras are what docker/Dockerfile.tts adds besides crates: the
+sherpa-onnx static libraries and what they contain (ONNX Runtime and the
+libraries ONNX Runtime links in, whose notices the image ships verbatim as
+ORT_NOTICES; kaldi, OpenFst, sentencepiece, kissfft, utf8proc), LAME (bundled by mp3lame-sys),
+the Kokoro model files and CMUdict; their licence texts come from the
+crates' sources and from docker/tts-licenses/. For the TTS image, cargo
+metadata runs with `RUSTFLAGS=--cfg vocab_tts_engine` (the engine's
+dependencies exist only with that cfg, crates/vocab-tts/src/engine.rs).
 
 The combined expression (all chosen licences joined with AND) is also the
 image's `org.opencontainers.image.licenses` label; --check verifies that
-docker/Dockerfile.server carries it.
+each Dockerfile carries its image's expression.
 
 Standard library only (and cargo). Self-tests: tools/tests/test_licenses.py.
 """
@@ -32,6 +43,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -44,6 +56,35 @@ DOCKERFILE = "docker/Dockerfile.server"
 PACKAGE = "vocab-server"
 TARGETS = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
 OWN_LICENSE = "MIT"
+# ONNX Runtime's ThirdPartyNotices.txt, taken from its wheel by
+# docker/Dockerfile.tts (--check verifies the Dockerfile ships it).
+ORT_NOTICES = "/licenses/onnxruntime-ThirdPartyNotices.txt"
+
+
+@dataclass(frozen=True)
+class Image:
+    """What one image ships: a package built for some targets, its
+    Dockerfile (licence label) and its notices file."""
+
+    name: str
+    package: str
+    targets: tuple[str, ...]
+    dockerfile: str
+    output: str
+    title: str
+    rustflags: str = ""
+
+
+IMAGES = {
+    "server": Image("server", PACKAGE, tuple(TARGETS), DOCKERFILE, OUTPUT,
+                    "the vocab-server binary and container image"),
+    "tts": Image("tts", "vocab-tts", ("x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"),
+                 "docker/Dockerfile.tts", "docker/tts-licenses/THIRD-PARTY-NOTICES.txt",
+                 "the vocab-tts binary and the TTS container image (vocabulary-training-tts)",
+                 "--cfg vocab_tts_engine"),
+}
+# Deprecated SPDX ids some crates still use, and their current form.
+DEPRECATED = {"LGPL-3.0": "LGPL-3.0-only", "LGPL-2.1": "LGPL-2.1-only", "GPL-3.0": "GPL-3.0-only"}
 
 # Order of preference when a crate offers a choice (`OR`); a licence that is
 # not listed is never chosen and makes the crate an error.
@@ -57,6 +98,10 @@ PREFERENCE = [
     "BSL-1.0",
     "MPL-2.0",
     "Apache-2.0 WITH LLVM-exception",
+    # The TTS image only: CMUdict, LAME and its Rust bindings.
+    "BSD-2-Clause",
+    "LGPL-2.0-or-later",
+    "LGPL-3.0-only",
 ]
 
 MIT_TEXT = """\
@@ -127,7 +172,7 @@ class Component:
 def tokenize(expression: str) -> list[str]:
     """Tokens of an SPDX expression; the legacy `A/B` form means `A OR B`."""
     expression = expression.replace("/", " OR ")
-    return re.findall(r"\(|\)|[A-Za-z0-9.+-]+", expression)
+    return [DEPRECATED.get(t, t) for t in re.findall(r"\(|\)|[A-Za-z0-9.+-]+", expression)]
 
 
 def rank(ids: frozenset[str]) -> tuple[int, int]:
@@ -223,6 +268,8 @@ CONTENT_HINTS = [
     (re.compile(r"free and unencumbered software released into the public domain", re.I), "Unlicense"),
     (re.compile(r"Boost Software License", re.I), "BSL-1.0"),
     (re.compile(r"Mozilla Public License,?\s+(Version|v\.?)\s*2\.0", re.I), "MPL-2.0"),
+    (re.compile(r"GNU LESSER GENERAL PUBLIC LICENSE\s+Version 3", re.I), "LGPL-3.0-only"),
+    (re.compile(r"GNU LIBRARY GENERAL PUBLIC LICENSE\s+Version 2", re.I), "LGPL-2.0-or-later"),
     (re.compile(r"GNU (LESSER )?GENERAL PUBLIC LICENSE", re.I), "GPL"),
 ]
 
@@ -268,11 +315,12 @@ def standard_text(spdx: str, authors: list[str], name: str) -> str:
 # ── cargo ────────────────────────────────────────────────────────────────────
 
 
-def cargo_metadata(root: Path) -> dict:
+def cargo_metadata(root: Path, image: Image = IMAGES["server"]) -> dict:
     args = ["cargo", "metadata", "--locked", "--format-version", "1"]
-    for target in TARGETS:
+    for target in image.targets:
         args += ["--filter-platform", target]
-    out = subprocess.run(args, cwd=root, check=True, capture_output=True, text=True).stdout
+    env = {**os.environ, "RUSTFLAGS": image.rustflags}
+    out = subprocess.run(args, cwd=root, check=True, capture_output=True, text=True, env=env).stdout
     return json.loads(out)
 
 
@@ -347,14 +395,61 @@ def extras(packages: list[dict]) -> list[Component]:
     return found
 
 
+def tts_extras(packages: list[dict], root: Path) -> list[Component]:
+    """What docker/Dockerfile.tts adds to the TTS image besides the crates."""
+    by_name = {p["name"]: Path(p["manifest_path"]).parent for p in packages}
+    for needed in ("sherpa-onnx", "mp3lame-sys"):
+        if needed not in by_name:
+            raise ValueError(f"{needed} is not among the TTS image's crates (RUSTFLAGS cfg missing?)")
+    here = root / "docker" / "tts-licenses"
+
+    def text(path: Path) -> str:
+        return path.read_text(encoding="utf-8")
+
+    apache = text(by_name["sherpa-onnx"] / "LICENSE")
+    return [
+        Component("Rust standard library", "(of the pinned Rust release)", "MIT OR Apache-2.0", ["MIT"],
+                  [MIT_TEXT.format(holders="The Rust Project Contributors")]),
+        Component("sherpa-onnx static libraries", "2.0.1", "Apache-2.0", ["Apache-2.0"], [apache]),
+        Component("kaldi-native-fbank, kaldi-decoder, kaldifst, OpenFst, simple-sentencepiece",
+                  "(in the sherpa-onnx static libraries)", "Apache-2.0", ["Apache-2.0"], [apache]),
+        Component("ONNX Runtime", "1.28.2 (in the sherpa-onnx static libraries)", "MIT", ["MIT"],
+                  [text(here / "onnxruntime-LICENSE.txt")]),
+        # What ONNX Runtime's static library links in (checked against the
+        # symbols of libonnxruntime.a 1.28.2); their licence texts and
+        # copyright notices are ORT_NOTICES, shipped next to this file.
+        Component("abseil, protobuf (with utf8_range), Eigen, re2, flatbuffers, ONNX, nlohmann/json, SafeInt, "
+                  "date (H. Hinnant), Microsoft GSL, cpuinfo, Boost.Mp11, KleidiAI (arm64)",
+                  "(as linked into ONNX Runtime 1.28.2)",
+                  "Apache-2.0 AND BSD-3-Clause AND MPL-2.0 AND MIT AND BSD-2-Clause AND BSL-1.0",
+                  ["MIT", "Apache-2.0", "BSD-3-Clause", "BSL-1.0", "MPL-2.0", "BSD-2-Clause"], [],
+                  "ONNX Runtime's third-party libraries: their licence texts and copyright notices are in "
+                  f"{ORT_NOTICES} (ONNX Runtime's ThirdPartyNotices.txt, verbatim). Eigen is MPL-2.0: its "
+                  "unmodified source is the one ONNX Runtime 1.28.2 builds with (docker/tts-licenses/SOURCE.md)."),
+        Component("kissfft", "(in the sherpa-onnx static libraries)", "BSD-3-Clause", ["BSD-3-Clause"],
+                  [text(here / "kissfft-LICENSE.txt")]),
+        Component("utf8proc", "2.12.0 (in the sherpa-onnx static libraries)", "MIT AND Unicode-3.0",
+                  ["MIT", "Unicode-3.0"], [text(here / "utf8proc-LICENSE.md")]),
+        Component("LAME", "3.100 (bundled by mp3lame-sys, linked statically)", "LGPL-2.0-or-later",
+                  ["LGPL-2.0-or-later"], [text(by_name["mp3lame-sys"] / "lame-3.100" / "COPYING")],
+                  "LAME: LGPL-2.0-or-later; its source is in the crate mp3lame-sys 0.1.11 "
+                  "(https://crates.io/crates/mp3lame-sys/0.1.11); the binary can be relinked with a modified "
+                  "LAME from this repository's sources (docker/tts-licenses/SOURCE.md)."),
+        Component("Kokoro-82M v1.0 model, voices and US/UK lexicons", "(kokoro-multi-lang-v1_0)", "Apache-2.0",
+                  ["Apache-2.0"], [apache]),
+        Component("CMUdict", "(cmusphinx/cmudict at 74790861)", "BSD-2-Clause", ["BSD-2-Clause"],
+                  [text(here / "cmudict-LICENSE.txt")]),
+    ]
+
+
 # ── output ───────────────────────────────────────────────────────────────────
 
 
-def render(components: list[Component]) -> str:
+def render(components: list[Component], title: str = IMAGES["server"].title) -> str:
     """The notices file: a table of components, then each distinct text
     once with the components it belongs to."""
     lines = [
-        "THIRD-PARTY NOTICES of the vocab-server binary and container image",
+        f"THIRD-PARTY NOTICES of {title}",
         "",
         "Generated by tools/licenses.py from Cargo.lock; do not edit by hand.",
         f"Combined licence expression: {combined(components)}",
@@ -382,51 +477,62 @@ def render(components: list[Component]) -> str:
 LABEL = re.compile(r'org\.opencontainers\.image\.licenses="(?P<value>[^"]*)"')
 
 
-def label_problem(dockerfile_text: str, expression: str) -> str | None:
+def label_problem(dockerfile_text: str, expression: str, dockerfile: str = DOCKERFILE) -> str | None:
     m = LABEL.search(dockerfile_text)
     if not m:
-        return f"{DOCKERFILE}: no org.opencontainers.image.licenses label"
+        return f"{dockerfile}: no org.opencontainers.image.licenses label"
     if m.group("value") != expression:
-        return f'{DOCKERFILE}: org.opencontainers.image.licenses="{m.group("value")}", expected "{expression}"'
+        return f'{dockerfile}: org.opencontainers.image.licenses="{m.group("value")}", expected "{expression}"'
     return None
 
 
-def generate(root: Path) -> tuple[str, str]:
-    packages = shipped_packages(cargo_metadata(root))
-    components = [crate_component(p) for p in packages] + extras(packages)
-    return render(components), combined(components)
+def generate(root: Path, image: Image = IMAGES["server"]) -> tuple[str, str]:
+    packages = shipped_packages(cargo_metadata(root, image), image.package)
+    native = tts_extras(packages, root) if image.name == "tts" else extras(packages)
+    components = [crate_component(p) for p in packages] + native
+    return render(components, image.title), combined(components)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--check", action="store_true", help="fail if the notices or the label are out of date")
-    mode.add_argument("--label", action="store_true", help="print the combined licence expression")
+    mode.add_argument("--check", action="store_true", help="fail if a notices file or a label is out of date")
+    mode.add_argument("--label", action="store_true", help="print an image's combined licence expression")
+    parser.add_argument("--image", choices=sorted(IMAGES), default="server", help="the image of --label")
     parser.add_argument("--root", type=Path, default=ROOT)
     args = parser.parse_args(argv)
-    try:
-        text, expression = generate(args.root)
-    except (ValueError, OSError, subprocess.CalledProcessError) as err:
-        detail = getattr(err, "stderr", "") or ""
-        print(f"licenses: {err} {detail}".strip())
-        return 1
-    if args.label:
-        print(expression)
-        return 0
-    target = args.root / OUTPUT
+    images = [IMAGES[args.image]] if args.label else list(IMAGES.values())
+    problems: list[str] = []
+    for image in images:
+        try:
+            text, expression = generate(args.root, image)
+        except (ValueError, OSError, subprocess.CalledProcessError) as err:
+            detail = getattr(err, "stderr", "") or ""
+            print(f"licenses ({image.name}): {err} {detail}".strip())
+            return 1
+        if args.label:
+            print(expression)
+            return 0
+        target = args.root / image.output
+        if args.check:
+            if not target.is_file() or target.read_text(encoding="utf-8") != text:
+                problems.append(f"{image.output} is out of date with Cargo.lock: run python3 tools/licenses.py "
+                                "and commit it")
+            dockerfile = args.root / image.dockerfile
+            if dockerfile.is_file() and (problem := label_problem(dockerfile.read_text(), expression,
+                                                                  image.dockerfile)):
+                problems.append(problem)
+            if image.name == "tts" and dockerfile.is_file() and ORT_NOTICES not in dockerfile.read_text():
+                problems.append(f"{image.dockerfile}: does not ship {ORT_NOTICES}, which the notices refer to")
+            print(f"licenses ({image.name}): combined licence {expression}")
+            continue
+        target.write_text(text, encoding="utf-8")
+        print(f"licenses: wrote {image.output} ({len(text)} bytes); combined licence {expression}")
     if args.check:
-        problems = []
-        if not target.is_file() or target.read_text(encoding="utf-8") != text:
-            problems.append(f"{OUTPUT} is out of date with Cargo.lock: run python3 tools/licenses.py and commit it")
-        dockerfile = args.root / DOCKERFILE
-        if dockerfile.is_file() and (problem := label_problem(dockerfile.read_text(), expression)):
-            problems.append(problem)
         for problem in problems:
             print(f"FAIL: {problem}")
-        print(f"licenses: {len(problems)} problem(s); combined licence {expression}")
+        print(f"licenses: {len(problems)} problem(s)")
         return 1 if problems else 0
-    target.write_text(text, encoding="utf-8")
-    print(f"licenses: wrote {OUTPUT} ({len(text)} bytes); combined licence {expression}")
     return 0
 
 

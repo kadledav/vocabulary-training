@@ -2,6 +2,12 @@
    (data-theme on <html>) or, with "system", prefers-color-scheme (R-71).
    Sizes in rem. No inline styles anywhere (CSP style-src 'self'). */
 
+/* The `hidden` attribute always wins (a `display` rule such as the
+   buttons' inline-flex would otherwise show a hidden element). */
+[hidden] {
+  display: none !important;
+}
+
 :root {
   color-scheme: dark;
   --bg: #15171c;
@@ -1259,6 +1265,21 @@ input[aria-invalid="true"] {
   background: var(--accent);
   color: var(--bg);
   border-color: var(--accent);
+}
+
+/* Recorded clip on its way (M6). */
+.play.loading {
+  border-style: dashed;
+}
+
+/* The clip could not be played: the browser speaks instead. */
+.play.failed {
+  border-color: var(--error);
+}
+
+/* The clip has an approximate pronunciation: a dotted ring, and the title says so. */
+.play[data-approximate] {
+  border-style: dotted;
 }
 
 /* Words: the whole row is the link (bug 8). */
