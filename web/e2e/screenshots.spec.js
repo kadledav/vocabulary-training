@@ -61,3 +61,71 @@ for (const theme of /** @type {const} */ (['dark', 'light'])) {
     await shot('9-login');
   });
 }
+
+/** Fix round R1-C: end of the day, answer side with legend, import done, settings. */
+const VIEWS = /** @type {const} */ ([
+  ['phone', 375, 812],
+  ['small', 320, 568],
+  ['landscape', 812, 375],
+]);
+for (const theme of /** @type {const} */ (['dark', 'light'])) {
+  for (const [label, width, height] of VIEWS) {
+    test(`R1-C screens, ${theme}, ${label}`, async ({ page, app }, info) => {
+      test.skip(!dir || info.project.name !== 'webkit-phone', 'set SCREENSHOT_DIR; phone project only');
+      const shot = (/** @type {string} */ name) =>
+        page.screenshot({ path: path.join(/** @type {string} */ (dir), `r1c-${theme}-${label}-${name}.png`) });
+      await page.setViewportSize({ width, height });
+      await app.api('PATCH', '/api/settings', { theme });
+      await startBookBlock(page, app);
+      await page.getByTestId('reveal').click();
+      await expect(page.getByTestId('legend')).toBeVisible();
+      await waitGuard();
+      await shot('1-answer-legend');
+      await page.getByRole('button', { name: /^Rate 2,/ }).click();
+      await expect(page.getByTestId('toast')).toBeVisible();
+      await shot('2-question-toast');
+      // Finish the day through the API: the rest of this block, then the article word.
+      const current = await app.api('GET', '/api/sessions/current');
+      let session = current;
+      for (;;) {
+        const item = session.items.find((/** @type {any} */ i) => !i.answered);
+        if (!item) break;
+        session = (await app.api('POST', `/api/sessions/${session.id}/reviews`, {
+          client_review_id: crypto.randomUUID(),
+          item_id: item.item_id,
+          raw_grade: 3,
+        })).session;
+      }
+      await app.api('POST', `/api/sessions/${session.id}/finish`, {});
+      await page.goto(`${app.url}/#/`);
+      await page.getByLabel(/All sources/).check();
+      await expect(page.getByTestId('end-of-day')).toBeVisible();
+      await shot('3-today-end-of-day');
+      await page.goto(`${app.url}/#/import`);
+      const pack = {
+        format: 'vocab-pack',
+        format_version: 1,
+        pack_id: 'test-e2e-shot--2026-11-02--1',
+        exported_at: '2026-11-02',
+        source: { id: 'test-e2e-shot', type: 'general', title: 'Screenshot words' },
+        words: ['test-shot-alpha', 'test-shot-beta'].map((headword) => ({
+          headword,
+          meaning: 'An invented word.',
+          czech: ['slovo'],
+          usefulness: 3,
+          sentences: [{ en: `A [[${headword}]] here.`, cs: 'Tady [[slovo]].', origin: 'example' }],
+        })),
+      };
+      await page.getByTestId('file-input').setInputFiles({ name: 'pack.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(pack)) });
+      await page.getByTestId('preview').click();
+      await page.getByTestId('import').click();
+      await expect(page.getByTestId('import-done')).toBeVisible();
+      await page.evaluate(() => window.scrollTo(0, 0));
+      await shot('4-import-done');
+      await page.goto(`${app.url}/#/settings`);
+      await page.getByLabel(/New words per day/).fill('101');
+      await page.getByLabel(/New words per day/).blur();
+      await shot('5-settings');
+    });
+  }
+}

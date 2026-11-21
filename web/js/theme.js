@@ -38,10 +38,27 @@ export function applyTheme(setting) {
   const root = document.documentElement;
   if (value) root.setAttribute('data-theme', value);
   else root.removeAttribute('data-theme');
+  applyThemeColor(value);
   try {
     localStorage.setItem(STORAGE_KEY, setting);
   } catch {
     // Storage may be unavailable (private mode); the server setting still applies on load.
+  }
+}
+
+/** Browser bar colours: the page background of each theme. */
+const THEME_COLORS = { dark: '#15171c', light: '#f7f7f5' };
+
+/**
+ * Colour the browser's bar like the page: a forced theme overrides both
+ * `theme-color` entries of the shell; "system" leaves each its own scheme.
+ *
+ * @param {'dark' | 'light' | null} forced
+ */
+function applyThemeColor(forced) {
+  for (const meta of document.querySelectorAll('meta[name="theme-color"]')) {
+    const scheme = (meta.getAttribute('media') ?? '').includes('light') ? 'light' : 'dark';
+    meta.setAttribute('content', THEME_COLORS[forced ?? scheme]);
   }
 }
 

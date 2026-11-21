@@ -77,11 +77,12 @@ test('R-54 R-53 R-52 R-60 a full block by touch on the phone', async ({ page, ap
   await page.getByTestId('see-summary').tap();
   await expectSummary(page);
 
-  // Nothing new is left today: Continue says so; Done goes home.
-  await page.getByTestId('continue').tap();
-  await expect(page.getByRole('status').filter({ hasText: 'Nothing more to practise' })).toBeVisible();
+  // Nothing is left today in this scope: an honest end, never "Continue" (F1).
+  await expect(page.getByTestId('end-of-day')).toContainText('Done for today');
+  await expect(page.getByTestId('continue')).toHaveCount(0);
   await page.getByTestId('done').tap();
-  await expect(page.getByTestId('start')).toHaveText('Continue +10');
+  await expect(page.getByTestId('end-of-day')).toBeVisible();
+  await expect(page.getByTestId('start')).toHaveCount(0);
 });
 
 test('R-70 a full block by keyboard on the desktop', async ({ page, app, pageErrors }, info) => {
@@ -182,13 +183,11 @@ test('R-62 the inverted scale is unmistakable: labels, colours, divider, filled/
 
   // The legend is visible during the first blocks.
   await expect(page.getByTestId('legend')).toBeVisible();
-  await expect(page.getByTestId('legend').locator('dt')).toHaveText([
-    '1 Instantly',
-    '2 Knew it',
-    '3 Shaky',
-    '4 Vague',
-    '5 No idea',
-  ]);
+  // One compact line in the card's flow, not inside the pinned bar (bug 1).
+  await expect(page.getByTestId('legend')).toHaveText(
+    '1 = knew it instantly · 2 = after a moment · 3 = with effort · 4 = half-knew it · 5 = no idea',
+  );
+  expect(await page.locator('.practice-bottom [data-testid="legend"]').count()).toBe(0);
 
   // Rate 2: the toast confirms in the rating's colour. Then input guard:
   // reveal the next card and press 2 in the same instant — ignored.

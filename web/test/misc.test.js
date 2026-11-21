@@ -35,10 +35,16 @@ test('R-42 the UK setting prefers British English', () => {
   assert.equal(speechLang('uk'), 'en-GB');
 });
 
-test('R-41 any English voice is better than none; no English voice leaves it to the browser', () => {
-  assert.equal(pickVoice([{ lang: 'en-AU', name: 'Karen' }, { lang: 'de-DE', name: 'Anna' }], 'us')?.name, 'Karen');
-  assert.equal(pickVoice([{ lang: 'de-DE', name: 'Anna' }], 'us'), null);
+test('R-41 any on-device English voice is better than none; without one nothing is chosen', () => {
+  assert.equal(pickVoice([{ lang: 'en-AU', name: 'Karen', localService: true }, { lang: 'de-DE', name: 'Anna', localService: true }], 'us')?.name, 'Karen');
+  assert.equal(pickVoice([{ lang: 'de-DE', name: 'Anna', localService: true }], 'us'), null);
   assert.equal(pickVoice([], 'us'), null);
+});
+
+test('R-24 U5 network voices are never used: book sentences stay on the device', () => {
+  assert.equal(pickVoice([{ lang: 'en-US', name: 'Cloud', localService: false }], 'us'), null);
+  assert.equal(pickVoice([{ lang: 'en-US', name: 'Unknown' }], 'us'), null);
+  assert.equal(pickVoice(voices, 'us')?.name, 'Alex');
 });
 
 test('R-41 speed 0.75x slows speech down', () => {

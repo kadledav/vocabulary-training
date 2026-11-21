@@ -4,6 +4,14 @@
  * fallback path of the later neural-TTS clips: started only by a tap or a
  * key, English voice preferring en-US (en-GB when the UK voice is chosen).
  * Without the Web Speech API the play buttons say so and do nothing.
+ *
+ * Only voices on this device (`localService`) are ever used: a network
+ * voice would send book sentences to a third party (R-24). Without an
+ * on-device English voice nothing is spoken and the caller says so. For
+ * iOS (usability U5): `speak()` runs directly in the tap handler, `cancel()`
+ * only when something is speaking (then the new utterance follows on the
+ * next tick), the voice comes from the list as of the last `voiceschanged`,
+ * and `lang` is always set.
  */
 
 /**
@@ -27,9 +35,8 @@ export function speechLang(preference) {
 }
 
 /**
- * Choose a voice: the preferred English variant, then any English voice;
- * local voices before network ones. `null` = let the browser decide from
- * the utterance's `lang`.
+ * Choose an on-device voice: the preferred English variant, then any
+ * English one. `null` = no on-device English voice (nothing is spoken).
  *
  * @template {VoiceLike} V
  * @param {readonly V[]} voices
@@ -40,13 +47,11 @@ export function pickVoice(voices, preference) {
   const wanted = speechLang(preference).toLowerCase();
   /** @param {V} v */
   const score = (v) => {
+    if (v.localService !== true) return -1;
     const lang = normaliseLang(v.lang);
-    let s = 0;
-    if (lang === wanted) s += 4;
-    else if (lang.startsWith('en-') || lang === 'en') s += 2;
-    else return -1;
-    if (v.localService) s += 1;
-    return s;
+    if (lang === wanted) return 4;
+    if (lang.startsWith('en-') || lang === 'en') return 2;
+    return -1;
   };
   let best = null;
   let bestScore = -1;
@@ -74,27 +79,73 @@ export function speechAvailable() {
   return typeof window !== 'undefined' && 'speechSynthesis' in window && typeof SpeechSynthesisUtterance === 'function';
 }
 
+/** @type {SpeechSynthesisVoice[]} */
+let voices = [];
+let watching = false;
+
+/** Keep the voice list as of the last `voiceschanged` (never a stale voice object). */
+function watchVoices() {
+  if (watching || !speechAvailable()) return;
+  watching = true;
+  const synth = window.speechSynthesis;
+  const update = () => {
+    voices = synth.getVoices();
+  };
+  update();
+  if (typeof synth.addEventListener === 'function') synth.addEventListener('voiceschanged', update);
+}
+
+/** Start loading the voice list early (it arrives asynchronously in some browsers). */
+export function prepareSpeech() {
+  watchVoices();
+}
+
 /**
- * Speak `text` (stops anything that is still speaking). Returns false when
- * speech is not available.
+ * @typedef {'speaking' | 'unavailable' | 'no-voice'} SpeakResult
+ * @typedef {{ onStart?: () => void, onEnd?: () => void }} SpeakEvents
+ */
+
+/**
+ * Speak `text` with an on-device English voice (stops anything that is
+ * still speaking). Call it directly from the tap or key handler.
  *
  * @param {string} text
  * @param {{ voice: VoicePreference, speed: SpeedSetting }} options
+ * @param {SpeakEvents} [events]
+ * @returns {SpeakResult}
  */
-export function speak(text, options) {
-  if (!speechAvailable() || text.trim() === '') return false;
+export function speak(text, options, events = {}) {
+  if (!speechAvailable() || text.trim() === '') return 'unavailable';
+  watchVoices();
   const synth = window.speechSynthesis;
+  if (voices.length === 0) voices = synth.getVoices();
+  const voice = pickVoice(voices, options.voice);
+  if (!voice) return 'no-voice';
   const utterance = new SpeechSynthesisUtterance(text);
-  utterance.lang = speechLang(options.voice);
+  utterance.lang = voice.lang || speechLang(options.voice);
+  utterance.voice = voice;
   utterance.rate = speechRate(options.speed);
-  const voice = pickVoice(synth.getVoices(), options.voice);
-  if (voice) utterance.voice = voice;
-  synth.cancel();
-  synth.speak(utterance);
-  return true;
+  let ended = false;
+  const end = () => {
+    if (ended) return;
+    ended = true;
+    events.onEnd?.();
+  };
+  utterance.onend = end;
+  utterance.onerror = end;
+  events.onStart?.();
+  // A safety net for engines that never report the end.
+  setTimeout(() => end(), Math.min(30_000, 2_000 + text.length * 150));
+  if (synth.speaking || synth.pending) {
+    synth.cancel();
+    setTimeout(() => synth.speak(utterance), 0);
+  } else {
+    synth.speak(utterance);
+  }
+  return 'speaking';
 }
 
 /** Stop speaking (leaving the practice screen). */
 export function stopSpeaking() {
-  if (speechAvailable()) window.speechSynthesis.cancel();
+  if (speechAvailable() && (window.speechSynthesis.speaking || window.speechSynthesis.pending)) window.speechSynthesis.cancel();
 }

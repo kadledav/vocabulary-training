@@ -16,7 +16,8 @@ test('R-59 the scope chooser lists the sources with their reading position and i
   await page.goto(`${app.url}/#/`);
   await expect(page.getByLabel(/All sources/)).toBeChecked();
   await expect(page.getByText('reading: Chapter 7 · 4 words')).toBeVisible();
-  await expect(page.getByTestId('new-left')).toHaveText('New words: 4 of 4 left today');
+  await expect(page.getByTestId('new-left')).toHaveText('New words today: 4 of 4 left.');
+  await expect(page.getByTestId('new-waiting')).toHaveText('5 new words waiting.');
   await expect(page.locator('ol.forecast li')).toHaveCount(7);
 
   await page.getByLabel(/An E2E Test Article/).check();
@@ -60,7 +61,9 @@ test('R-54 a backlog pauses new words until "Add new words anyway"', async ({ pa
   db.close();
 
   await page.goto(`${app.url}/#/`);
-  await expect(page.getByTestId('backlog')).toHaveText('New words paused — backlog of 41 reviews.');
+  await expect(page.getByTestId('backlog')).toHaveText(
+    'New words are paused until you catch up on reviews (41 reviews waiting) — you can still add some now.',
+  );
   await page.getByTestId('add-new-anyway').click();
   await expect(page).toHaveURL(/#\/practice$/);
   const session = await app.api('GET', '/api/sessions/current');

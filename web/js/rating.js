@@ -8,26 +8,40 @@
 
 /**
  * @typedef {1 | 2 | 3 | 4 | 5} Grade
- * @typedef {{ grade: Grade, label: string, definition: string, pass: boolean }} Rating
+ * @typedef {{ grade: Grade, label: string, definition: string, short: string, pass: boolean }} Rating
  */
 
 /** @type {readonly Rating[]} */
 export const RATINGS = Object.freeze([
-  { grade: 1, label: 'Instantly', definition: 'sure, no effort', pass: true },
-  { grade: 2, label: 'Knew it', definition: 'after a moment', pass: true },
-  { grade: 3, label: 'Shaky', definition: 'effort, doubt, or only worked out from context', pass: true },
-  { grade: 4, label: 'Vague', definition: 'half-knew it, or wrong sense', pass: false },
-  { grade: 5, label: 'No idea', definition: "didn't know it at all", pass: false },
+  { grade: 1, label: 'Instantly', definition: 'sure, no effort', short: 'knew it instantly', pass: true },
+  { grade: 2, label: 'Knew it', definition: 'after a moment', short: 'after a moment', pass: true },
+  { grade: 3, label: 'Shaky', definition: 'effort, doubt, or only worked out from context', short: 'with effort', pass: true },
+  { grade: 4, label: 'Vague', definition: 'half-knew it, or wrong sense', short: 'half-knew it', pass: false },
+  { grade: 5, label: 'No idea', definition: "didn't know it at all", short: 'no idea', pass: false },
 ]);
 
-/** Ratings are ignored this long after the answer is revealed (double-tap guard). */
+/** Reveal/Next ignore input this long after each change (double-tap guard). */
 export const INPUT_GUARD_MS = 250;
+/**
+ * Ratings are ignored this long after the answer is revealed: a slow
+ * double tap on "Show translation" must not rate the card that appears
+ * under the finger (frontend review, bug 4).
+ */
+export const RATING_GUARD_MS = 500;
+/** A rating tap this soon after the reveal tap… */
+export const SAME_SPOT_MS = 600;
+/** …and this close to it (CSS pixels) is the second half of a double tap. */
+export const SAME_SPOT_PX = 24;
 /** How long the "Rated … — Undo" toast stays. */
 export const TOAST_MS = 4000;
 /** …and after a suspected slip (a reflex "1" right after a failed card). */
 export const SLIP_TOAST_MS = 8000;
-/** A "1" faster than this after reveal on a card last rated 4–5 is a suspected slip. */
-export const SLIP_WINDOW_MS = 600;
+/**
+ * A "1" faster than this after reveal on a card last rated 4–5 is a
+ * suspected slip. (Was 600 ms; ratings now wait 500 ms after the reveal,
+ * so the window reaches past the guard to still catch a reflex.)
+ */
+export const SLIP_WINDOW_MS = 1000;
 /** The legend stays visible during this many first finished blocks (legend "auto"). */
 export const LEGEND_BLOCKS = 3;
 
@@ -87,8 +101,30 @@ export function guardOpen(msSinceReveal) {
 }
 
 /**
+ * May a rating be accepted this long after the reveal?
+ *
+ * @param {number} msSinceReveal
+ */
+export function ratingGuardOpen(msSinceReveal) {
+  return msSinceReveal >= RATING_GUARD_MS;
+}
+
+/**
+ * Is a rating tap the second tap of a double tap on the reveal button: soon
+ * after the reveal tap and where it landed?
+ *
+ * @param {{ x: number, y: number, t: number } | null} revealTap
+ * @param {{ x: number, y: number, t: number }} tap
+ */
+export function sameSpotTap(revealTap, tap) {
+  if (!revealTap) return false;
+  const dt = tap.t - revealTap.t;
+  return dt >= 0 && dt < SAME_SPOT_MS && Math.hypot(tap.x - revealTap.x, tap.y - revealTap.y) <= SAME_SPOT_PX;
+}
+
+/**
  * How long the toast stays and whether it pulses: a "1" given within
- * 600 ms of reveal on a card whose last rating was 4–5 is probably a
+ * a second of reveal on a card whose last rating was 4–5 is probably a
  * reflex from an app where 1 means "fail".
  *
  * @param {{ grade: Grade, msSinceReveal: number, lastFailed: boolean }} input

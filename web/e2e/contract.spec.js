@@ -283,7 +283,7 @@ test('R-62 a 1 right after the reveal of a card last failed keeps the toast long
   expect(await headwordOnScreen(page)).toBe('brontle');
   await page.keyboard.press('Space');
   await expect(page.locator('button.rate')).toHaveCount(5);
-  await page.waitForTimeout(300); // past the 250 ms guard, inside 600 ms
+  await page.waitForTimeout(650); // past the 500 ms rating guard, inside the 1 s slip window
   await page.keyboard.press('1');
   await expect(page.getByTestId('toast')).toContainText('Rated 1');
   // Normal toasts last about 4 s; the slip-guard toast stays up to 8 s.
@@ -355,12 +355,12 @@ test('R-54 a reload on the answer side keeps the block, the position and every s
   await expect(page.getByTestId('progress')).toHaveText('3 / 4');
 });
 
-test('R-54 ✕ ends the block at once (no confirmation) and the summary says what stays due', async ({ page, app, pageErrors }) => {
+test('R-54 U7 Pause ends the block at once (no confirmation) and the summary says what stays due', async ({ page, app, pageErrors }) => {
   void pageErrors;
   await startBookBlock(page, app);
   await revealByKey(page);
   await page.keyboard.press('1');
-  await page.getByRole('button', { name: /^End block/ }).click();
+  await page.getByRole('button', { name: /^Pause/ }).click();
   await expect(page).toHaveURL(/#\/summary$/);
   await expect(page.getByRole('heading', { name: 'Block ended' })).toBeVisible();
   await expect(page.getByText('3 cards not rated — they stay due.')).toBeVisible();
@@ -369,7 +369,7 @@ test('R-54 ✕ ends the block at once (no confirmation) and the summary says wha
   await expect(page.getByTestId('resume')).toHaveCount(0);
 });
 
-test('R-54 "Continue +N" after a finished block starts another block of N', async ({ page, app, pageErrors }) => {
+test('R-54 U1 "Continue · N cards" after a finished block starts another block of N', async ({ page, app, pageErrors }) => {
   void pageErrors;
   const words = Array.from({ length: 12 }, (_, i) => ({
     headword: `test-cont-${i}`,
@@ -390,7 +390,7 @@ test('R-54 "Continue +N" after a finished block starts another block of N', asyn
   await app.api('PATCH', '/api/settings', { new_per_day: 15, block_size: 5 });
   await page.goto(`${app.url}/#/`);
   await page.getByLabel(/Continuation Source/).check();
-  await expect(page.getByTestId('start')).toHaveText('Start');
+  await expect(page.getByTestId('start')).toHaveText('Start · 5 cards (5 new)');
   await page.getByTestId('start').click();
   await expect(page.getByTestId('progress')).toHaveText('1 / 5');
   for (let i = 0; i < 5; i += 1) {
@@ -400,7 +400,7 @@ test('R-54 "Continue +N" after a finished block starts another block of N', asyn
   }
   await page.getByTestId('see-summary').click();
   await expect(page.getByTestId('summary-line')).toHaveText('5 cards · 5 new words');
-  await expect(page.getByTestId('continue')).toHaveText('Continue +5');
+  await expect(page.getByTestId('continue')).toHaveText('Continue · 5 cards (5 new)');
   await page.getByTestId('continue').click();
   await expect(page).toHaveURL(/#\/practice$/);
   await expect(page.getByTestId('progress')).toHaveText('1 / 5');
@@ -408,7 +408,7 @@ test('R-54 "Continue +N" after a finished block starts another block of N', asyn
   const session = await currentSession(app);
   expect(session.block_no).toBe(2);
   expect(new Set(session.items.map((/** @type {any} */ i) => i.word.headword)).size).toBe(5);
-  // Today now says Continue.
+  // Today now offers to resume the new block.
   await page.goto(`${app.url}/#/`);
   await expect(page.getByTestId('resume')).toBeVisible();
 });
@@ -711,7 +711,7 @@ test('R-70 R-74 on the phone Reveal/Next/rating sit in the bottom third, ✕ ? �
   const r = /** @type {NonNullable<typeof reveal>} */ (reveal);
   expect(r.y).toBeGreaterThan((height * 2) / 3 - 40);
   expect(r.width, 'Reveal is full width').toBeGreaterThan(375 * 0.8);
-  for (const name of [/^End block/, /^Help/, /^Undo/]) {
+  for (const name of [/^Pause/, /^Help/, /^Undo/]) {
     const box = await page.getByRole('button', { name }).boundingBox();
     expect(box && box.y + box.height < 100, `${name} is in the top bar`).toBe(true);
   }
