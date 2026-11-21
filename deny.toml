@@ -1,13 +1,15 @@
 # cargo-deny (pinned 0.20.2 in CI): advisories, licences, bans, sources.
-# Licence exceptions for the GPL/LGPL parts of `vocab-tts` (espeak-ng via
-# sherpa-onnx, LAME) are added with that crate in M6, scoped to it only.
+# Licence exceptions of `vocab-tts` (LAME, and the build-time downloader of
+# sherpa-onnx-sys) are scoped to the crates concerned (see [licenses]).
 
 [graph]
 all-features = true
-# Only platforms we build for: the musl release binary, CI, the owner's Mac.
+# Only platforms we build for: the musl release binary, CI, the owner's Mac,
+# and vocab-tts (glibc) on amd64 and arm64.
 targets = [
     "x86_64-unknown-linux-musl",
     "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
     "aarch64-apple-darwin",
 ]
 
@@ -37,6 +39,21 @@ confidence-threshold = 0.93
 # the rest of the binary. Scoped to this one crate.
 exceptions = [
     { allow = ["MPL-2.0"], crate = "priority-queue" },
+    # LAME and its Rust bindings, linked into vocab-tts only (design §10.1;
+    # the TTS image carries their licence texts in /licenses). "LGPL-3.0" is
+    # the crates' own (deprecated) identifier.
+    { allow = ["LGPL-3.0"], crate = "mp3lame-encoder" },
+    { allow = ["LGPL-3.0"], crate = "mp3lame-sys" },
+    # Build dependencies of sherpa-onnx-sys only: its build script can
+    # download (ureq, rustls) and unpack (zip, bzip2) prebuilt libraries.
+    # None of them is in a shipped binary, and no build downloads anything:
+    # SHERPA_ONNX_LIB_DIR points at the checksum-verified libraries
+    # (docs/design/tts-spike.md, "Building").
+    { allow = ["ISC"], crate = "ring" },
+    { allow = ["ISC"], crate = "rustls-webpki" },
+    { allow = ["ISC"], crate = "untrusted" },
+    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
+    { allow = ["bzip2-1.0.6"], crate = "libbz2-rs-sys" },
 ]
 
 [licenses.private]
