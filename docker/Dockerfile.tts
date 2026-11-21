@@ -62,25 +62,12 @@ COPY crates crates
 RUN cargo build --release --locked -p vocab-tts \
  && install -D -m 0755 target/release/vocab-tts /out/vocab-tts
 
-# ── test: `--target test` only; not part of the image ───────────────────────
-# The crate's tests linked against the real libraries, then the real engine
-# with the real model on the worst inputs the API accepts (long compounds,
-# long numbers, the longest text; crates/vocab-tts/tests/engine_limits.rs).
-FROM build AS test
-COPY --from=model /out/model /model
-RUN cargo test --release --locked -p vocab-tts \
- && VOCAB_TTS_MODEL_DIR=/model cargo test --release --locked -p vocab-tts --test engine_limits -- --ignored
-
 # ── model: the Kokoro files the service reads ───────────────────────────────
 FROM tools AS model
 ADD --checksum=sha256:60703707bc05ccd48d60e1eb723f38b07d6e474795a0b6a588d7220400e0f7a4 https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-multi-lang-v1_0.tar.bz2 /archives/
 # The fallback pronunciation dictionary (CMUdict, BSD-2-Clause) at a fixed
 # commit: words the Kokoro lexicons lack (crates/vocab-tts/src/phonemize.rs).
 ADD --checksum=sha256:81917843c7f44ce2b094ac63873c2c7a4cf802040792c455ba3ca406891c3d22 https://raw.githubusercontent.com/cmusphinx/cmudict/74790861f652b15e4ac49015a90074ad62a27690/cmudict.dict /archives/
-# fp32 model (the spike: int8 is 2.4x slower on CPU, docs/design/tts-spike.md),
-# voices, symbol table, the US and UK lexicons. Not copied: espeak-ng-data
-# (GPL; unused since sherpa-onnx 2.0), Chinese/other files. The licences are
-# in docker/tts-licenses/THIRD-PARTY-NOTICES.txt (tools/licenses.py).
 # ONNX Runtime's third-party notices (protobuf, abseil, Eigen, re2, …: what
 # its static library in sherpa-onnx links in). The C/C++ library archives
 # ship no notices; the file is the same in every wheel of a release, and
@@ -91,6 +78,10 @@ RUN mkdir -p /out/notices \
  && unzip -p /archives/onnxruntime-1.28.0-*.whl onnxruntime/ThirdPartyNotices.txt > /out/notices/onnxruntime-ThirdPartyNotices.txt \
  && grep -q 'Eigen' /out/notices/onnxruntime-ThirdPartyNotices.txt \
  && chmod 0444 /out/notices/onnxruntime-ThirdPartyNotices.txt
+# fp32 model (the spike: int8 is 2.4x slower on CPU, docs/design/tts-spike.md),
+# voices, symbol table, the US and UK lexicons. Not copied: espeak-ng-data
+# (GPL; unused since sherpa-onnx 2.0), Chinese/other files. The licences are
+# in docker/tts-licenses/THIRD-PARTY-NOTICES.txt (tools/licenses.py).
 RUN mkdir -p /unpacked /out/model \
  && tar -xjf /archives/kokoro-multi-lang-v1_0.tar.bz2 -C /unpacked \
       kokoro-multi-lang-v1_0/model.onnx kokoro-multi-lang-v1_0/voices.bin kokoro-multi-lang-v1_0/tokens.txt \
@@ -98,6 +89,15 @@ RUN mkdir -p /unpacked /out/model \
  && cd /unpacked/kokoro-multi-lang-v1_0 \
  && install -m 0444 model.onnx voices.bin tokens.txt lexicon-us-en.txt lexicon-gb-en.txt /archives/cmudict.dict /out/model/ \
  && chmod 0555 /out/model
+
+# ── test: `--target test` only; not part of the image ───────────────────────
+# The crate's tests linked against the real libraries, then the real engine
+# with the real model on the worst inputs the API accepts (long compounds,
+# long numbers, the longest text; crates/vocab-tts/tests/engine_limits.rs).
+FROM build AS test
+COPY --from=model /out/model /model
+RUN cargo test --release --locked -p vocab-tts \
+ && VOCAB_TTS_MODEL_DIR=/model cargo test --release --locked -p vocab-tts --test engine_limits -- --ignored
 
 # ── runtime ─────────────────────────────────────────────────────────────────
 FROM gcr.io/distroless/cc-debian13:nonroot@sha256:08476c244888bfb425bae1ae4dd7c17f093e972aab8426883d97f3c6f280f7c1
