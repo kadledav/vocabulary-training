@@ -137,10 +137,10 @@ fn r10_documented_example_pack_is_valid() {
 }
 
 /// The word example in the instruction text Claude follows
-/// (`docs/claude-project-instructions.txt`) is a valid word.
+/// (`docs/vocabulary-export-instructions.txt`) is a valid word.
 #[test]
 fn r14_instruction_text_word_example_is_valid() {
-    let text = std::fs::read_to_string(repo_root().join("docs/claude-project-instructions.txt"))
+    let text = std::fs::read_to_string(repo_root().join("docs/vocabulary-export-instructions.txt"))
         .expect("instruction text");
     let start = text.find("## Word format").expect("word section");
     let rest = &text[start..];
@@ -301,7 +301,7 @@ fn r23_schema_and_importer_agree_on_single_value_changes() {
 #[test]
 fn r03_instruction_examples_leave_the_tag_out_when_there_is_none() {
     for doc in [
-        "docs/claude-project-instructions.txt",
+        "docs/vocabulary-export-instructions.txt",
         "docs/claude-export-instructions.md",
     ] {
         let text = std::fs::read_to_string(repo_root().join(doc)).expect("doc");
@@ -311,7 +311,7 @@ fn r03_instruction_examples_leave_the_tag_out_when_there_is_none() {
             .collect();
         assert_eq!(json_lines, Vec::<&str>::new(), "{doc}");
     }
-    let text = std::fs::read_to_string(repo_root().join("docs/claude-project-instructions.txt"))
+    let text = std::fs::read_to_string(repo_root().join("docs/vocabulary-export-instructions.txt"))
         .expect("instruction text");
     assert!(text.contains("omit `tag` when there is none"));
 }
@@ -321,7 +321,7 @@ fn r03_instruction_examples_leave_the_tag_out_when_there_is_none() {
 /// the tag kinds it names are the format's.
 #[test]
 fn r13_instruction_text_maps_every_key_of_the_old_pages() {
-    let text = std::fs::read_to_string(repo_root().join("docs/claude-project-instructions.txt"))
+    let text = std::fs::read_to_string(repo_root().join("docs/vocabulary-export-instructions.txt"))
         .expect("instruction text");
     let start = text
         .find("## Converting my old pages")

@@ -1,7 +1,7 @@
 # Vocabulary Training — Architecture & Technical Design
 
 Status: **design v1.0 for phase 1** · Date: 2026-11-17 · Author: design agent · Reviewer: guarantor
-Inputs: `docs/requirements.md` (v1.0 incl. the R-85 storage change and R-59), `docs/claude-project-instructions.txt` (pack format v1, single source of the instruction text), `docs/research/training-ui.md` (as amended by R-74), the owner's home infrastructure (`home/INFRASTRUCTURE.md`, Traefik and `another-service-notify` stacks).
+Inputs: `docs/requirements.md` (v1.0 incl. the R-85 storage change and R-59), `docs/vocabulary-export-instructions.txt` (pack format v1, single source of the instruction text), `docs/research/training-ui.md` (as amended by R-74), the owner's home infrastructure (`home/INFRASTRUCTURE.md`, Traefik and `another-service-notify` stacks).
 Hostname: `vocab.example.home` is a placeholder for the owner's real hostname (kept out of this public repo; set via `VOCAB_PUBLIC_ORIGIN` in the Compose environment and the Traefik rule in the home repo).
 Companion file: `docs/vocab-pack.schema.json` (JSON Schema draft 2020-12 for pack format v1).
 
@@ -1127,7 +1127,7 @@ The **first usable version** is the end of **M5** (import → Understand practic
 | R-11 | MUST | §5.1, §7.1 Import, §8 | M2 | |
 | R-12 | MUST | §11, §9.2, §8 connector endpoints | M11 | |
 | R-13 | MUST | §5.4, §5.5 (order across parts) | M2 | Conversion done by Claude; P-1 for old `seq` |
-| R-14 | MUST | `docs/claude-project-instructions.txt` (guarantor), §5, §19.2 | — | Validated by real exports (manual) |
+| R-14 | MUST | `docs/vocabulary-export-instructions.txt` (guarantor), §5, §19.2 | — | Validated by real exports (manual) |
 | R-15 | MUST | §5.2, §6.3, §6.4, schema | M2, M3 | No extra pack fields needed in v1 |
 | R-20 | MUST | §4.2 `sentence`, §5.2 | M2 | |
 | R-21 | MUST | instruction text (guarantor) | — | App only stores; no sentence selection in the app |
@@ -1202,7 +1202,7 @@ Nothing is marked infeasible.
 
 ### 19.2 Proposed changes to the format / instruction text
 
-**Guarantor review (2026-11-17):** P-1, P-3, P-4, P-5 applied to `claude-project-instructions.txt`; P-1 `seq` must be added to the schema and importer in M2 (optional integer ≥ 1; when present it orders the word within its source, otherwise §5.5 applies). P-6 noted in requirements R-01. P-2 rejected (content-hash idempotency already covers it; keep the pattern stable).
+**Guarantor review (2026-11-17):** P-1, P-3, P-4, P-5 applied to `vocabulary-export-instructions.txt`; P-1 `seq` must be added to the schema and importer in M2 (optional integer ≥ 1; when present it orders the word within its source, otherwise §5.5 applies). P-6 noted in requirements R-01. P-2 rejected (content-hash idempotency already covers it; keep the pattern stable).
 
 | # | Proposal | Why | Compatibility |
 |---|---|---|---|

@@ -17,7 +17,7 @@ import { MAX_PASTE_BYTES, byteLength, readChosen, sizeLabel, splitIntoParts } fr
 const IMPORT_TIMEOUT_MS = 130_000;
 
 const INSTRUCTIONS_URL =
-  'https://github.com/kadledav/vocabulary-training/blob/main/docs/claude-project-instructions.txt';
+  'https://github.com/kadledav/vocabulary-training/blob/main/docs/vocabulary-export-instructions.txt';
 
 /** @typedef {{ pointer: string, code: string, message: string }} Issue */
 /**

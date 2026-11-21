@@ -4,7 +4,7 @@ How the owner gets words from a claude.ai chat into the training app.
 
 ## How to use
 
-1. In claude.ai, open the **Learning english** project → *Project instructions* (or *Set custom instructions*) and paste the whole content of [`claude-project-instructions.txt`](claude-project-instructions.txt). Do this once; when this file changes, replace the block.
+1. In claude.ai, open the **Learning english** project → *Project instructions* (or *Set custom instructions*) and paste the whole content of [`vocabulary-export-instructions.txt`](vocabulary-export-instructions.txt). Do this once; when this file changes, replace the block.
 2. Put the book PDF into the project knowledge, as you do today.
 3. While reading, ask about words as usual. When you want to practise them, say e.g.:
    - *"Export the words for the training app. I'm at chapter 14."*
@@ -21,7 +21,7 @@ How the owner gets words from a claude.ai chat into the training app.
 
 ## Instruction text
 
-The paste-ready text is in **[`claude-project-instructions.txt`](claude-project-instructions.txt)** — copy the whole file into the project instructions. That file is the single source of the instruction text; edit it there.
+The paste-ready text is in **[`vocabulary-export-instructions.txt`](vocabulary-export-instructions.txt)** — copy the whole file into the project instructions. That file is the single source of the instruction text; edit it there.
 
 ---
 
