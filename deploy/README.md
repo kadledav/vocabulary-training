@@ -86,11 +86,35 @@ once). Without a token, the connector routes refuse every request.
    - Not public: `curl -sk -o /dev/null -w '%{http_code}\n' https://<public-ip>:PUBLIC_PORT -H 'Host: vocab.example.home'`
      prints `404`.
 
+### Neural audio: `vocabulary-tts` (M6, R-40, R-83)
+
+The second service turns headwords and sentences into MP3 clips (Kokoro
+voices, US `af_heart` and UK `bf_emma`). It needs no setup:
+
+- `image:` from the same release notes,
+  `ghcr.io/kadledav/vocabulary-training-tts:X.Y.Z@sha256:…` (≈ 0.45 GB: the
+  model is inside; the image has no shell and runs read-only).
+- It is only on the network `vocab-internal` (`internal: true`, created by
+  the stack): no published port, no Traefik router, no route to the LAN or
+  the internet; only the app can reach it, as `http://vocabulary-tts:8090`.
+  The app also joins `vocab-internal` (and stays on `proxy-net` for Traefik).
+- Limits: 1280 MB memory without swap, 2 CPUs, 64 PIDs (measured peak about
+  0.9 GB for the longest text, 5 threads). `docker ps` shows it `healthy`
+  about 10 s after the start (model load and a self-test of both voices).
+- Its log has one line per clip with lengths and a hash of the text, never
+  the text itself (`docker logs vocabulary-tts`).
+- The app uses it from the release that brings the audio module; until a
+  clip is ready the app falls back to the browser's speech (R-41), so the
+  service may also be stopped at any time.
+- Licences: the image is MIT/Apache-2.0 with LGPL LAME (see `/licenses` in
+  the image, `docker cp vocabulary-tts:/licenses .`).
+
 ## 5. Updates
 
 1. Read the release notes. **If they mention a database migration**, take a
    snapshot first: `zfs snapshot tank/services/vocabulary@pre-vX.Y.Z`.
-2. Replace tag and digest in `image:` (home repo commit), redeploy.
+2. Replace tag and digest in both `image:` lines (home repo commit),
+   redeploy.
 3. Check `healthy` and log in. Migrations run at start; a failed start logs
    `database check failed` — then restore (§6) from the snapshot.
 

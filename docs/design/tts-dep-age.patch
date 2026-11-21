@@ -1,0 +1,166 @@
+--- a/tools/dep-age.py	2026-11-21 02:21:33.140025357 +0100
++++ b/tools/dep-age.py	2026-11-21 02:22:10.666876325 +0100
+@@ -35,8 +35,11 @@
+     - `# syntax=` directives and `RUN --mount=…,from=` images like `FROM`;
+       heredocs, `BUILDKIT_*` arguments and `ONBUILD` are errors
+     - known install/download commands only in these forms: `apt-get update`,
+-      `rustup target add <target or "$VAR">`; `ADD <url>`, other URLs and
+-      downloads (curl, wget, pip, …) are errors
++      `rustup target add <target or "$VAR">`; other URLs and downloads
++      (curl, wget, pip, …) are errors
++    - `ADD` from a URL only as `ADD --checksum=sha256:<hex> <GitHub release
++      asset URL> <dest>`: the checksum must equal GitHub's digest of the
++      asset, dated by the asset's upload                           -> GitHub API
+ * everywhere: `cargo update|generate-lockfile|add` are errors, cargo commands
+   that resolve dependencies must use `--locked`, `cargo --config` is an error;
+   settings that redirect downloads (registry/source variables, CARGO_HOME,
+@@ -355,6 +358,52 @@
+     return _action_cache[key]
+ 
+ 
++# a file attached to a GitHub release, pinned by its SHA-256 (ADD --checksum).
++GITHUB_RELEASE_ASSET = re.compile(
++    r"^https://github\.com/(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/releases/download/"
++    r"(?P<tag>[A-Za-z0-9_.+-]+)/(?P<asset>[A-Za-z0-9_.+-]+)$"
++)
++ADD_CHECKSUM = re.compile(r"^--checksum=sha256:(?P<sha256>[0-9a-f]{64})$")
++
++
++def release_asset_published(repo: str, tag: str, asset: str, sha256: str) -> dt.datetime:
++    """When the release asset was uploaded (the later of its creation and
++    last update: a re-upload under the same name counts as new), after
++    checking that GitHub's digest of the asset is the pinned checksum. An
++    asset without a digest, or a digest that differs, fails the lookup."""
++    def lookup() -> dt.datetime:
++        release = github_api(f"/repos/{repo}/releases/tags/{urllib.parse.quote(tag)}")
++        assets = release.get("assets", []) if isinstance(release, dict) else []
++        for item in assets:
++            if item.get("name") == asset:
++                if item.get("digest") != f"sha256:{sha256}":
++                    raise LookupFailed(f"GitHub's digest of {asset} is {item.get('digest')!r}, not the pinned sha256")
++                return max(parse_ts(item["created_at"]), parse_ts(item["updated_at"]))
++        raise LookupFailed(f"no asset {asset} in release {tag} of {repo}")
++
++    return cached("release-asset", f"{repo}@{tag}/{asset}#{sha256}", lookup)
++
++
++def check_add_url(args: str, where: str, result: "Result") -> None:
++    """`ADD --checksum=sha256:<hex> <GitHub release asset URL> <dest>`: the
++    only form of ADD from a URL (the build verifies the checksum, the gate
++    compares it with GitHub's digest and dates the asset)."""
++    words = args.split()
++    flags = [w for w in words if w.startswith("--")]
++    rest = [w for w in words if not w.startswith("--")]
++    checksum = ADD_CHECKSUM.match(flags[0]) if len(flags) == 1 else None
++    url = GITHUB_RELEASE_ASSET.match(rest[0]) if len(rest) == 2 else None
++    if not checksum or not url:
++        result.errors.append(
++            f"{where}: ADD from a URL must be `ADD --checksum=sha256:<hex> "
++            f"https://github.com/<owner>/<repo>/releases/download/<tag>/<asset> <dest>`"
++        )
++        return
++    repo, tag, asset, sha256 = url.group("repo"), url.group("tag"), url.group("asset"), checksum.group("sha256")
++    result.add("asset", f"{repo}/{asset}", tag,
++               lambda: release_asset_published(repo, tag, asset, sha256), where)
++
++
+ # ── Cargo ────────────────────────────────────────────────────────────────────
+ 
+ 
+@@ -1214,7 +1263,7 @@
+             for source in re.findall(r"--from=(\S+)", args):
+                 check_from_source(source, stages, where, "--from=", result)
+             if instruction == "ADD" and re.search(r"\b(https?|git|ssh)://|git@", args):
+-                result.errors.append(f"{where}: ADD from a URL is not checked by the age gate yet")
++                check_add_url(args, where, result)  # only checksum-pinned GitHub release assets
+         elif instruction == "RUN":
+             for mount in re.findall(r"--mount=(\S+)", args):
+                 for option in mount.split(","):
+--- a/tools/tests/test_dep_age.py	2026-11-21 02:21:33.141774571 +0100
++++ b/tools/tests/test_dep_age.py	2026-11-21 02:22:10.680936866 +0100
+@@ -111,7 +111,7 @@
+             name: getattr(dep_age, name)
+             for name in (
+                 "crate_published", "npm_published", "rust_published", "node_published", "action_published",
+-                "image_published", "debian_published",
++                "image_published", "debian_published", "release_asset_published",
+             )
+         }
+         dep_age.crate_published = lambda n, v: self._date(n, v)
+@@ -121,6 +121,7 @@
+         dep_age.action_published = lambda repo, sha, tag: self._date(repo, sha, tag)
+         dep_age.image_published = lambda name, digest: self._date(name, digest)
+         dep_age.debian_published = lambda pkg, version: self._date(pkg, version)
++        dep_age.release_asset_published = lambda repo, tag, asset, sha256: self._date(asset, tag, sha256)
+         return self
+ 
+     def __exit__(self, *exc):
+@@ -539,6 +540,37 @@
+             self.run_with(r)
+ 
+ 
++class ReleaseAssetDates(unittest.TestCase):
++    """release_asset_published: GitHub's digest must be the pinned checksum;
++    the age is the asset's upload (a re-upload counts)."""
++
++    def run_with(self, release):
++        saved, saved_cache = dep_age.github_api, dep_age.cache_enabled
++        dep_age.cache_enabled = False
++        dep_age.github_api = lambda path: release if path == "/repos/o/r/releases/tags/v1" else {}
++        try:
++            return dep_age.release_asset_published("o/r", "v1", "a.tar.bz2", DIGEST)
++        finally:
++            dep_age.github_api, dep_age.cache_enabled = saved, saved_cache
++
++    def asset(self, **override):
++        base = {"name": "a.tar.bz2", "digest": f"sha256:{DIGEST}",
++                "created_at": "2026-10-26T09:08:26Z", "updated_at": "2026-10-26T09:08:34Z"}
++        base.update(override)
++        return {"published_at": "2023-11-21T07:43:51Z", "assets": [{"name": "other"}, base]}
++
++    def test_r90_upload_time_of_the_asset_is_its_date(self):
++        self.assertEqual(self.run_with(self.asset()).isoformat(), "2026-10-26T09:08:34+00:00")
++        reuploaded = self.asset(updated_at="2026-11-20T00:00:00Z")
++        self.assertEqual(self.run_with(reuploaded).isoformat(), "2026-11-20T00:00:00+00:00")
++
++    def test_r90_digest_must_match_and_be_known(self):
++        for release in [self.asset(digest=f"sha256:{DIGEST2}"), self.asset(digest=None),
++                        {"assets": [{"name": "other"}]}, {}]:
++            with self.subTest(release), self.assertRaises(dep_age.LookupFailed):
++                self.run_with(release)
++
++
+ DIGEST = "a" * 64
+ DIGEST2 = "b" * 64
+ 
+@@ -690,6 +722,30 @@
+         # The pinned image of line 5 is still dated.
+         self.assertIn("alpine:3.20", {f.name for f in result.findings if f.kind == "image"})
+ 
++    def test_r90_add_of_a_checksum_pinned_github_release_asset_is_dated(self):
++        url = "https://github.com/o/r/releases/download/v2.0.1/lib-linux-x64.tar.bz2"
++        result = self.dockerfile(CLEAN_DOCKERFILE + f"ADD --checksum=sha256:{DIGEST} {url} /archives/\n")
++        self.assertEqual(result.errors, [])
++        assets = [(f.kind, f.name, f.version) for f in result.findings if f.kind == "asset"]
++        self.assertEqual(assets, [("asset", "o/r/lib-linux-x64.tar.bz2", "v2.0.1")])
++        young = self.dockerfile(CLEAN_DOCKERFILE + f"ADD --checksum=sha256:{DIGEST} {url} /archives/\n",
++                                young={"lib-linux-x64.tar.bz2"})
++        self.assertIn(YOUNG, {f.published for f in young.findings if f.kind == "asset"})
++
++    def test_r90_add_from_a_url_without_checksum_or_from_elsewhere_is_rejected(self):
++        url = "https://github.com/o/r/releases/download/v1/a.tar.gz"
++        for line in [
++            f"ADD {url} /x",
++            f"ADD --checksum=sha256:{DIGEST[:10]} {url} /x",
++            f"ADD --checksum=sha256:{DIGEST} https://example.invalid/a.tar.gz /x",
++            f"ADD --checksum=sha256:{DIGEST} https://github.com/o/r/archive/refs/heads/main.tar.gz /x",
++            f"ADD --checksum=sha256:{DIGEST} --chmod=755 {url} /x",
++            f"ADD --checksum=sha256:{DIGEST} {url} {url} /x",
++            f"ADD --checksum=sha256:{DIGEST} git@github.com:o/r.git /x",
++        ]:
++            with self.subTest(line):
++                self.assertError(self.dockerfile(CLEAN_DOCKERFILE + line + "\n"), "ADD from a URL must be")
++
+     def test_r90_redirecting_settings_in_dockerfiles_are_rejected(self):
+         result = self.dockerfile(CLEAN_DOCKERFILE + "ENV RUSTUP_DIST_SERVER=https://example.invalid\n")
+         self.assertError(result, "RUSTUP_DIST_SERVER can redirect")

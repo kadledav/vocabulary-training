@@ -1,8 +1,9 @@
 # Compose stack of the vocabulary app (design §12.2, R-80, R-81, R-83, R-85).
 # Copy to the home repo as docker/vocabulary/docker-compose.yml. No .env and
 # no secrets: the password is set in the app on first start (setup code in
-# `docker logs vocabulary`, see README.md). Set `image:` to the tag AND digest
-# printed in the release notes. The TTS service joins in M6.
+# `docker logs vocabulary`, see README.md). Set both `image:` lines to the tag
+# AND digest printed in the release notes. The TTS service (M6) is reachable
+# only from the app, on the internal network `vocab-internal`.
 name: vocabulary
 
 services:
@@ -44,6 +45,8 @@ services:
       options: { max-size: "10m", max-file: "3" }
     networks:
       - proxy-net
+      # Only to reach vocabulary-tts (no route anywhere else).
+      - vocab-internal
     labels:
       - "traefik.enable=true"
       - "traefik.docker.network=proxy-net"
@@ -57,6 +60,44 @@ services:
       - "traefik.http.routers.vocabulary-home.tls=true"
     # No ports:, no Docker socket, no host network, no devices.
 
+  # Neural TTS (design §10, R-40, R-83): turns words and sentences into MP3
+  # clips for the app. The Kokoro model is in the image (read-only); no
+  # volumes, no ports, no route to the LAN or the internet.
+  vocabulary-tts:
+    container_name: vocabulary-tts
+    image: ghcr.io/kadledav/vocabulary-training-tts:X.Y.Z@sha256:DIGEST-FROM-THE-RELEASE-NOTES
+    restart: unless-stopped
+    user: "3101:3101"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      # Inference threads; keep equal to `cpus`.
+      - VOCAB_TTS_THREADS=2
+      - VOCAB_TTS_LOG_LEVEL=info
+    # Measured peak ~0.9 GB for the longest text (docs/design/tts-spike.md).
+    mem_limit: 1280m
+    memswap_limit: 1280m
+    cpus: 2.0
+    pids_limit: 64
+    healthcheck:
+      test: ["CMD", "/vocab-tts", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # Loading the model and the start self-test take a few seconds.
+      start_period: 60s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    networks:
+      - vocab-internal
+    # No ports:, no volumes:, no Docker socket, no host network, no devices.
+
 networks:
   proxy-net:
     external: true
+  # The app and the TTS service only; `internal: true` = no gateway, so no
+  # traffic to the LAN or the internet.
+  vocab-internal:
+    internal: true
