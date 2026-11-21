@@ -118,6 +118,8 @@ class TtsService(unittest.TestCase):
         app = service("vocabulary")
         self.assertIn("      - vocab-internal\n", app)
         self.assertIn("traefik.docker.network=proxy-net", app)
+        # The app reaches the service by its name on that network.
+        self.assertIn("      - VOCAB_TTS_URL=http://vocabulary-tts:8090\n", app)
         self.assertEqual(COMPOSE.count("      - vocab-internal\n"), 2)
 
 

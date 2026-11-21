@@ -28,6 +28,9 @@ services:
       - VOCAB_TIMEZONE=Europe/Prague
       - VOCAB_DAY_ROLLOVER_HOUR=4
       - VOCAB_LOG_LEVEL=info
+      # Neural audio (v0.2.0): the TTS service below, on vocab-internal.
+      # Remove the line to go back to the browser's own speech.
+      - VOCAB_TTS_URL=http://vocabulary-tts:8090
     volumes:
       # The dataset root: the database, and the cache in /data/cache (made by
       # the app).

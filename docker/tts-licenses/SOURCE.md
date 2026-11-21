@@ -11,7 +11,7 @@ exactly, use:
    sources are on https://crates.io (MIT; the crates' own licences in
    their sources).
 2. **sherpa-onnx v2.0.1** static libraries (Apache-2.0; they contain ONNX
-   Runtime 1.28.2, MIT, and the libraries listed in `THIRD-PARTY.md`):
+   Runtime 1.28.2, MIT, and the libraries listed in `THIRD-PARTY-NOTICES.txt`):
    - https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.1/sherpa-onnx-v2.0.1-linux-x64-static-lib.tar.bz2
      sha256 `55cfadf65ba50d0afc1a802b7a337942819e51c94a5b5a384def1978f7c70871`
    - https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.1/sherpa-onnx-v2.0.1-linux-aarch64-static-lib.tar.bz2
@@ -22,11 +22,14 @@ exactly, use:
    - https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-multi-lang-v1_0.tar.bz2
      sha256 `60703707bc05ccd48d60e1eb723f38b07d6e474795a0b6a588d7220400e0f7a4`
    - upstream: https://huggingface.co/hexgrad/Kokoro-82M
-4. **LAME 3.100** (LGPL-2.0-or-later), compiled from the source bundled in
+4. **CMUdict** (BSD-2-Clause), the fallback pronunciation dictionary:
+   - https://raw.githubusercontent.com/cmusphinx/cmudict/74790861f652b15e4ac49015a90074ad62a27690/cmudict.dict
+     sha256 `81917843c7f44ce2b094ac63873c2c7a4cf802040792c455ba3ca406891c3d22`
+5. **LAME 3.100** (LGPL-2.0-or-later), compiled from the source bundled in
    the crate `mp3lame-sys` 0.1.11 (https://crates.io/crates/mp3lame-sys);
-   statically linked: the object files can be rebuilt from 1. and 4. and
+   statically linked: the object files can be rebuilt from 1. and 5. and
    relinked with a modified LAME.
-5. **Base images** (glibc, libstdc++, libgcc, CA certificates and tzdata
+6. **Base images** (glibc, libstdc++, libgcc, CA certificates and tzdata
    from Debian 13, under their own licences in `/usr/share/doc` of the
    image): `gcr.io/distroless/cc-debian13:nonroot` and, for the build,
    `rust:1.99.0-slim-trixie` with Debian packages from

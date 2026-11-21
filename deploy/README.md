@@ -15,10 +15,11 @@ environment: the password and the connector token are set in the app.
 
 ## 0. Image access (once, after the first release)
 
-GitHub creates the package `ghcr.io/kadledav/vocabulary-training` as
-**private** on the first push. Make it public once: GitHub → profile →
-Packages → `vocabulary-training` → Package settings → *Change visibility* →
-Public. Then check that it can be pulled without any login (a fresh, empty
+GitHub creates the packages `ghcr.io/kadledav/vocabulary-training` and
+(from v0.2.0) `ghcr.io/kadledav/vocabulary-training-tts` as **private** on
+the first push. Make each public once: GitHub → profile → Packages →
+`vocabulary-training` (and `vocabulary-training-tts`) → Package settings →
+*Change visibility* → Public. Then check that it can be pulled without any login (a fresh, empty
 Docker config):
 
 ```sh
@@ -127,18 +128,31 @@ voices, US `af_heart` and UK `bf_emma`). It needs no setup:
   model is inside; the image has no shell and runs read-only).
 - It is only on the network `vocab-internal` (`internal: true`, created by
   the stack): no published port, no Traefik router, no route to the LAN or
-  the internet; only the app can reach it, as `http://vocabulary-tts:8090`.
-  The app also joins `vocab-internal` (and stays on `proxy-net` for Traefik).
+  the internet; only the app can reach it, as `http://vocabulary-tts:8090`
+  (`VOCAB_TTS_URL` in the app's `environment:`). The app also joins
+  `vocab-internal` (and stays on `proxy-net` for Traefik).
 - Limits: 1280 MB memory without swap, 2 CPUs, 64 PIDs (measured peak about
   0.9 GB for the longest text, 5 threads). `docker ps` shows it `healthy`
   about 10 s after the start (model load and a self-test of both voices).
 - Its log has one line per clip with lengths and a hash of the text, never
   the text itself (`docker logs vocabulary-tts`).
-- The app uses it from the release that brings the audio module; until a
-  clip is ready the app falls back to the browser's speech (R-41), so the
-  service may also be stopped at any time.
-- Licences: the image is MIT/Apache-2.0 with LGPL LAME (see `/licenses` in
-  the image, `docker cp vocabulary-tts:/licenses .`).
+- The app queues a clip for every headword (the pack's `speak` text if
+  set) and every visible English sentence, in the voice chosen in Settings,
+  and fetches them one at a time (words first). Until a clip is ready, ▶
+  uses the browser's speech (R-41); the service may be stopped at any time.
+  Settings → Audio shows clips ready / being made / failed, how many have an
+  approximate pronunciation (a word in no dictionary), and *Retry failed
+  clips*.
+- Clips live in `/data/cache/audio` (regenerable, R-85: a restore without
+  the cache only means the clips are made again). Disk: about 35 MB per
+  1 000 sentences of 15–20 words per voice (≈ 7.5 KB a second of speech;
+  a headword ≈ 5 KB); a voice switch keeps the other voice's clips while
+  their text exists.
+- Time: about 1–2 s per sentence on two cores (measured real-time factor
+  0.36 on an arm64 laptop core; NAS cores are slower), so 1 000 sentences
+  take roughly half an hour.
+- Licences: the image is MIT/Apache-2.0/BSD with LGPL LAME (see
+  `/licenses` in the image, `docker cp vocabulary-tts:/licenses .`).
 
 ## 5. Updates
 
@@ -148,6 +162,21 @@ voices, US `af_heart` and UK `bf_emma`). It needs no setup:
    redeploy.
 3. Check `healthy` and log in. Migrations run at start; a failed start logs
    `database check failed` — then restore (§6) from the snapshot.
+
+### v0.1.1 → v0.2.0 (neural audio)
+
+1. Snapshot first (migration `0006` adds the audio tables; nothing else
+   changes): `zfs snapshot tank/services/vocabulary@pre-v0.2.0`.
+2. Make the package `vocabulary-training-tts` public (§0).
+3. Take the new `docker-compose.example.yml` parts: the `vocabulary-tts`
+   service, the `vocab-internal` network (also in the app's `networks:`)
+   and `VOCAB_TTS_URL=http://vocabulary-tts:8090` in the app's
+   `environment:`; set both `image:` lines from the release notes; redeploy.
+4. Check: both containers `healthy`; `docker logs vocabulary` shows
+   `neural audio on` and soon `audio clips synced queued=…`; Settings →
+   Audio counts clips. Audio appears gradually as the queue drains (the
+   words first); meanwhile ▶ speaks with the browser as before.
+5. Auto-play is off by default now; turn it on in Settings if wanted.
 
 If an earlier build with secrets in `.env` is deployed: remove `.env` and the two
 `VOCAB_PASSWORD_HASH_B64`/`VOCAB_IMPORT_TOKEN` lines from `environment:` (the
