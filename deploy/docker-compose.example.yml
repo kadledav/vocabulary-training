@@ -68,7 +68,10 @@ services:
 
   # Neural TTS (design §10, R-40, R-83): turns words and sentences into MP3
   # clips for the app. The Kokoro model is in the image (read-only); no
-  # volumes, no ports, no route to the LAN or the internet.
+  # volumes, no ports, no route to the LAN or the internet. The model is in
+  # memory only while clips are being made (an engine process that ends
+  # after VOCAB_TTS_IDLE_SECONDS without work): idle, the container uses a
+  # few MiB.
   vocabulary-tts:
     container_name: vocabulary-tts
     image: ghcr.io/kadledav/vocabulary-training-tts:X.Y.Z@sha256:DIGEST-FROM-THE-RELEASE-NOTES
@@ -78,20 +81,26 @@ services:
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     environment:
-      # Inference threads; keep equal to `cpus`.
-      - VOCAB_TTS_THREADS=2
+      # Inference threads; keep equal to `cpus`. One is enough: clips are
+      # made once, in the background (a sentence takes a few seconds).
+      - VOCAB_TTS_THREADS=1
+      # The engine process (and the model's memory) goes this long after
+      # the last clip.
+      - VOCAB_TTS_IDLE_SECONDS=180
       - VOCAB_TTS_LOG_LEVEL=info
-    # Measured peak ~0.9 GB for the longest text (docs/design/tts-spike.md).
-    mem_limit: 1280m
-    memswap_limit: 1280m
-    cpus: 2.0
+    # Measured peak 415 MiB for the worst texts the service accepts (a
+    # sentence: ~345 MiB; idle: a few MiB); docs/design/tts-spike.md,
+    # "Small memory". Above the limit only that clip fails, the service stays.
+    mem_limit: 512m
+    memswap_limit: 512m
+    cpus: 1.0
     pids_limit: 64
     healthcheck:
       test: ["CMD", "/vocab-tts", "healthcheck"]
       interval: 30s
       timeout: 5s
       retries: 3
-      # Loading the model and the start self-test take a few seconds.
+      # The start self-test loads the model once (seconds on a slow CPU).
       start_period: 60s
     logging:
       driver: json-file

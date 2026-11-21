@@ -101,10 +101,10 @@ class Memory(unittest.TestCase):
         self.assertEqual(smoke.mib({"current": 3 << 20, "anon": 1 << 20}), "current 3 MiB, anon 1 MiB")
 
     def test_r83_limit_covers_the_measured_peak(self):
-        # docs/design/tts-spike.md, "Small memory": a peak of 413 MiB for
+        # docs/design/tts-spike.md, "Small memory": a peak of 415 MiB for
         # the worst accepted texts in one engine process (arm64; amd64 is
         # measured by CI), plus a margin.
-        self.assertGreater(smoke.MEMORY_LIMIT_BYTES, 413 * 2**20 * 1.2)
+        self.assertGreater(smoke.MEMORY_LIMIT_BYTES, 415 * 2**20 * 1.2)
         self.assertLess(smoke.MEMORY_LIMIT_BYTES, 1280 * 2**20)
 
     def test_r83_the_smoke_test_runs_under_the_compose_limit(self):

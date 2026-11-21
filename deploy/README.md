@@ -124,8 +124,8 @@ The second service turns headwords and sentences into MP3 clips (Kokoro
 voices, US `af_heart` and UK `bf_emma`). It needs no setup:
 
 - `image:` from the same release notes,
-  `ghcr.io/kadledav/vocabulary-training-tts:X.Y.Z@sha256:…` (≈ 0.45 GB: the
-  model is inside; the image has no shell and runs read-only).
+  `ghcr.io/kadledav/vocabulary-training-tts:X.Y.Z@sha256:…` (≈ 0.25 GB: the
+  int8 model is inside; the image has no shell and runs read-only).
 - It is only on the network `vocab-internal` (`internal: true`, created by
   the stack): no published port, no Traefik router, no route to the LAN or
   the internet; only the app can reach it, as `http://vocabulary-tts:8090`
@@ -135,11 +135,18 @@ voices, US `af_heart` and UK `bf_emma`). It needs no setup:
   accepts only an internal `VOCAB_TTS_URL` — a host name without dots (the
   compose service name), `localhost`, or a loopback, private or link-local
   IP address — and refuses to start with anything else.
-- Limits: 1280 MB memory without swap, 2 CPUs, 64 PIDs (measured under
-  these limits: idle 0.57 GiB; 50 of the longest texts in a row stay at
-  0.76 GiB; the worst texts the service accepts, alternated, settle at
-  0.98 GiB; 5 threads). `docker ps` shows it `healthy`
-  about 10 s after the start (model load and a self-test of both voices).
+- Memory: the model is loaded only while clips are being made, in an
+  engine process that ends `VOCAB_TTS_IDLE_SECONDS` (default 180) after the
+  last clip; then the container is back at a few MiB. While it works:
+  about 345 MiB for words and sentences, at most about 415 MiB for the
+  longest and worst texts the service accepts (measured with the
+  container's cgroup numbers, docs/design/tts-spike.md, "Small memory").
+  `GET /healthz` says `"engine": "running"` or `"stopped"`.
+- Limits: 512 MB memory without swap, 1 CPU, 64 PIDs. If a text ever
+  needs more, the kernel stops only the engine process: that clip fails
+  (after three tries, "crashed the audio service"), the service stays up.
+  `docker ps` shows it `healthy` a few seconds after the start (the model is
+  loaded once for a self-test of both voices, then released).
 - Its log has one line per clip with lengths and a hash of the text, never
   the text itself (`docker logs vocabulary-tts`).
 - The app queues a clip for every headword (the pack's `speak` text if
@@ -158,9 +165,13 @@ voices, US `af_heart` and UK `bf_emma`). It needs no setup:
   clips while less than about 257 MiB is free on the dataset (the database
   needs room too); in both cases its log says so once and Settings → Audio
   shows why no new clips are made.
-- Time: about 1–2 s per sentence on two cores (measured real-time factor
-  0.36 on an arm64 laptop core; NAS cores are slower), so 1 000 sentences
-  take roughly half an hour.
+- Time: the small (int8) model on one thread is slow but fine for clips
+  made once in the background: on an arm64 laptop core about 2.2–2.7 s per
+  sentence and 1 s per word (300 clips: ~10 minutes), about twice that at
+  half a CPU; a NAS core may be several times slower (300 clips: perhaps
+  30–60 minutes). The first clip after an idle time also loads the
+  lexicons (about 0.5 s on the laptop). A request may take up to 10 minutes
+  before it counts as failed.
 - Licences: the image is MIT/Apache-2.0/BSD with LGPL LAME (see
   `/licenses` in the image, `docker cp vocabulary-tts:/licenses .`).
 
@@ -172,6 +183,17 @@ voices, US `af_heart` and UK `bf_emma`). It needs no setup:
    redeploy.
 3. Check `healthy` and log in. Migrations run at start; a failed start logs
    `database check failed` — then restore (§6) from the snapshot.
+
+### v0.2.0 → v0.2.1 (smaller audio service)
+
+1. Take the new `vocabulary-tts` settings from `docker-compose.example.yml`:
+   `VOCAB_TTS_THREADS=1`, `VOCAB_TTS_IDLE_SECONDS=180`, `mem_limit` and
+   `memswap_limit: 512m`, `cpus: 1.0`; set both `image:` lines from the
+   release notes; redeploy. No migration.
+2. The service now uses the small (int8) model, so the app makes every clip
+   again, in the background (the old clips play until their replacement is
+   ready, then they are deleted). Expect the audio container at a few
+   hundred MiB while that runs, then a few MiB (`docker stats`).
 
 ### v0.1.1 → v0.2.0 (neural audio)
 
