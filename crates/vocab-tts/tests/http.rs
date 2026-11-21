@@ -110,8 +110,8 @@ async fn r83_healthz_and_unknown_routes() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    // The in-process pipeline has its model loaded all the time.
-    assert_eq!(body, br#"{"engine":"loaded","status":"ok"}"#);
+    // The in-process pipeline runs all the time.
+    assert_eq!(body, br#"{"engine":"running","status":"ok"}"#);
     let (status, _, body) = send(
         &app,
         Request::get("/v1/other")

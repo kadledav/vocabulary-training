@@ -54,8 +54,8 @@ pub trait Backend: Send + Sync + std::fmt::Debug {
         true
     }
 
-    /// Whether the model is in memory now (or being loaded or used).
-    fn loaded(&self) -> bool {
+    /// Whether the engine is running now (in memory, or busy).
+    fn running(&self) -> bool {
         true
     }
 }
@@ -151,9 +151,9 @@ impl Speaker {
         self.backend.healthy()
     }
 
-    /// See [`Backend::loaded`].
-    pub fn loaded(&self) -> bool {
-        self.backend.loaded()
+    /// See [`Backend::running`].
+    pub fn engine_running(&self) -> bool {
+        self.backend.running()
     }
 }
 

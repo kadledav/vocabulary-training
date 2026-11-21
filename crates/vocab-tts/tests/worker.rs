@@ -75,7 +75,7 @@ async fn r83_started_on_demand_reused_and_stopped_when_idle() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&body).expect("json"),
-        serde_json::json!({ "status": "ok", "engine": "unloaded" })
+        serde_json::json!({ "status": "ok", "engine": "stopped" })
     );
     // And started again for the next request.
     say(&speaker).await.expect("spoken again");
