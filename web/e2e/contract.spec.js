@@ -8,7 +8,7 @@
 
 import { DatabaseSync } from 'node:sqlite';
 
-import { expect, headwordOnScreen, startBookBlock, test, waitGuard } from './fixtures.js';
+import { advanceClock, expect, freezeClock, headwordOnScreen, installClock, startBookBlock, test, waitGuard } from './fixtures.js';
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -257,20 +257,25 @@ test('R-70 digits do nothing before the reveal; Space and Enter never rate', asy
 
 test('R-62 a double reveal tap cannot fire a rating (250 ms guard, by touch/click)', async ({ page, app, pageErrors }) => {
   void pageErrors;
+  await installClock(page);
   await startBookBlock(page, app);
+  // Page time stands still until advanced: "right away" is exact, however
+  // slow the keypresses reach the page.
+  await freezeClock(page);
   await page.getByTestId('reveal').click();
   // A rating fired right away is ignored.
   await page.keyboard.press('3');
   await page.keyboard.press('1');
-  await page.waitForTimeout(100);
+  await page.waitForTimeout(100); // real time: lets a (wrong) rating request show up
   expect((await currentSession(app)).answered).toBe(0);
-  await waitGuard();
+  await advanceClock(page, 650); // past the 500 ms rating guard
   await page.keyboard.press('3');
   await expect(page.getByTestId('toast')).toContainText('Rated 3');
 });
 
 test('R-62 a 1 right after the reveal of a card last failed keeps the toast longer (slip guard)', async ({ page, app, pageErrors }) => {
   void pageErrors;
+  await installClock(page);
   await startBookBlock(page, app);
   // g=1, b=5 (queues a repeat of brontle), q=1, s=1; then brontle again.
   for (const grade of [1, 5, 1, 1]) {
@@ -281,13 +286,14 @@ test('R-62 a 1 right after the reveal of a card last failed keeps the toast long
   }
   await expect(page.getByTestId('progress')).toHaveText('5 / 5');
   expect(await headwordOnScreen(page)).toBe('brontle');
+  await freezeClock(page);
   await page.keyboard.press('Space');
   await expect(page.locator('button.rate')).toHaveCount(5);
-  await page.waitForTimeout(650); // past the 500 ms rating guard, inside the 1 s slip window
+  await advanceClock(page, 650); // past the 500 ms rating guard, inside the 1 s slip window
   await page.keyboard.press('1');
   await expect(page.getByTestId('toast')).toContainText('Rated 1');
   // Normal toasts last about 4 s; the slip-guard toast stays up to 8 s.
-  await page.waitForTimeout(5500);
+  await advanceClock(page, 5500);
   await expect(page.getByTestId('toast')).toBeVisible();
   const animation = await page.getByTestId('toast').evaluate((el) => getComputedStyle(el).animationName);
   expect(animation, 'slip-guard toast pulses').not.toBe('none');

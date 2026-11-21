@@ -200,3 +200,44 @@ export async function headwordOnScreen(page) {
 export function waitGuard() {
   return new Promise((resolve) => setTimeout(() => resolve(undefined), 650));
 }
+
+/**
+ * Control the page's own clock for a test that depends on a product time
+ * window (input guard, rating guard, slip window, toast lifetime). Call it
+ * once, before the first `page.goto`. The clock runs at real speed until
+ * `freezeClock`.
+ *
+ * Why not `waitForTimeout`: it measures on the Node side, and the polling
+ * and input latency of Playwright add an unknown amount on a loaded
+ * machine, so a tap meant to land inside (or outside) a window may not.
+ * The product reads `performance.now()` and `setTimeout`, both of which
+ * Playwright's clock replaces.
+ *
+ * @param {import('@playwright/test').Page} page
+ */
+export function installClock(page) {
+  return page.clock.install();
+}
+
+/**
+ * Stop the page's clock: from here on page time passes only through
+ * `advanceClock`, however long Playwright, the server or the machine take.
+ * Also works again after a reload.
+ *
+ * @param {import('@playwright/test').Page} page
+ */
+export async function freezeClock(page) {
+  const now = await page.evaluate(() => Date.now());
+  await page.clock.pauseAt(now + 1_000);
+}
+
+/**
+ * Let exactly `ms` of page time pass on a frozen clock, running the timers
+ * (guards, toasts) that fall due on the way.
+ *
+ * @param {import('@playwright/test').Page} page
+ * @param {number} ms
+ */
+export function advanceClock(page, ms) {
+  return page.clock.runFor(ms);
+}

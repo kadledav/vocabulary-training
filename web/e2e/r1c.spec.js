@@ -10,7 +10,7 @@
 import { randomUUID } from 'node:crypto';
 import { deflateRawSync, crc32 } from 'node:zlib';
 
-import { expect, startBookBlock, test, waitGuard } from './fixtures.js';
+import { advanceClock, expect, freezeClock, installClock, startBookBlock, test, waitGuard } from './fixtures.js';
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -200,6 +200,9 @@ test('R-62 bug 2 the "Rated … Undo" toast is a row of the bottom bar and never
 
 test('R-62 bug 4 a slow double tap on "Show translation" never rates the card', async ({ page, app, pageErrors }, info) => {
   void pageErrors;
+  // The page's clock is frozen between the two taps and moved by exact
+  // amounts, so the timing never depends on how fast this machine is.
+  await installClock(page);
   await startBookBlock(page, app);
   const reveal = await page.getByTestId('reveal').boundingBox();
   if (!reveal) throw new Error('no reveal button');
@@ -207,24 +210,37 @@ test('R-62 bug 4 a slow double tap on "Show translation" never rates the card', 
   const y = reveal.y + reveal.height / 2;
   const tap = (/** @type {number} */ px, /** @type {number} */ py) =>
     info.project.name === 'webkit-phone' ? page.touchscreen.tap(px, py) : page.mouse.click(px, py);
-  for (const pause of [300, 460]) {
+  const reviewPosts = /** @type {string[]} */ ([]);
+  page.on('request', (request) => {
+    if (request.method() === 'POST' && request.url().endsWith('/reviews')) reviewPosts.push(request.url());
+  });
+  // 300 ms: early in the 500 ms rating guard; 480 ms: just inside its end.
+  for (const pause of [300, 480]) {
+    await freezeClock(page);
+    await advanceClock(page, 250); // past the 250 ms input guard that disables Reveal
     await expect(page.getByTestId('reveal')).toBeEnabled();
     await tap(x, y);
     await expect(page.locator('button.rate')).toHaveCount(5);
-    await page.waitForTimeout(pause - 20);
+    await advanceClock(page, pause);
     // Whatever button is under the finger now, the second tap is ignored.
     await tap(x, y);
+    // Rating, if it happened, is a request sent from the tap itself; give
+    // it real time to show up (a longer wait cannot make this flaky).
     await page.waitForTimeout(300);
+    expect(reviewPosts, `second tap after ${pause} ms sent no rating`).toEqual([]);
     const current = await app.api('GET', '/api/sessions/current');
     expect(current.answered, `second tap after ${pause} ms did not rate`).toBe(0);
     await expect(page.getByTestId('toast')).toHaveCount(0);
-    // A deliberate rating still works (and goes back to the question side).
+    // Past the guard (and the 600 ms same-spot window): a deliberate rating works.
+    await advanceClock(page, 700);
     await page.getByRole('button', { name: /^Rate 3,/ }).click();
     await expect(page.getByTestId('toast')).toContainText('Rated 3');
+    expect(reviewPosts).toHaveLength(1);
     await page.getByTestId('undo').click();
     await expect(page.getByTestId('toast')).toContainText('Rating undone');
     // Undo leaves the answer side: start over from the question side.
     await page.evaluate(() => document.querySelector('[data-testid="toast"]')?.remove());
+    reviewPosts.length = 0;
     await page.reload();
     await expect(page.getByTestId('reveal')).toBeVisible();
   }

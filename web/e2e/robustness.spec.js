@@ -6,7 +6,7 @@
  * and the rating bar never hiding the end of the answer.
  */
 
-import { expect, startBookBlock, test, waitGuard } from './fixtures.js';
+import { advanceClock, expect, freezeClock, installClock, startBookBlock, test, waitGuard } from './fixtures.js';
 
 /**
  * Collect the bodies of the rating posts.
@@ -39,21 +39,26 @@ const CONFLICT = /^console: Failed to load resource: the server responded with a
 const current = (app) => app.api('GET', '/api/sessions/current');
 
 /**
- * Tap (phone) or click (desktop) twice at the centre of `locator`, `gap` ms apart.
+ * Tap (phone) or click (desktop) the centre of `locator`, then again at the
+ * same spot once `appears` is visible and `gap` ms of page time have passed.
+ * The page's clock is frozen in between, so `gap` is exact whatever the
+ * speed of the machine (see `installClock`).
  *
  * @param {import('@playwright/test').Page} page
  * @param {import('@playwright/test').Locator} locator
+ * @param {import('@playwright/test').Locator} appears what the first tap brings up
  * @param {boolean} touch
  * @param {number} gap
  */
-async function doubleTap(page, locator, touch, gap) {
+async function doubleTap(page, locator, appears, touch, gap) {
   const box = await locator.boundingBox();
   if (!box) throw new Error('target not visible');
   const x = box.x + box.width / 2;
   const y = box.y + box.height / 2;
   if (touch) await page.touchscreen.tap(x, y);
   else await page.mouse.click(x, y);
-  await page.waitForTimeout(gap);
+  await expect(appears).toBeVisible();
+  await advanceClock(page, gap);
   if (touch) await page.touchscreen.tap(x, y);
   else await page.mouse.click(x, y);
 }
@@ -88,19 +93,24 @@ test('R-62 a double tap on a rating does not act on the next card (H1)', async (
   void pageErrors;
   const touch = info.project.name === 'webkit-phone';
   const posts = reviewPosts(page);
+  await installClock(page);
   await startBookBlock(page, app, { touch });
-  await reveal(page);
-  // The second tap lands where "Show answer" of the next card appears.
-  await doubleTap(page, page.getByRole('button', { name: /^Rate 2,/ }), touch, 130);
+  await freezeClock(page);
+  await page.getByTestId('reveal').click();
+  await advanceClock(page, 650); // past the 500 ms rating guard
+  // The second tap lands where "Show answer" of the next card appears, 130 ms
+  // (inside the 250 ms input guard) after that card did.
+  await doubleTap(page, page.getByRole('button', { name: /^Rate 2,/ }), page.getByTestId('reveal'), touch, 130);
   await page.waitForTimeout(300);
   await expect(page.getByTestId('reveal')).toBeVisible();
   await expect(page.getByTestId('progress')).toHaveText('2 / 4');
   expect(posts).toHaveLength(1);
 
   // A double tap on a 5 must not skip the "Next" step either.
+  await advanceClock(page, 250);
   await page.getByTestId('reveal').click();
-  await waitGuard();
-  await doubleTap(page, page.getByRole('button', { name: /^Rate 5,/ }), touch, 130);
+  await advanceClock(page, 650);
+  await doubleTap(page, page.getByRole('button', { name: /^Rate 5,/ }), page.getByTestId('next'), touch, 130);
   await page.waitForTimeout(300);
   await expect(page.getByTestId('next')).toBeVisible();
   await expect(page.getByTestId('headword')).toHaveText('brontle');
@@ -321,6 +331,7 @@ test('R-70 the screen stays awake while practising, again after the page was hid
 test('R-62 the slip-guard toast pulses exactly once (H11)', async ({ page, app, pageErrors }, info) => {
   test.skip(info.project.name !== 'chromium-desktop', 'keyboard');
   void pageErrors;
+  await installClock(page);
   await startBookBlock(page, app);
   for (const grade of [2, 5, 2, 2]) {
     await page.keyboard.press('Space');
@@ -331,8 +342,10 @@ test('R-62 the slip-guard toast pulses exactly once (H11)', async ({ page, app, 
   }
   // brontle's repeat (last rated 5): a reflex 1 right after the guard.
   await expect(page.getByTestId('headword-question')).toHaveText('brontle');
+  await freezeClock(page);
   await page.keyboard.press('Space');
-  await waitGuard();
+  await expect(page.locator('button.rate')).toHaveCount(5);
+  await advanceClock(page, 650); // past the 500 ms rating guard, inside the 1 s slip window
   await page.keyboard.press('1');
   const toast = page.getByTestId('toast');
   await expect(toast).toHaveClass(/pulse/);
