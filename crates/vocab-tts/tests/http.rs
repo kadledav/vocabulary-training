@@ -17,6 +17,9 @@ async fn r40_speak_returns_an_mp3_clip() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(headers[header::CONTENT_TYPE], "audio/mpeg");
     assert_eq!(headers["x-voice"], "af_heart");
+    assert_eq!(headers["x-approximate"], "0");
+    assert_eq!(headers["x-words-spelled"], "0");
+    assert_eq!(headers["x-frontend"], "g2p-2");
     assert_eq!(headers[header::CACHE_CONTROL], "no-store");
     assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
     // MPEG-2 layer III frame sync at the start.
@@ -87,7 +90,7 @@ async fn r42_voices_are_listed() {
         serde_json::json!({ "voices": [
             { "id": "af_heart", "accent": "en-US", "default": true },
             { "id": "bf_emma", "accent": "en-GB", "default": false },
-        ]})
+        ], "frontend": "g2p-2", "engine": "kokoro-multi-lang-v1_0+sherpa-onnx-2.0.1"})
     );
 }
 

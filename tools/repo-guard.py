@@ -152,7 +152,7 @@ ALLOWED_HOSTS = {
 CONFIG_SUFFIXES = {".yml", ".yaml", ".toml", ".json", ".ini", ".cfg", ".conf", ".env", ".example", ".npmrc",
                    ".dockerignore", ".gitignore"}
 # Generated or third-party text: licence texts name their authors.
-PERSONAL_DATA_EXEMPT = {"THIRD-PARTY-NOTICES.txt", "LICENSE"}
+PERSONAL_DATA_EXEMPT = {"THIRD-PARTY-NOTICES.txt", "LICENSE", "docker/tts-licenses/THIRD-PARTY-NOTICES.txt"}
 
 FIXTURE_DIRS = {"testdata", "test-data", "test_data", "fixtures", "__fixtures__"}
 FIXTURE_KEYS = r"id|pack_id|slug|source_slug|source_id"

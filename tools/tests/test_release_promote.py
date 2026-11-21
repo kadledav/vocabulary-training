@@ -108,7 +108,28 @@ class Notes(unittest.TestCase):
         self.assertIsNone(promote.notes_body(body, self.REF))  # a re-run adds nothing
 
 
+    def test_r83_both_images_get_their_own_block_once(self):
+        tts = f"ghcr.io/o/r-tts:0.1.0@{D2}"
+        body = promote.notes_body(None, self.REF)
+        body = promote.notes_body(body, tts, "tts")
+        self.assertIn("Server image", body)
+        self.assertIn(f"TTS image (linux/amd64, linux/arm64), deploy by tag and digest:\n\n    {tts}\n", body)
+        self.assertIsNone(promote.notes_body(body, tts, "tts"))
+        self.assertEqual(body.count("ZFS snapshot"), 1)
+
+
 class Arguments(unittest.TestCase):
+    def test_r83_smoke_tool_and_notes_image_choices(self):
+        args = promote.parse(["smoke", "--repository", "ghcr.io/o/r-tts", "--digest", D1, "--platform", "linux/arm64",
+                              "--tool", "tts-smoke"])
+        self.assertEqual(promote.SMOKE_TOOLS[args.tool], "tts-smoke.py")
+        self.assertTrue((Path(promote.__file__).parent / "tts-smoke.py").is_file())
+        self.assertEqual(promote.parse(["smoke", "--repository", "ghcr.io/o/r", "--digest", D1,
+                                        "--platform", "linux/amd64"]).tool, "image-smoke")
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            promote.parse(["smoke", "--repository", "ghcr.io/o/r", "--digest", D1, "--platform", "linux/amd64",
+                           "--tool", "other"])
+
     def test_arguments_are_validated(self):
         ok = promote.parse(["publish", "--repository", "ghcr.io/o/r", "--version", "0.1.0", "--short", "abc1234",
                             "--digest", D1, "--digest", D2])

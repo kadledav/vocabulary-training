@@ -13,7 +13,7 @@ use std::time::Instant;
 use tokio::sync::Semaphore;
 
 use crate::engine::{EngineError, Synthesizer};
-use crate::phonemize::Phonemizer;
+use crate::phonemize::{Phonemizer, Tally};
 use crate::postprocess::{self, Clip, PostError};
 use crate::speech::{SpeakText, Speed, Voice};
 
@@ -37,8 +37,8 @@ impl std::fmt::Debug for Speaker {
 #[derive(Debug)]
 pub struct Spoken {
     pub clip: Clip,
-    /// Words not in the lexicon, spoken letter by letter.
-    pub spelled_out: usize,
+    /// Where the words' pronunciations came from.
+    pub tally: Tally,
     pub phoneme_symbols: usize,
     /// Time spent in the engine and in post-processing.
     pub synthesis_ms: u64,
@@ -113,7 +113,7 @@ impl Speaker {
         let clip = postprocess::to_mp3(pcm)?;
         Ok(Spoken {
             clip,
-            spelled_out: phonemes.spelled_out(),
+            tally: phonemes.tally(),
             phoneme_symbols: phonemes.symbol_count(),
             synthesis_ms,
             postprocess_ms: elapsed_ms(started),

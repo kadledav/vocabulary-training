@@ -10,7 +10,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use vocab_tts::config::Config;
-use vocab_tts::engine::Kokoro;
+use vocab_tts::engine;
 use vocab_tts::http;
 use vocab_tts::phonemize::Phonemizer;
 use vocab_tts::speaker::Speaker;
@@ -130,16 +130,17 @@ fn load_speaker(config: &Config) -> Result<std::sync::Arc<Speaker>, String> {
         .map_err(|err| format!("cannot load the lexicons: {err}"))?;
     let lexicons_ms = started.elapsed().as_millis();
     let started = Instant::now();
-    let engine = Kokoro::load(&config.model_dir, config.threads)
+    let engine = engine::load(&config.model_dir, config.threads)
         .map_err(|err| format!("cannot load the model: {err}"))?;
     tracing::info!(
         model_dir = %config.model_dir.display(),
         threads = config.threads,
         lexicons_ms,
+        fallback_entries = ?phonemizer.fallback_sizes(),
         model_ms = started.elapsed().as_millis(),
         "model loaded"
     );
-    let speaker = Speaker::new(phonemizer, Box::new(engine), WAITING_REQUESTS);
+    let speaker = Speaker::new(phonemizer, engine, WAITING_REQUESTS);
     let text = SpeakText::new(SELF_TEST_TEXT).map_err(|err| err.to_string())?;
     for voice in Voice::ALL {
         let spoken = speaker

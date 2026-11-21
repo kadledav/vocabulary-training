@@ -140,12 +140,13 @@ class TtsDockerfile(unittest.TestCase):
         for image in external:
             self.assertRegex(image, r":[^@]+@sha256:[0-9a-f]{64}$")
         adds = re.findall(r"(?m)^ADD (.+)$", self.TEXT)
-        self.assertEqual(len(adds), 3)
+        self.assertEqual(len(adds), 4)
         for add in adds:
-            self.assertRegex(add, r"^--checksum=sha256:[0-9a-f]{64} https://github\.com/k2-fsa/sherpa-onnx/releases/download/\S+ /archives/$")
+            self.assertRegex(add, r"^--checksum=sha256:[0-9a-f]{64} https://(github\.com/k2-fsa/sherpa-onnx/releases/"
+                                  r"download/|raw\.githubusercontent\.com/cmusphinx/cmudict/[0-9a-f]{40}/)\S+ /archives/$")
 
     def test_r83_tts_image_ships_its_licences_and_no_espeak(self):
-        for name in ("SOURCE.md", "THIRD-PARTY.md", "onnxruntime-LICENSE.txt"):
+        for name in ("SOURCE.md", "THIRD-PARTY-NOTICES.txt", "onnxruntime-LICENSE.txt", "cmudict-LICENSE.txt"):
             self.assertTrue((REPO / "docker" / "tts-licenses" / name).is_file(), name)
         self.assertIn("COPY docker/tts-licenses/ /licenses/", self.TEXT)
         self.assertNotRegex(self.TEXT, r"(?m)^[^#]*install[^#\n]*espeak")

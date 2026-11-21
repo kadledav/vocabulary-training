@@ -9,10 +9,11 @@
       returned as `existing` (nothing is built again). Outputs (to
       $GITHUB_OUTPUT): version, short, existing.
 
-  release-promote.py smoke --repository R --digest sha256:… --platform linux/arm64
+  release-promote.py smoke --repository R --digest sha256:… --platform linux/arm64 [--tool tts-smoke]
       Pulls the per-platform image that was just pushed (by digest, untagged)
-      on a runner of that platform, checks its architecture and runs
-      tools/image-smoke.py on it. A failure says in the job summary that the
+      on a runner of that platform, checks its architecture and runs the
+      smoke tests on it (tools/image-smoke.py, or tools/tts-smoke.py for the
+      TTS image). A failure says in the job summary that the
       pushed digest stays in the registry untagged and nothing was tagged.
 
   release-promote.py publish --repository R --version X.Y.Z --short abc1234 --digest D1 --digest D2
@@ -22,9 +23,9 @@
       that index. An existing version tag is never moved: the same digest is
       fine (a re-run), any other digest is an error. Output: digest.
 
-  release-promote.py notes --repository R --tag vX.Y.Z --version X.Y.Z --digest sha256:…
+  release-promote.py notes --repository R --tag vX.Y.Z --version X.Y.Z --digest sha256:… [--image tts]
       Writes the reference `R:X.Y.Z@digest` to the job summary and to the
-      GitHub release notes (creates the release, or adds the reference to an
+      GitHub release notes, under the heading of the image (creates the release, or adds the reference to an
       existing one once; a re-run does not repeat it). Uses `gh`.
 
 Registry lookups use the registry API with GHCR_USER / GITHUB_TOKEN (pull
@@ -56,6 +57,14 @@ TAG = re.compile(r"v(?P<version>(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9]
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 REPOSITORY = re.compile(r"ghcr\.io/[a-z0-9._-]+/[a-z0-9._/-]+")
 PLATFORM = re.compile(r"linux/(?P<arch>amd64|arm64)")
+# The smoke tests of each image (tools/), by the name of --tool.
+SMOKE_TOOLS = {"image-smoke": "image-smoke.py", "tts-smoke": "tts-smoke.py"}
+# The heading of each image's block in the release notes (--image).
+NOTE_HEADINGS = {
+    "server": ("Server image (linux/amd64, linux/arm64), deploy by tag and digest:",
+               "If this release adds a database migration, take a ZFS snapshot first (deploy/README.md).\n"),
+    "tts": ("TTS image (linux/amd64, linux/arm64), deploy by tag and digest:", ""),
+}
 INDEX_TYPES = ", ".join([
     "application/vnd.oci.image.index.v1+json",
     "application/vnd.docker.distribution.manifest.list.v2+json",
@@ -157,14 +166,11 @@ def platforms_of(raw: str) -> list[str]:
     )
 
 
-def notes_body(existing: str | None, reference: str) -> str | None:
+def notes_body(existing: str | None, reference: str, image: str = "server") -> str | None:
     """The release notes with the image reference, or None if `existing`
     already has it (a re-run must not repeat it)."""
-    block = (
-        "Server image (linux/amd64, linux/arm64), deploy by tag and digest:\n\n"
-        f"    {reference}\n\n"
-        "If this release adds a database migration, take a ZFS snapshot first (deploy/README.md).\n"
-    )
+    heading, footer = NOTE_HEADINGS[image]
+    block = f"{heading}\n\n    {reference}\n\n{footer}"
     if existing is None:
         return block
     if reference in existing:
@@ -278,8 +284,8 @@ def smoke(args: argparse.Namespace) -> None:
         got = run("architecture", "docker", "image", "inspect", "--format", "{{.Architecture}}", pinned).strip()
         if got != arch:
             raise PromoteFailure("architecture", f"{pinned} is {got}, expected {arch}")
-        # image-smoke.py prints its own annotations and summary to the same log.
-        result = subprocess.run([sys.executable, str(HERE / "image-smoke.py"), pinned], timeout=1800)
+        # The smoke tool prints its own annotations and summary to the same log.
+        result = subprocess.run([sys.executable, str(HERE / SMOKE_TOOLS[args.tool]), pinned], timeout=1800)
         if result.returncode != 0:
             raise PromoteFailure("smoke tests", f"smoke tests of the pushed {args.platform} image failed")
     except PromoteFailure as err:
@@ -325,7 +331,7 @@ def notes(args: argparse.Namespace) -> None:
     existing = view.stdout if view.returncode == 0 else None
     if existing is None and "not found" not in (view.stderr or "").lower():
         raise PromoteFailure("release notes", f"gh release view failed: {view.stderr.strip()[:300]}")
-    body = notes_body(existing, reference)
+    body = notes_body(existing, reference, args.image)
     gha.append_summary(f"### Release notes\n\n`{reference}`\n")
     if body is None:
         print(f"release {args.tag} already names {reference}")
@@ -372,6 +378,7 @@ def parse(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--repository", type=repository, required=True)
     p.add_argument("--digest", type=digest, required=True)
     p.add_argument("--platform", type=platform, required=True)
+    p.add_argument("--tool", choices=sorted(SMOKE_TOOLS), default="image-smoke")
     p = sub.add_parser("publish")
     p.add_argument("--repository", type=repository, required=True)
     p.add_argument("--version", type=version, required=True)
@@ -382,6 +389,7 @@ def parse(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--tag", required=True)
     p.add_argument("--version", type=version, required=True)
     p.add_argument("--digest", type=digest, required=True)
+    p.add_argument("--image", choices=sorted(NOTE_HEADINGS), default="server")
     return parser.parse_args(argv)
 
 

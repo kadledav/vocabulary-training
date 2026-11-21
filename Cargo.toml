@@ -68,6 +68,8 @@ tower = { version = "=0.5.3", default-features = false, features = ["util"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+# `vocab_tts_engine`: vocab-tts with the sherpa-onnx engine (src/engine.rs).
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(vocab_tts_engine)"] }
 missing_debug_implementations = "warn"
 
 [workspace.lints.clippy]

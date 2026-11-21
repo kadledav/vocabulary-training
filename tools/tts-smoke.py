@@ -13,9 +13,9 @@ Checks:
   shell, busybox, package manager or other program: the only ELF files are
   /vocab-tts and the shared libraries of the distroless base (filesystem
   listing; `--entrypoint /bin/sh` must fail);
-* the model files are root-owned and read-only; /licenses holds the
-  project's, the model's, sherpa-onnx's, ONNX Runtime's and LAME's licences
-  and SOURCE.md;
+* the model files (and CMUdict) are root-owned and read-only; /licenses
+  holds the project's licence, the generated third-party notices and
+  SOURCE.md;
 * the container refuses to start with an unknown VOCAB_TTS_* variable;
 * with `--network none` (no network at all: the model is in the image) it
   starts and its `healthcheck` subcommand passes;
@@ -79,11 +79,8 @@ ALLOWED_EXECUTABLE = "vocab-tts"
 # libssl, …) and its dynamic loader: ELF, but not programs one can run.
 SHARED_LIBRARY = re.compile(r"^(?:usr/)?lib(?:64)?/(?:[^/]+/)*(?:[^/]*\.so(?:\.[0-9.]+)?|ld-linux[^/]*)$")
 ELF_MAGIC = b"\x7fELF"
-MODEL_FILES = ["model.onnx", "voices.bin", "tokens.txt", "lexicon-us-en.txt", "lexicon-gb-en.txt"]
-LICENSE_FILES = [
-    "LICENSE.txt", "THIRD-PARTY.md", "SOURCE.md", "kokoro-model-LICENSE.txt", "sherpa-onnx-LICENSE.txt",
-    "onnxruntime-LICENSE.txt", "lame-COPYING.txt", "mp3lame-sys-LICENSE.txt",
-]
+MODEL_FILES = ["model.onnx", "voices.bin", "tokens.txt", "lexicon-us-en.txt", "lexicon-gb-en.txt", "cmudict.dict"]
+LICENSE_FILES = ["LICENSE.txt", "THIRD-PARTY-NOTICES.txt", "SOURCE.md", "cmudict-LICENSE.txt"]
 
 RESULTS: list[tuple[str, bool | None, str]] = []
 

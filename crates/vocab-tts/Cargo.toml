@@ -24,12 +24,17 @@ mp3lame-encoder.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-sherpa-onnx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 unicode-normalization.workspace = true
+
+# The engine links the sherpa-onnx static libraries; only builds with
+# RUSTFLAGS="--cfg vocab_tts_engine" (docker/Dockerfile.tts) have it, so the
+# workspace builds and tests offline (src/engine.rs).
+[target.'cfg(vocab_tts_engine)'.dependencies]
+sherpa-onnx.workspace = true
 
 [dev-dependencies]
 tower.workspace = true

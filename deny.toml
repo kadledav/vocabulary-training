@@ -4,15 +4,10 @@
 
 [graph]
 all-features = true
-# Only platforms we build for: the musl release binaries (amd64, arm64), CI,
-# the owner's Mac, and vocab-tts (glibc) on amd64 and arm64.
-targets = [
-    "x86_64-unknown-linux-musl",
-    "aarch64-unknown-linux-musl",
-    "x86_64-unknown-linux-gnu",
-    "aarch64-unknown-linux-gnu",
-    "aarch64-apple-darwin",
-]
+# No target filter: every platform's crates are checked (a superset of
+# what ships). vocab-tts's engine dependency sits behind
+# `cfg(vocab_tts_engine)` (crates/vocab-tts/src/engine.rs), which a target
+# list cannot express; with a filter it would not be checked at all.
 
 [advisories]
 # Advisories are reported, but updates still respect the 14-day rule (R-90):

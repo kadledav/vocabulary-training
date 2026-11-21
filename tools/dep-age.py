@@ -37,9 +37,11 @@ deliberate shell obfuscation is out of scope (review covers that).
     - known install/download commands only in these forms: `apt-get update`,
       `rustup target add <target or "$VAR">`; other URLs and downloads
       (curl, wget, pip, …) are errors
-    - `ADD` from a URL only as `ADD --checksum=sha256:<hex> <GitHub release
-      asset URL> <dest>`: the checksum must equal GitHub's digest of the
-      asset, dated by the asset's upload                           -> GitHub API
+    - `ADD` from a URL only as `ADD --checksum=sha256:<hex> <URL> <dest>`
+      with a GitHub release asset URL (the checksum must equal GitHub's
+      digest of the asset; dated by the asset's upload) or a file of a
+      repository at a full commit SHA on raw.githubusercontent.com (the
+      content of a commit never changes; dated by the commit) -> GitHub API
 * everywhere: `cargo update|generate-lockfile|add` are errors, cargo commands
   that resolve dependencies must use `--locked`, `cargo --config` is an error;
   settings that redirect downloads (registry/source variables, CARGO_HOME,
@@ -363,6 +365,11 @@ GITHUB_RELEASE_ASSET = re.compile(
     r"^https://github\.com/(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/releases/download/"
     r"(?P<tag>[A-Za-z0-9_.+-]+)/(?P<asset>[A-Za-z0-9_.+-]+)$"
 )
+# a file of a GitHub repository at a commit (raw content of that commit).
+GITHUB_RAW_AT_COMMIT = re.compile(
+    r"^https://raw\.githubusercontent\.com/(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/"
+    r"(?P<sha>[0-9a-f]{40})/(?P<path>(?!\.)[A-Za-z0-9_.+-]+(?:/(?!\.)[A-Za-z0-9_.+-]+)*)$"
+)
 ADD_CHECKSUM = re.compile(r"^--checksum=sha256:(?P<sha256>[0-9a-f]{64})$")
 
 
@@ -384,19 +391,40 @@ def release_asset_published(repo: str, tag: str, asset: str, sha256: str) -> dt.
     return cached("release-asset", f"{repo}@{tag}/{asset}#{sha256}", lookup)
 
 
+def commit_published(repo: str, sha: str) -> dt.datetime:
+    """The committer date of a commit (its content never changes; a commit
+    whose date is faked into the past is out of scope, see the module
+    docstring)."""
+    def lookup() -> dt.datetime:
+        commit = github_api(f"/repos/{repo}/commits/{sha}")
+        if not isinstance(commit, dict) or commit.get("sha") != sha:
+            raise LookupFailed(f"commit {sha} not found in {repo}")
+        return parse_ts(commit["commit"]["committer"]["date"])
+
+    return cached("commit", f"{repo}@{sha}", lookup)
+
+
 def check_add_url(args: str, where: str, result: "Result") -> None:
-    """`ADD --checksum=sha256:<hex> <GitHub release asset URL> <dest>`: the
-    only form of ADD from a URL (the build verifies the checksum, the gate
-    compares it with GitHub's digest and dates the asset)."""
+    """`ADD --checksum=sha256:<hex> <URL> <dest>`, URL a GitHub release asset
+    or a file at a commit: the only forms of ADD from a URL (the build
+    verifies the checksum; the gate compares it with GitHub's digest of an
+    asset and dates the asset or the commit)."""
     words = args.split()
     flags = [w for w in words if w.startswith("--")]
     rest = [w for w in words if not w.startswith("--")]
     checksum = ADD_CHECKSUM.match(flags[0]) if len(flags) == 1 else None
     url = GITHUB_RELEASE_ASSET.match(rest[0]) if len(rest) == 2 else None
+    raw = GITHUB_RAW_AT_COMMIT.match(rest[0]) if len(rest) == 2 else None
+    if checksum and raw:
+        repo, sha = raw.group("repo"), raw.group("sha")
+        result.add("commit", f"{repo}/{raw.group('path')}", sha[:12],
+                   lambda: commit_published(repo, sha), where)
+        return
     if not checksum or not url:
         result.errors.append(
             f"{where}: ADD from a URL must be `ADD --checksum=sha256:<hex> "
-            f"https://github.com/<owner>/<repo>/releases/download/<tag>/<asset> <dest>`"
+            f"https://github.com/<owner>/<repo>/releases/download/<tag>/<asset> <dest>` or "
+            f"`… https://raw.githubusercontent.com/<owner>/<repo>/<commit sha>/<path> <dest>`"
         )
         return
     repo, tag, asset, sha256 = url.group("repo"), url.group("tag"), url.group("asset"), checksum.group("sha256")

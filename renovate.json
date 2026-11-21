@@ -104,18 +104,6 @@
     {
       "customType": "regex",
       "managerFilePatterns": [
-        "/^docker/Dockerfile\\.tts$/"
-      ],
-      "matchStrings": [
-        "ARG SHERPA_ONNX_VERSION=(?<currentValue>[0-9.]+)"
-      ],
-      "datasourceTemplate": "github-releases",
-      "depNameTemplate": "k2-fsa/sherpa-onnx",
-      "extractVersionTemplate": "^v(?<version>.+)$"
-    },
-    {
-      "customType": "regex",
-      "managerFilePatterns": [
         "/^\\.github/workflows/.+\\.ya?ml$/"
       ],
       "matchStrings": [

@@ -4,9 +4,13 @@
 //! * `POST /v1/speak` `{"text": "…", "voice": "af_heart", "speed": 1.0}`
 //!   (`voice` and `speed` optional) → `200 audio/mpeg` with `X-Duration-Ms`,
 //!   `X-Loudness-Lufs` (of the normalised audio before encoding) and
-//!   `X-Voice`; `400` invalid request/text/voice/speed, `413` body over
+//!   `X-Voice`, `X-Approximate` (words whose pronunciation is a guess: from
+//!   the fallback dictionary or spelled letter by letter), `X-Words-Spelled`,
+//!   `X-Frontend` and `X-Engine` (versions, for the app's clip identity);
+//!   `400` invalid request/text/voice/speed, `413` body over
 //!   4 KiB, `415` not JSON, `422` nothing speakable, `503` busy or timeout.
-//! * `GET /v1/voices` → the voices and their accents.
+//! * `GET /v1/voices` → the voices and their accents, and the front-end and
+//!   engine versions (the app's clip identity).
 //! * `GET /healthz` → `200` once the model is loaded (it is loaded before
 //!   the listener opens).
 //!
@@ -37,6 +41,8 @@ use serde::Deserialize;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 
+use crate::engine::ENGINE_VERSION;
+use crate::phonemize::FRONTEND_VERSION;
 use crate::speaker::{SpeakError, Speaker};
 use crate::speech::{Accent, SpeakText, Speed, Voice};
 
@@ -95,7 +101,12 @@ async fn voices() -> Response {
             serde_json::json!({ "id": voice.id(), "accent": accent, "default": voice == Voice::DEFAULT })
         })
         .collect();
-    Json(serde_json::json!({ "voices": voices })).into_response()
+    Json(serde_json::json!({
+        "voices": voices,
+        "frontend": FRONTEND_VERSION,
+        "engine": ENGINE_VERSION,
+    }))
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -148,7 +159,9 @@ async fn speak(
                 text_sha256 = %fingerprint,
                 voice = voice.id(),
                 phonemes = spoken.phoneme_symbols,
-                spelled_out = spoken.spelled_out,
+                derived = spoken.tally.derived,
+                fallback = spoken.tally.fallback,
+                spelled_out = spoken.tally.spelled,
                 audio_ms = spoken.clip.duration_ms(),
                 loudness_lufs = format!("{:.1}", spoken.clip.loudness_lufs()),
                 mp3_bytes = spoken.clip.mp3().len(),
@@ -158,6 +171,7 @@ async fn speak(
             );
             let duration = spoken.clip.duration_ms();
             let loudness = format!("{:.1}", spoken.clip.loudness_lufs());
+            let tally = spoken.tally;
             let mut response = spoken.clip.into_mp3().into_response();
             let headers = response.headers_mut();
             headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("audio/mpeg"));
@@ -166,6 +180,10 @@ async fn speak(
                 headers.insert("x-loudness-lufs", value);
             }
             headers.insert("x-voice", HeaderValue::from_static(voice.id()));
+            headers.insert("x-approximate", HeaderValue::from(tally.approximate()));
+            headers.insert("x-words-spelled", HeaderValue::from(tally.spelled));
+            headers.insert("x-frontend", HeaderValue::from_static(FRONTEND_VERSION));
+            headers.insert("x-engine", HeaderValue::from_static(ENGINE_VERSION));
             response
         }
         Err(SpeakError::NothingToSay) => error(

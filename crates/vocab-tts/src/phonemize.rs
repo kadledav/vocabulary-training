@@ -11,12 +11,16 @@
 //! So the text is split into words and pauses here, every word is looked up
 //! in the lexicon of the voice's accent (Kokoro v1.0's `lexicon-us-en.txt` /
 //! `lexicon-gb-en.txt`, misaki phonemes), and words that are not in it get,
-//! in this order: numbers read as words, accents folded, the possessive and
-//! the regular suffixes (-s, -ed, -ing, -ly) derived from the stem,
-//! hyphenated parts looked up one by one, and finally letter-by-letter
-//! spelling (counted, so a log line can say how many words were spelled).
-//! The engine receives only phoneme symbols of its own symbol table.
+//! in this order: numbers read as words, accents folded, the fallback
+//! dictionary (CMUdict, converted to misaki notation per accent, see
+//! `arpabet`), the possessive and the regular suffixes (-s, -ed, -ing, -ly)
+//! derived from a known stem, hyphenated parts looked up one by one, and
+//! finally letter-by-letter spelling. Every word is counted by where its
+//! pronunciation came from ([`Tally`]): the API tells the app whether a clip
+//! is approximate. The engine receives only phoneme symbols of its own
+//! symbol table.
 
+mod arpabet;
 mod numbers;
 
 use std::collections::{HashMap, HashSet};
@@ -32,6 +36,12 @@ use crate::speech::{Accent, SpeakText};
 const US_LEXICON: &str = "lexicon-us-en.txt";
 const GB_LEXICON: &str = "lexicon-gb-en.txt";
 const SYMBOLS: &str = "tokens.txt";
+/// The fallback dictionary (CMUdict, ARPAbet).
+const FALLBACK: &str = "cmudict.dict";
+/// Version of this front-end: part of the app's clip identity, so a change
+/// in how text becomes phonemes regenerates the clips. Bump it with every
+/// change of the rules or the dictionaries.
+pub const FRONTEND_VERSION: &str = "g2p-2";
 /// Phoneme symbols per chunk the engine synthesises in one pass; Kokoro's
 /// context is 510 symbols, and shorter chunks keep the prosody stable.
 const MAX_CHUNK_SYMBOLS: usize = 300;
@@ -130,10 +140,18 @@ pub fn parse_symbols(text: &str) -> Result<HashSet<char>, FormatError> {
     Ok(symbols)
 }
 
+/// The dictionaries of one accent: the Kokoro lexicon and, for words it
+/// lacks, the fallback dictionary (only entries the lexicon does not have).
+#[derive(Debug)]
+struct Dictionaries {
+    lexicon: Lexicon,
+    fallback: Lexicon,
+}
+
 /// Text to phonemes, for both accents.
 pub struct Phonemizer {
-    us: Lexicon,
-    gb: Lexicon,
+    us: Dictionaries,
+    gb: Dictionaries,
     symbols: HashSet<char>,
 }
 
@@ -147,13 +165,34 @@ impl fmt::Debug for Phonemizer {
     }
 }
 
+/// Where the pronunciations of a text's words came from (word counts).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Tally {
+    /// From the voice's own lexicon (also numbers read as words).
+    pub lexicon: usize,
+    /// A regular inflection (-s, -ed, -ing, -ly, possessive) of a known stem.
+    pub derived: usize,
+    /// From the fallback dictionary (CMUdict, mapped to the accent).
+    pub fallback: usize,
+    /// Not found anywhere: spoken letter by letter.
+    pub spelled: usize,
+}
+
+impl Tally {
+    /// Words whose pronunciation is a guess rather than a dictionary entry
+    /// for this accent: fallback-dictionary words and spelled words.
+    pub fn approximate(&self) -> usize {
+        self.fallback + self.spelled
+    }
+}
+
 /// The phonemes of one text: chunks the engine speaks one after another.
 ///
 /// Phonemes reveal the text, so `Debug` shows only sizes.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Phonemes {
     chunks: Vec<String>,
-    spelled_out: usize,
+    tally: Tally,
 }
 
 impl fmt::Debug for Phonemes {
@@ -163,7 +202,7 @@ impl fmt::Debug for Phonemes {
             "Phonemes({} chunks, {} symbols, {} spelled out)",
             self.chunks.len(),
             self.symbol_count(),
-            self.spelled_out
+            self.tally.spelled
         )
     }
 }
@@ -173,9 +212,14 @@ impl Phonemes {
         &self.chunks
     }
 
-    /// Words that were not in the lexicon and are spoken letter by letter.
+    /// Words that were not in any dictionary and are spoken letter by letter.
     pub fn spelled_out(&self) -> usize {
-        self.spelled_out
+        self.tally.spelled
+    }
+
+    /// Where the words' pronunciations came from.
+    pub fn tally(&self) -> Tally {
+        self.tally
     }
 
     pub fn is_empty(&self) -> bool {
@@ -196,8 +240,37 @@ enum Piece {
 }
 
 impl Phonemizer {
+    /// The Kokoro lexicons of both accents, no fallback dictionary.
     pub fn new(us: Lexicon, gb: Lexicon, symbols: HashSet<char>) -> Self {
-        Self { us, gb, symbols }
+        let empty = || Lexicon {
+            entries: HashMap::new(),
+        };
+        Self {
+            us: Dictionaries {
+                lexicon: us,
+                fallback: empty(),
+            },
+            gb: Dictionaries {
+                lexicon: gb,
+                fallback: empty(),
+            },
+            symbols,
+        }
+    }
+
+    /// Add the fallback dictionary (CMUdict text): for each accent the
+    /// entries its lexicon lacks, converted to misaki notation.
+    pub fn with_fallback(mut self, cmudict: &str) -> Self {
+        for (dictionaries, accent) in [(&mut self.us, Accent::Us), (&mut self.gb, Accent::Gb)] {
+            for line in cmudict.lines() {
+                if let Some((word, phonemes)) = arpabet::entry(line, accent)
+                    && dictionaries.lexicon.get(&word).is_none()
+                {
+                    dictionaries.fallback.entries.insert(word, phonemes);
+                }
+            }
+        }
+        self
     }
 
     /// Load both lexicons and the symbol table from the model directory.
@@ -224,16 +297,25 @@ impl Phonemizer {
         let gb = Lexicon::parse(&text).map_err(format(path))?;
         let (path, text) = read(SYMBOLS)?;
         let symbols = parse_symbols(&text).map_err(format(path))?;
-        Ok(Self::new(us, gb, symbols))
+        let (_, cmudict) = read(FALLBACK)?;
+        Ok(Self::new(us, gb, symbols).with_fallback(&cmudict))
+    }
+
+    /// Entries of the fallback dictionaries (US, UK), for the start log.
+    pub fn fallback_sizes(&self) -> (usize, usize) {
+        (
+            self.us.fallback.entries.len(),
+            self.gb.fallback.entries.len(),
+        )
     }
 
     /// The phonemes of `text` in the given accent.
     pub fn phonemize(&self, text: &SpeakText, accent: Accent) -> Phonemes {
-        let lexicon = match accent {
+        let dictionaries = match accent {
             Accent::Us => &self.us,
             Accent::Gb => &self.gb,
         };
-        let mut spelled_out = 0;
+        let mut tally = Tally::default();
         let mut chunks = Vec::new();
         let mut current = String::new();
         let mut current_len = 0;
@@ -241,7 +323,7 @@ impl Phonemizer {
             match piece {
                 Piece::Word(word) => {
                     let phonemes =
-                        self.known(&word_phonemes(lexicon, accent, &word, &mut spelled_out));
+                        self.known(&word_phonemes(dictionaries, accent, &word, &mut tally));
                     let len = phonemes.chars().count();
                     if len == 0 {
                         continue;
@@ -273,10 +355,7 @@ impl Phonemizer {
         if current_len > 0 {
             chunks.push(current);
         }
-        Phonemes {
-            chunks,
-            spelled_out,
-        }
+        Phonemes { chunks, tally }
     }
 
     /// `phonemes` without symbols the model does not know.
@@ -352,9 +431,23 @@ fn pieces(text: &str) -> Vec<Piece> {
     out
 }
 
+/// How one word's pronunciation was found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    Lexicon,
+    Derived,
+    Fallback,
+}
+
 /// The phonemes of one word (several words, separated by spaces, for a
-/// number or a hyphenated compound); empty if nothing in it is speakable.
-fn word_phonemes(lexicon: &Lexicon, accent: Accent, raw: &str, spelled_out: &mut usize) -> String {
+/// number or a hyphenated compound), counted in `tally`; empty if nothing
+/// in it is speakable.
+fn word_phonemes(
+    dictionaries: &Dictionaries,
+    accent: Accent,
+    raw: &str,
+    tally: &mut Tally,
+) -> String {
     let word = raw.trim_matches(|c| c == '\'' || c == '-').to_lowercase();
     if word.is_empty() {
         return String::new();
@@ -362,59 +455,106 @@ fn word_phonemes(lexicon: &Lexicon, accent: Accent, raw: &str, spelled_out: &mut
     if let Some(words) = numbers::words(&word) {
         let said: Vec<String> = words
             .iter()
-            .map(|w| lookup(lexicon, accent, w).unwrap_or_else(|| spell(lexicon, w)))
+            .map(|w| {
+                lookup(dictionaries, accent, w)
+                    .map(|(p, _)| p)
+                    .unwrap_or_else(|| spell(dictionaries, w))
+            })
             .collect();
+        tally.lexicon += 1;
         return said.join(" ");
     }
-    if let Some(phonemes) = lookup(lexicon, accent, &word) {
+    if let Some((phonemes, source)) = lookup(dictionaries, accent, &word) {
+        match source {
+            Source::Lexicon => tally.lexicon += 1,
+            Source::Derived => tally.derived += 1,
+            Source::Fallback => tally.fallback += 1,
+        }
         return phonemes;
     }
     if word.contains('-') {
         let parts: Vec<String> = word
             .split('-')
             .filter(|p| !p.is_empty())
-            .map(|part| word_phonemes(lexicon, accent, part, spelled_out))
+            .map(|part| word_phonemes(dictionaries, accent, part, tally))
             .filter(|p| !p.is_empty())
             .collect();
         return parts.join(" ");
     }
-    let spelled = spell(lexicon, &word);
+    if let Some(phonemes) = compound(dictionaries, accent, &word) {
+        tally.fallback += 1;
+        return phonemes;
+    }
+    let spelled = spell(dictionaries, &word);
     if !spelled.is_empty() {
-        *spelled_out += 1;
+        tally.spelled += 1;
     }
     spelled
 }
 
-/// A word from the lexicon, directly or derived (accents folded,
-/// possessive, regular suffixes).
-fn lookup(lexicon: &Lexicon, accent: Accent, word: &str) -> Option<String> {
-    if let Some(p) = lexicon.get(word) {
-        return Some(p.to_owned());
+/// Shortest part of a compound ("mash" + "up"): shorter pieces would split
+/// unknown names into accidental words.
+const MIN_COMPOUND_PART: usize = 3;
+
+/// An unknown word as two known words written together ("mashup",
+/// "doorkeeper"): the split with the longest known first part. The second
+/// part's primary stress becomes secondary.
+fn compound(dictionaries: &Dictionaries, accent: Accent, word: &str) -> Option<String> {
+    let chars: Vec<char> = word.chars().collect();
+    if chars.len() < 2 * MIN_COMPOUND_PART || !chars.iter().all(|c| c.is_ascii_alphabetic()) {
+        return None;
     }
+    (MIN_COMPOUND_PART..=chars.len() - MIN_COMPOUND_PART)
+        .rev()
+        .find_map(|split| {
+            let (head, tail) = word.split_at(split);
+            let (first, _) = lookup(dictionaries, accent, head)?;
+            let (second, _) = lookup(dictionaries, accent, tail)?;
+            Some(format!("{first}{}", second.replace('ˈ', "ˌ")))
+        })
+}
+
+/// A word from the dictionaries, with its source, in this order: the
+/// lexicon (also with accents folded), a regular inflection of a lexicon
+/// stem, the fallback dictionary, an inflection of a fallback stem.
+fn lookup(dictionaries: &Dictionaries, accent: Accent, word: &str) -> Option<(String, Source)> {
     let folded = fold_accents(word);
-    if folded != word
-        && let Some(p) = lexicon.get(&folded)
-    {
-        return Some(p.to_owned());
+    for key in [word, folded.as_str()] {
+        if let Some(p) = dictionaries.lexicon.get(key) {
+            return Some((p.to_owned(), Source::Lexicon));
+        }
     }
-    if let Some(stem) = folded.strip_suffix("'s") {
-        let base = lookup_stem(lexicon, stem)?;
-        return Some(format!("{base}{}", plural_ending(&base, accent)));
+    let inflected = |stems_from: Source| -> Option<String> {
+        let stem = |s: &str| match stems_from {
+            Source::Fallback => dictionaries.fallback.get(s),
+            _ => dictionaries.lexicon.get(s),
+        };
+        match folded.strip_suffix("'s") {
+            Some(base) => stem(base).map(|b| format!("{b}{}", plural_ending(b, accent))),
+            None => derived(&stem, accent, &folded),
+        }
+    };
+    if let Some(p) = inflected(Source::Lexicon) {
+        return Some((p, Source::Derived));
     }
-    derived(lexicon, accent, &folded)
+    for key in [word, folded.as_str()] {
+        if let Some(p) = dictionaries.fallback.get(key) {
+            return Some((p.to_owned(), Source::Fallback));
+        }
+    }
+    inflected(Source::Fallback).map(|p| (p, Source::Fallback))
 }
 
-/// A stem as it is in the lexicon (no further derivation).
-fn lookup_stem(lexicon: &Lexicon, stem: &str) -> Option<String> {
-    lexicon.get(stem).map(str::to_owned)
-}
-
-/// Regular inflections and -ly of a stem that is in the lexicon.
-fn derived(lexicon: &Lexicon, accent: Accent, word: &str) -> Option<String> {
+/// Regular inflections and -ly of a stem that `stem` knows.
+fn derived<'a>(
+    stem: &dyn Fn(&str) -> Option<&'a str>,
+    accent: Accent,
+    word: &str,
+) -> Option<String> {
     let first = |stems: &[String]| {
         stems
             .iter()
-            .find_map(|s| (s.len() > 1).then(|| lookup_stem(lexicon, s)).flatten())
+            .find_map(|s| (s.len() > 1).then(|| stem(s)).flatten())
     };
     if let Some(rest) = word.strip_suffix("ing") {
         let mut stems = vec![rest.to_owned(), format!("{rest}e")];
@@ -434,7 +574,7 @@ fn derived(lexicon: &Lexicon, accent: Accent, word: &str) -> Option<String> {
             stems.push(undoubled);
         }
         if let Some(base) = first(&stems) {
-            return Some(format!("{base}{}", past_ending(&base, accent)));
+            return Some(format!("{base}{}", past_ending(base, accent)));
         }
     }
     if let Some(rest) = word.strip_suffix("ly") {
@@ -458,7 +598,7 @@ fn derived(lexicon: &Lexicon, accent: Accent, word: &str) -> Option<String> {
             }
         }
         if let Some(base) = first(&stems) {
-            return Some(format!("{base}{}", plural_ending(&base, accent)));
+            return Some(format!("{base}{}", plural_ending(base, accent)));
         }
     }
     None
@@ -513,7 +653,7 @@ fn fold_accents(word: &str) -> String {
 
 /// Letter by letter, with the lexicon's letter names (digits as numbers);
 /// other characters are skipped.
-fn spell(lexicon: &Lexicon, word: &str) -> String {
+fn spell(dictionaries: &Dictionaries, word: &str) -> String {
     let names: Vec<&str> = fold_accents(word)
         .chars()
         .filter_map(|c| {
@@ -521,7 +661,7 @@ fn spell(lexicon: &Lexicon, word: &str) -> String {
                 Some(d) => numbers::words(&d.to_string())?.into_iter().next()?,
                 None => c.to_string(),
             };
-            lexicon.get(&name)
+            dictionaries.lexicon.get(&name)
         })
         .collect();
     names.join(" ")
@@ -578,7 +718,7 @@ a ˈ A
             .collect();
         set.extend([
             ' ', ',', '.', '!', '?', ';', ':', '—', '…', 'ᵻ', 'ɪ', 'ŋ', 'z', 's', 'd', 't', 'l',
-            'i',
+            'i', 'u',
         ]);
         set
     }
@@ -636,6 +776,53 @@ a ˈ A
         let p = us("Zxc cat");
         assert_eq!(p.chunks(), ["zˈi ˈɛks sˈi kˈæt"]);
         assert_eq!(p.spelled_out(), 1);
+    }
+
+    #[test]
+    fn r40_fallback_dictionary_covers_words_the_lexicon_lacks() {
+        let cmu = "zxc Z IH1 K S\nsusurrus S UW0 S ER1 AH0 S\ncat K AA1 T\n";
+        let p = phonemizer().with_fallback(cmu);
+        let text = SpeakText::new("Zxc susurruses cat").expect("test setup");
+        let us = p.phonemize(&text, Accent::Us);
+        // "cat" stays the lexicon's; the fallback only fills gaps.
+        assert_eq!(us.chunks(), ["zˈɪks susˈɜɹəsᵻz kˈæt"]);
+        assert_eq!(
+            us.tally(),
+            Tally {
+                lexicon: 1,
+                derived: 0,
+                fallback: 2,
+                spelled: 0
+            }
+        );
+        assert_eq!(us.tally().approximate(), 2);
+        let gb = p.phonemize(&text, Accent::Gb);
+        assert_eq!(gb.chunks()[0].split(' ').next(), Some("zˈɪks"));
+        assert_eq!(p.fallback_sizes(), (2, 3));
+    }
+
+    #[test]
+    fn r40_unknown_compounds_are_split_into_known_words() {
+        let p = us("catdog dogcats");
+        assert_eq!(p.chunks(), ["kˈætdˌɔɡ dˈɔɡkˌæts"]);
+        assert_eq!(p.tally().fallback, 2);
+        // Parts shorter than three letters are not words of a compound.
+        assert_eq!(us("catz").tally().spelled, 1);
+    }
+
+    #[test]
+    fn r40_tally_counts_lexicon_derived_and_spelled_words() {
+        let p = us("The dogs walked, zxc 1990.");
+        assert_eq!(
+            p.tally(),
+            Tally {
+                lexicon: 2,
+                derived: 2,
+                fallback: 0,
+                spelled: 1
+            }
+        );
+        assert_eq!(p.tally().approximate(), 1);
     }
 
     #[test]

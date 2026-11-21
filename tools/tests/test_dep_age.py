@@ -111,7 +111,7 @@ class FakeRegistries:
             name: getattr(dep_age, name)
             for name in (
                 "crate_published", "npm_published", "rust_published", "node_published", "action_published",
-                "image_published", "debian_published", "release_asset_published",
+                "image_published", "debian_published", "release_asset_published", "commit_published",
             )
         }
         dep_age.crate_published = lambda n, v: self._date(n, v)
@@ -122,6 +122,7 @@ class FakeRegistries:
         dep_age.image_published = lambda name, digest: self._date(name, digest)
         dep_age.debian_published = lambda pkg, version: self._date(pkg, version)
         dep_age.release_asset_published = lambda repo, tag, asset, sha256: self._date(asset, tag, sha256)
+        dep_age.commit_published = lambda repo, sha: self._date(repo, sha)
         return self
 
     def __exit__(self, *exc):
@@ -540,6 +541,20 @@ class ActionDates(unittest.TestCase):
             self.run_with(r)
 
 
+class CommitDates(unittest.TestCase):
+    def test_r90_commit_date_and_existence(self):
+        saved, saved_cache = dep_age.github_api, dep_age.cache_enabled
+        dep_age.cache_enabled = False
+        try:
+            dep_age.github_api = lambda path: {"sha": SHA, "commit": {"committer": {"date": "2025-10-24T17:40:26Z"}}}
+            self.assertEqual(dep_age.commit_published("o/r", SHA).isoformat(), "2025-10-24T17:40:26+00:00")
+            dep_age.github_api = lambda path: {"sha": "0" * 40, "commit": {"committer": {"date": "2025-10-24T17:40:26Z"}}}
+            with self.assertRaises(dep_age.LookupFailed):
+                dep_age.commit_published("o/r", SHA)
+        finally:
+            dep_age.github_api, dep_age.cache_enabled = saved, saved_cache
+
+
 class ReleaseAssetDates(unittest.TestCase):
     """release_asset_published: GitHub's digest must be the pinned checksum;
     the age is the asset's upload (a re-upload counts)."""
@@ -731,6 +746,23 @@ class Dockerfiles(RepoCase):
         young = self.dockerfile(CLEAN_DOCKERFILE + f"ADD --checksum=sha256:{DIGEST} {url} /archives/\n",
                                 young={"lib-linux-x64.tar.bz2"})
         self.assertIn(YOUNG, {f.published for f in young.findings if f.kind == "asset"})
+
+    def test_r90_add_of_a_checksum_pinned_file_at_a_commit_is_dated(self):
+        url = f"https://raw.githubusercontent.com/o/dict/{SHA}/data/words.dict"
+        result = self.dockerfile(CLEAN_DOCKERFILE + f"ADD --checksum=sha256:{DIGEST} {url} /archives/\n")
+        self.assertEqual(result.errors, [])
+        commits = [(f.name, f.version) for f in result.findings if f.kind == "commit"]
+        self.assertEqual(commits, [("o/dict/data/words.dict", SHA[:12])])
+        young = self.dockerfile(CLEAN_DOCKERFILE + f"ADD --checksum=sha256:{DIGEST} {url} /archives/\n", young={"o/dict"})
+        self.assertIn(YOUNG, {f.published for f in young.findings if f.kind == "commit"})
+        for bad in [f"https://raw.githubusercontent.com/o/dict/master/words.dict",
+                    f"https://raw.githubusercontent.com/o/dict/{SHA[:12]}/words.dict",
+                    f"https://raw.githubusercontent.com/o/dict/{SHA}/../x"]:
+            with self.subTest(bad):
+                self.assertError(self.dockerfile(CLEAN_DOCKERFILE + f"ADD --checksum=sha256:{DIGEST} {bad} /x\n"),
+                                 "ADD from a URL must be")
+        no_checksum = self.dockerfile(CLEAN_DOCKERFILE + f"ADD {url} /x\n")
+        self.assertError(no_checksum, "ADD from a URL must be")
 
     def test_r90_add_from_a_url_without_checksum_or_from_elsewhere_is_rejected(self):
         url = "https://github.com/o/r/releases/download/v1/a.tar.gz"

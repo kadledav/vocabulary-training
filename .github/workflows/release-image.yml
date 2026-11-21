@@ -1,4 +1,5 @@
-# One platform of the release image (called by release.yml): build it once,
+# One platform of one release image (called by release.yml; `kind` is the
+# app image `server` or the TTS image `tts`): build it once,
 # natively on a runner of that platform, with SLSA provenance (mode=max) and
 # an SBOM; push it by digest only (no tag); pull that digest back and run the
 # smoke tests on it. Its digest is the output; release.yml merges the tested
@@ -9,6 +10,10 @@ name: Release image (one platform)
 on:
   workflow_call:
     inputs:
+      kind:
+        description: server (ghcr.io/kadledav/vocabulary-training) or tts (…-tts)
+        type: string
+        required: true
       platform:
         description: linux/amd64 or linux/arm64
         type: string
@@ -37,7 +42,7 @@ jobs:
       contents: read
       packages: write
     outputs:
-      digest: ${{ steps.build.outputs.digest }}
+      digest: ${{ steps.server.outputs.digest || steps.tts.outputs.digest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -51,8 +56,11 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build once and push by digest
-        id: build
+      # Two literal build steps (dep-age verifies every Dockerfile a
+      # workflow builds by its literal `file:`); exactly one runs.
+      - name: Build once and push by digest (server)
+        id: server
+        if: inputs.kind == 'server'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -65,8 +73,38 @@ jobs:
           labels: |
             org.opencontainers.image.version=${{ inputs.number }}
             org.opencontainers.image.revision=${{ github.sha }}
+      # The TTS crate's tests, natively on this platform, linked against the
+      # checksum-verified sherpa-onnx libraries (the `test` stage is not part
+      # of the image).
+      - name: vocab-tts tests (Dockerfile.tts, target test)
+        if: inputs.kind == 'tts'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: docker/Dockerfile.tts
+          platforms: ${{ inputs.platform }}
+          target: test
+          push: false
+          provenance: false
+          sbom: false
+      - name: Build once and push by digest (TTS)
+        id: tts
+        if: inputs.kind == 'tts'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: docker/Dockerfile.tts
+          platforms: ${{ inputs.platform }}
+          outputs: type=image,name=ghcr.io/kadledav/vocabulary-training-tts,push-by-digest=true,name-canonical=true,push=true
+          provenance: mode=max
+          sbom: generator=docker/buildkit-syft-scanner:1.12.1@sha256:873a7458c3c8ac8e32c7b796c10e1600b07b963d2aa000a72a2d97aaaa2d6315
+          labels: |
+            org.opencontainers.image.version=${{ inputs.number }}
+            org.opencontainers.image.revision=${{ github.sha }}
       - name: Smoke-test the pushed digest on this platform
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
+          DIGEST: ${{ steps.server.outputs.digest || steps.tts.outputs.digest }}
           PLATFORM: ${{ inputs.platform }}
-        run: python3 tools/release-promote.py smoke --repository ghcr.io/kadledav/vocabulary-training --digest "$DIGEST" --platform "$PLATFORM"
+          REPOSITORY: ${{ inputs.kind == 'tts' && 'ghcr.io/kadledav/vocabulary-training-tts' || 'ghcr.io/kadledav/vocabulary-training' }}
+          TOOL: ${{ inputs.kind == 'tts' && 'tts-smoke' || 'image-smoke' }}
+        run: python3 tools/release-promote.py smoke --repository "$REPOSITORY" --digest "$DIGEST" --platform "$PLATFORM" --tool "$TOOL"

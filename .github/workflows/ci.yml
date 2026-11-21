@@ -63,19 +63,19 @@ jobs:
         run: rustup toolchain install && rustc --version && cargo clippy --version
       - name: cargo fmt
         run: cargo fmt --all --check
-      # vocab-tts links the sherpa-onnx static libraries. Their build script
-      # would download them (unverified) unless SHERPA_ONNX_LIB_DIR is set;
-      # an empty directory is enough to check the code (clippy links
-      # nothing). Its tests run in the tts-image job, linked against the
-      # checksum-verified libraries of docker/Dockerfile.tts.
-      - name: No download of the sherpa-onnx libraries
-        run: mkdir -p "$RUNNER_TEMP/no-sherpa-libs" && echo "SHERPA_ONNX_LIB_DIR=$RUNNER_TEMP/no-sherpa-libs" >> "$GITHUB_ENV"
       - name: cargo clippy (all features)
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: cargo clippy (default features)
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: cargo test (vocab-tts in the tts-image job)
-        run: cargo test --workspace --exclude vocab-tts --locked
+      # vocab-tts's Kokoro engine (only with --cfg vocab_tts_engine) links the
+      # sherpa-onnx static libraries, whose build script would download them
+      # (unverified) unless SHERPA_ONNX_LIB_DIR is set: an empty directory is
+      # enough to check the code (clippy links nothing). The engine's tests
+      # run in the tts-image job against the checksum-verified libraries.
+      - name: cargo clippy (vocab-tts with the engine)
+        run: mkdir -p "$RUNNER_TEMP/no-sherpa-libs" && SHERPA_ONNX_LIB_DIR="$RUNNER_TEMP/no-sherpa-libs" RUSTFLAGS="--cfg vocab_tts_engine" cargo clippy -p vocab-tts --all-targets --locked -- -D warnings
+      - name: cargo test
+        run: cargo test --workspace --locked
 
   web:
     name: web (typecheck, unit tests)
