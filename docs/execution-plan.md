@@ -1,6 +1,6 @@
 # Execution Plan — phase 1
 
-Status: **v0.1.0 released and deployed (2026-11-21); v0.1.1 committed, waiting for the owner to push and tag** — review round 1 (4 whole-project reviews → fix rounds A/B/C) plus the owner's first feedback. Next: M6 (neural TTS; phase 1 = TTS service in progress on branch `m6-tts`). Single branch `main`.
+Status: **v0.1.0 deployed; v0.1.1 committed on `main` (owner pushes and tags); M6 neural TTS finished and reviewed on branch `m6-tts` as v0.2.0, waiting for v0.1.1 to be released first** — then merge `m6-tts` into `main`, push, CI (first amd64 build of the TTS image), tag v0.2.0. Remaining milestones: M7–M12.
 Guarantor: Claude (main session). The guarantor does not write application code; it briefs agents, runs verification commands, reviews, and decides.
 
 Inputs: `docs/requirements.md` (v1.0) · `docs/design/architecture.md` (after guarantor review) · `docs/research/training-ui.md` · `docs/claude-export-instructions.md` · `docs/vocab-pack.schema.json`
@@ -105,6 +105,7 @@ Estimate: design 0.2–0.4 M tokens · implementation 3–6 M · testing 0.5–1
 | 2026-11-20 | Whole-project review on the new model: backend logic, security/deployment, frontend/UX, supply chain/CI/release (4 agents). Public history rewritten (infrastructure names → placeholders, two book quotes, owner vocabulary in the research doc) and force-pushed; CI on the cleaned main all green incl. the image job | | |
 | 2026-11-21 | v0.1.0 tagged, released (first run of the release workflow) and deployed by the owner | | |
 | 2026-11-21 | Fix rounds A (app logic + security, 17 items), B (tooling, CI, multi-arch release, licences, 8 items), C (frontend, 13 bugs + 8 usability) + owner feedback (R-63 extra practice, learn more new words, new/day up to 100, zip/multi-file import, iOS audio hint). Independent review of round A (migration 0005 on deployed data): 6 follow-ups fixed. Gates: 466 Rust, 141 tool tests, 58 node, 183 Playwright (3 clean runs), licences ok, repo-guard ok, local arm64 image build + smoke ok (dep-age: 0 too young; action lookups rate-limited locally → CI). Committed as v0.1.1 | | owner: push main + tag v0.1.1 |
+| 2026-11-21 | M6 on branch `m6-tts` (separate worktree, all on Opus): phase 1 TTS service (Kokoro fp32 via sherpa-onnx 2.0.1, own phonemiser because espeak-ng is gone → image is not GPL), phase 2 merge of v0.1.1 + server audio module, media-element playback, CMUdict fallback, release pipeline for the second image. Testing agent: 36 contract tests, 1 defect; bug review with the real image: 9 confirmed (2 high: OOM by one long token, crash-looping clip blocks the queue) + 4 follow-ups, all fixed. Guarantor check of the branch: 575 Rust, 166 tool tests, repo-guard and licences ok; agent: e2e 215 ×2, TTS smoke 62 checks, two-container run ok (arm64) | new week 2 % | amd64 + CI + release of the TTS image unverified until pushed; real iPhone unverified |
 
 ### Resume notes for M5
 - Docker is not installed on the Mac: image build and smoke tests run only in GitHub Actions → the owner pushes, guarantor reads CI results.
