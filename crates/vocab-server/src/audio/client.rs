@@ -23,10 +23,13 @@ const MAX_HEAD: usize = 16 * 1024;
 pub const MAX_CLIP_BYTES: usize = 1024 * 1024;
 const MAX_JSON_BYTES: usize = 64 * 1024;
 const VOICES_TIMEOUT: Duration = Duration::from_secs(10);
-/// Longer than the service's own request timeout (60 s): a slow synthesis
-/// ends with the service's `503 timeout` (and the service cancels the
-/// work), not with this side hanging up first.
-const SPEAK_TIMEOUT: Duration = Duration::from_secs(75);
+/// Longer than the service's own request timeout (600 s; the longest text
+/// on a slow CPU limited to half a core, plus loading the model): a slow
+/// synthesis ends with the service's `503 timeout` (and the service cancels
+/// the work), not with this side hanging up first.
+const SPEAK_TIMEOUT: Duration = Duration::from_secs(630);
+/// The service's error code when its engine process died on the text.
+const ENGINE_CRASHED: &str = "engine_crashed";
 
 /// The configured TTS service.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,7 +147,8 @@ pub enum CallError {
     #[error("{0}")]
     Temporary(String),
     /// The request was sent, then the connection died without a complete
-    /// answer: the service may have crashed on this text.
+    /// answer, or the service says its engine process died on this text
+    /// (`500 engine_crashed`): this text may crash it.
     #[error("connection dropped: {0}")]
     Dropped(String),
     /// The service refused this text for good (4xx): its error code.
@@ -304,6 +308,9 @@ fn error_code(body: &[u8]) -> String {
 fn check_status(response: &Response) -> Result<(), CallError> {
     match response.status {
         200 => Ok(()),
+        500 if error_code(&response.body) == ENGINE_CRASHED => {
+            Err(dropped(format!("500 {ENGINE_CRASHED}")))
+        }
         400..=499 if response.status != 408 && response.status != 429 => Err(CallError::Refused(
             format!("{} {}", response.status, error_code(&response.body)),
         )),
@@ -476,6 +483,39 @@ mod tests {
         ] {
             assert_eq!(TtsEndpoint::parse(bad), Err(EndpointError::Format), "{bad}");
         }
+    }
+
+    fn response(status: u16, body: &str) -> Response {
+        Response {
+            status,
+            headers: Vec::new(),
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn r83_status_codes_map_to_retry_refusal_or_crash() {
+        let crashed = r#"{"error":{"code":"engine_crashed"}}"#;
+        let failed = r#"{"error":{"code":"synthesis_failed"}}"#;
+        let busy = r#"{"error":{"code":"busy"}}"#;
+        let refused = r#"{"error":{"code":"too_long_to_speak"}}"#;
+        assert_eq!(check_status(&response(200, "")), Ok(()));
+        assert!(matches!(
+            check_status(&response(500, crashed)),
+            Err(CallError::Dropped(_))
+        ));
+        assert!(matches!(
+            check_status(&response(500, failed)),
+            Err(CallError::Temporary(_))
+        ));
+        assert!(matches!(
+            check_status(&response(503, busy)),
+            Err(CallError::Temporary(_))
+        ));
+        assert_eq!(
+            check_status(&response(422, refused)),
+            Err(CallError::Refused("422 too_long_to_speak".to_owned()))
+        );
     }
 
     #[test]

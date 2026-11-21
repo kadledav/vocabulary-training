@@ -57,6 +57,14 @@ async fn speak(State(fake): State<Arc<Fake>>, Json(body): Json<Value>) -> Respon
         )
             .into_response();
     }
+    if text.contains("crashing") {
+        // The service's engine process died on this text (e.g. OOM-killed).
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": {"code": "engine_crashed"}})),
+        )
+            .into_response();
+    }
     if text.contains("refuse") {
         return (
             StatusCode::BAD_REQUEST,
@@ -335,6 +343,33 @@ async fn r40_failures_are_retried_with_backoff_and_refusals_fail_at_once() {
     assert_eq!(
         env.int("SELECT COUNT(*) FROM audio_clip WHERE last_error LIKE '%refuse%'"),
         0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r83_a_text_that_crashes_the_engine_process_fails_after_three_crashes() {
+    let (_fake, endpoint) = fake_tts().await;
+    let env = env_with_audio(tempfile::tempdir().expect("tempdir"), START, Some(endpoint));
+    let audio = env.audio.clone().expect("audio");
+    let mut crashing = word("crashword", 5, 0);
+    crashing["speak"] = json!("a crashing text");
+    env.import("test-audio-book", vec![crashing]).await;
+    audio.sync().await.expect("sync");
+    for (crashes, later) in [(1, "2026-11-20T09:00:31Z"), (2, "2026-11-20T09:02:32Z")] {
+        assert_eq!(audio.work_one().await.expect("work"), Step::Worked);
+        assert_eq!(
+            env.int(&format!(
+                "SELECT COUNT(*) FROM audio_clip WHERE status = 'pending' AND crashes = {crashes}"
+            )),
+            1
+        );
+        assert_eq!(audio.work_one().await.expect("work"), Step::Idle);
+        env.set_time(later);
+    }
+    assert_eq!(audio.work_one().await.expect("work"), Step::Worked);
+    assert_eq!(
+        env.int("SELECT COUNT(*) FROM audio_clip WHERE status = 'failed' AND crashes = 3 AND last_error = 'crashed the audio service'"),
+        1
     );
 }
 

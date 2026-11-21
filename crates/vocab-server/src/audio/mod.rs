@@ -22,8 +22,11 @@
 //!   answer that is not audio or too large, a timeout) is retried after
 //!   30 s, 2 min, 10 min, 1 h, 6 h, 24 h, then marked failed; a refusal
 //!   (4xx) or a clip over 60 s fails at once. A connection that dies after
-//!   the request was sent counts as an attempt and a crash: three crashes
-//!   and the clip fails ("crashed the audio service"). A clip that failed
+//!   the request was sent, or the service's `500 engine_crashed` (its
+//!   engine process died on the text, e.g. out of memory), counts as an
+//!   attempt and a crash: three crashes and the clip fails ("crashed the
+//!   audio service"). A slow synthesis is not a failure: the call waits up
+//!   to 630 s (the service gives up after 600 s). A clip that failed
 //!   waits behind the others, so one clip never blocks the queue. Settings
 //!   can retry failed clips.
 //! * **Storage:** at most [`CacheLimits::total_bytes`] of clips (2 GiB), and
