@@ -42,9 +42,15 @@ const FALLBACK: &str = "cmudict.dict";
 /// in how text becomes phonemes regenerates the clips. Bump it with every
 /// change of the rules or the dictionaries.
 pub const FRONTEND_VERSION: &str = "g2p-3";
-/// Phoneme symbols per chunk the engine synthesises in one pass; Kokoro's
-/// context is 510 symbols, and shorter chunks keep the prosody stable.
-const MAX_CHUNK_SYMBOLS: usize = 300;
+/// Phoneme symbols per chunk the engine synthesises in one pass (Kokoro's
+/// context is 510). The engine's memory grows with the chunk length and
+/// with every new chunk shape (measured in the image: idle 576 MiB, after
+/// one chunk of 150 symbols 753 MiB, of 300 symbols 998 MiB, after two
+/// different 300-symbol chunks 1353 MiB — over the 1280 MB limit), so
+/// chunks stay short; a sentence of up to ~25 words is one chunk.
+const MAX_CHUNK_SYMBOLS: usize = 150;
+/// Where a chunk that must be cut ends best: at its last pause.
+const CUT_MARKS: [char; 5] = [',', ';', ':', '—', '…'];
 /// Stress and length marks: not sounds (skipped when looking at the last
 /// sound of a stem).
 const MARKS: [char; 3] = ['ˈ', 'ˌ', 'ː'];
@@ -361,9 +367,10 @@ impl Phonemizer {
 }
 
 /// Builds chunks of at most [`MAX_CHUNK_SYMBOLS`] symbols: breaks after a
-/// sentence end, before a word that would not fit, and inside a single
-/// word that alone is longer than a chunk (no chunk ever exceeds the limit,
-/// whatever the input).
+/// sentence end, before a word that would not fit (at the chunk's last
+/// pause if there is one, so the cut falls where the text breathes), and
+/// inside a single word that alone is longer than a chunk (no chunk ever
+/// exceeds the limit, whatever the input).
 #[derive(Debug, Default)]
 struct Chunks {
     done: Vec<String>,
@@ -379,12 +386,30 @@ impl Chunks {
         }
     }
 
+    /// Make room for `needed` more symbols (and a space): end the chunk at
+    /// its last pause when the rest then fits, else end it here.
+    fn make_room(&mut self, needed: usize) {
+        if self.len == 0 || self.len + 1 + needed <= MAX_CHUNK_SYMBOLS {
+            return;
+        }
+        if let Some(cut) = self.current.rfind(CUT_MARKS) {
+            let end = cut + self.current[cut..].chars().next().map_or(1, char::len_utf8);
+            let tail = self.current[end..].trim_start().to_owned();
+            let tail_len = tail.chars().count();
+            if tail_len > 0 && tail_len + 1 + needed <= MAX_CHUNK_SYMBOLS {
+                self.current.truncate(end);
+                self.done.push(std::mem::replace(&mut self.current, tail));
+                self.len = tail_len;
+                return;
+            }
+        }
+        self.close();
+    }
+
     fn word(&mut self, phonemes: &str) {
         let symbols: Vec<char> = phonemes.chars().collect();
         for piece in symbols.chunks(MAX_CHUNK_SYMBOLS) {
-            if self.len > 0 && self.len + 1 + piece.len() > MAX_CHUNK_SYMBOLS {
-                self.close();
-            }
+            self.make_room(piece.len());
             if self.len > 0 {
                 self.current.push(' ');
                 self.len += 1;
@@ -998,6 +1023,35 @@ a ˈ A
                 "{text}"
             );
         }
+    }
+
+    #[test]
+    fn r40_a_long_chunk_is_cut_at_its_last_pause() {
+        let mut chunks = Chunks::default();
+        let word = "a".repeat(40);
+        for _ in 0..2 {
+            chunks.word(&word);
+        }
+        chunks.pause(',');
+        chunks.word(&word);
+        // The fourth word does not fit: the chunk ends at the comma and the
+        // third word moves on with it.
+        chunks.word(&word);
+        let done = chunks.finish();
+        assert_eq!(done.len(), 2, "{done:?}");
+        assert!(done[0].ends_with(','), "{done:?}");
+        assert_eq!(done[0].chars().count(), 82);
+        assert_eq!(done[1], format!("{word} {word}"));
+        // No pause to cut at: the chunk ends before the word.
+        let mut chunks = Chunks::default();
+        for _ in 0..4 {
+            chunks.word(&word);
+        }
+        let done = chunks.finish();
+        assert_eq!(
+            done.iter().map(|c| c.chars().count()).collect::<Vec<_>>(),
+            [122, 40]
+        );
     }
 
     #[test]
