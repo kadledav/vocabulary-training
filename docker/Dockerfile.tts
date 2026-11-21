@@ -1,0 +1,107 @@
+# vocab-tts image (design §10.2, §12.4; R-40, R-83): the TTS service with
+# the Kokoro model baked in, on distroless "cc" (glibc and libstdc++: the
+# sherpa-onnx static libraries are built against glibc), as 65532:65532.
+# No shell, no package manager; the model files are read-only.
+#
+# Every input is pinned (R-90) and dated by tools/dep-age.py: base images by
+# tag and digest, Debian packages by exact version from a snapshot, crates
+# by Cargo.lock, the sherpa-onnx libraries and the model by URL and SHA-256
+# (ADD --checksum; dep-age compares it with GitHub's digest of the release
+# asset and dates the asset).
+# Build from the repository root, for the machine's own platform (the
+# release builds linux/amd64 and linux/arm64 natively, each on its own
+# runner):
+#   docker build -f docker/Dockerfile.tts -t vocab-tts .
+# The crate's tests, linked against the real sherpa-onnx libraries:
+#   docker build -f docker/Dockerfile.tts --target test .
+
+# ── tools: Debian packages of the build ─────────────────────────────────────
+# The Rust release must match rust-toolchain.toml (checked by repo-guard).
+FROM rust:1.99.0-slim-trixie@sha256:2752b332db73fdbb7dc576f06c82ed1f312005784ef913d7e04a28f5f55dc581 AS tools
+
+# bzip2 unpacks the archives; make builds LAME (mp3lame-sys runs its
+# autotools build); libstdc++-14-dev links the C++ sherpa-onnx libraries.
+# From a fixed snapshot of the Debian archive, so the pins stay installable;
+# the dry run proves that apt installs exactly these three packages.
+# To update: pick a snapshot timestamp at least 14 days old, take the
+# versions of the three packages from its dists/trixie/main/binary-amd64 and
+# binary-arm64 Packages files, change timestamp and all six pins together.
+RUN echo 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/20261101T000000Z trixie main' > /etc/apt/sources.list \
+ && rm -f /etc/apt/sources.list.d/debian.sources \
+ && apt-get update \
+ && test "$(apt-get install -s --no-install-recommends bzip2=1.0.8-6 libstdc++-14-dev=14.2.0-19 make=4.4.1-2 | grep -c '^Inst ')" = 3 \
+ && apt-get install -y --no-install-recommends bzip2=1.0.8-6 libstdc++-14-dev=14.2.0-19 make=4.4.1-2 \
+ && rm -rf /var/lib/apt/lists/*
+
+# ── build: the vocab-tts binary ─────────────────────────────────────────────
+FROM tools AS build
+
+# sherpa-onnx v2.0.1 static libraries for both platforms (21 MB each; the one
+# of the platform being built is used). Given to the sherpa-onnx-sys build
+# script by SHERPA_ONNX_LIB_DIR, so it downloads nothing itself.
+ADD --checksum=sha256:55cfadf65ba50d0afc1a802b7a337942819e51c94a5b5a384def1978f7c70871 https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.1/sherpa-onnx-v2.0.1-linux-x64-static-lib.tar.bz2 /archives/
+ADD --checksum=sha256:b6c6090e40fd18d6812f04fe21260602cd1223d7b5e83ad39dab87ad7c1c031d https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.1/sherpa-onnx-v2.0.1-linux-aarch64-static-lib.tar.bz2 /archives/
+ARG TARGETARCH
+RUN case "$TARGETARCH" in \
+      amd64) echo linux-x64 ;; \
+      arm64) echo linux-aarch64 ;; \
+      *) echo "unsupported TARGETARCH '$TARGETARCH'" >&2; exit 1 ;; \
+    esac > /sherpa-platform \
+ && mkdir -p /sherpa \
+ && tar -xjf "/archives/sherpa-onnx-v2.0.1-$(cat /sherpa-platform)-static-lib.tar.bz2" -C /sherpa --strip-components=1 \
+ && test -f /sherpa/lib/libsherpa-onnx-c-api.a \
+ && rm -rf /archives
+ENV SHERPA_ONNX_LIB_DIR=/sherpa/lib
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates crates
+RUN cargo build --release --locked -p vocab-tts \
+ && install -D -m 0755 target/release/vocab-tts /out/vocab-tts \
+ && registry="$(dirname /usr/local/cargo/registry/src/*/sherpa-onnx-2.0.1)" \
+ && install -D -m 0444 "$registry/sherpa-onnx-2.0.1/LICENSE" /out/licenses/sherpa-onnx-LICENSE.txt \
+ && install -m 0444 "$registry/mp3lame-sys-0.1.11/lame-3.100/COPYING" /out/licenses/lame-COPYING.txt \
+ && install -m 0444 "$registry/mp3lame-sys-0.1.11/LICENSE" /out/licenses/mp3lame-sys-LICENSE.txt
+
+# ── test: `--target test` only; not part of the image ───────────────────────
+FROM build AS test
+RUN cargo test --release --locked -p vocab-tts
+
+# ── model: the Kokoro files the service reads ───────────────────────────────
+FROM tools AS model
+ADD --checksum=sha256:60703707bc05ccd48d60e1eb723f38b07d6e474795a0b6a588d7220400e0f7a4 https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-multi-lang-v1_0.tar.bz2 /archives/
+# fp32 model (the spike: int8 is 2.4x slower on CPU, docs/design/tts-spike.md),
+# voices, symbol table, the US and UK lexicons, the licence. Not copied:
+# espeak-ng-data (GPL; unused since sherpa-onnx 2.0), Chinese/other files.
+RUN mkdir -p /unpacked /out/model /out/licenses \
+ && tar -xjf /archives/kokoro-multi-lang-v1_0.tar.bz2 -C /unpacked \
+      kokoro-multi-lang-v1_0/model.onnx kokoro-multi-lang-v1_0/voices.bin kokoro-multi-lang-v1_0/tokens.txt \
+      kokoro-multi-lang-v1_0/lexicon-us-en.txt kokoro-multi-lang-v1_0/lexicon-gb-en.txt kokoro-multi-lang-v1_0/LICENSE \
+ && cd /unpacked/kokoro-multi-lang-v1_0 \
+ && install -m 0444 model.onnx voices.bin tokens.txt lexicon-us-en.txt lexicon-gb-en.txt /out/model/ \
+ && install -m 0444 LICENSE /out/licenses/kokoro-model-LICENSE.txt \
+ && chmod 0555 /out/model
+
+# ── runtime ─────────────────────────────────────────────────────────────────
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:08476c244888bfb425bae1ae4dd7c17f093e972aab8426883d97f3c6f280f7c1
+
+# The licence is the combined expression of docker/tts-licenses/THIRD-PARTY.md.
+LABEL org.opencontainers.image.title="vocabulary-training-tts" \
+      org.opencontainers.image.description="Neural TTS service of the vocabulary training app (vocab-tts, Kokoro-82M via sherpa-onnx)" \
+      org.opencontainers.image.source="https://github.com/kadledav/vocabulary-training" \
+      org.opencontainers.image.licenses="MIT AND Apache-2.0 AND BSD-3-Clause AND Unicode-3.0 AND LGPL-3.0-only AND LGPL-2.0-or-later"
+
+COPY --from=build /out/vocab-tts /vocab-tts
+# Owned by root, read-only for everyone: the service only reads them.
+COPY --from=model /out/model /model
+COPY LICENSE /licenses/LICENSE.txt
+COPY docker/tts-licenses/ /licenses/
+COPY --from=build /out/licenses/ /licenses/
+COPY --from=model /out/licenses/ /licenses/
+# The exact crate versions in the binary, for the SBOM generator (syft).
+COPY Cargo.lock /usr/share/doc/vocab-tts/Cargo.lock
+
+USER 65532:65532
+EXPOSE 8090
+ENTRYPOINT ["/vocab-tts"]
+CMD ["serve"]

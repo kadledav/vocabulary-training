@@ -23,8 +23,10 @@ complete, and on anything it cannot verify (fail closed):
     - `# syntax=` directives and `RUN --mount=…,from=` images like `FROM`;
       heredocs, `BUILDKIT_*` arguments and `ONBUILD` are errors
     - other install/download commands only in these forms: `apt-get update`,
-      `rustup target add <target>`; `ADD <url>`, other URLs and downloads
+      `rustup target add <target>`; other URLs and downloads
       (curl, wget, pip, …) are errors
+* M6: `ADD` from a URL only as `ADD --checksum=sha256:<hex> <GitHub release
+  asset URL> <dest>`, checksum = GitHub's digest, dated by the upload -> GitHub API
 * everywhere: `cargo update|generate-lockfile|add` are errors, and cargo
   commands that resolve dependencies must use `--locked`
 * compose files (`compose*.yml`, `docker-compose*.yml`, any YAML file with
@@ -241,6 +243,52 @@ def action_published(repo: str, sha: str, tag: str) -> dt.datetime:
             pass  # no GitHub release for this tag: commit (and tag) date only
         _action_cache[key] = max(dates)
     return _action_cache[key]
+
+
+# M6: a file attached to a GitHub release, pinned by its SHA-256 (ADD --checksum).
+GITHUB_RELEASE_ASSET = re.compile(
+    r"^https://github\.com/(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/releases/download/"
+    r"(?P<tag>[A-Za-z0-9_.+-]+)/(?P<asset>[A-Za-z0-9_.+-]+)$"
+)
+ADD_CHECKSUM = re.compile(r"^--checksum=sha256:(?P<sha256>[0-9a-f]{64})$")
+
+
+def release_asset_published(repo: str, tag: str, asset: str, sha256: str) -> dt.datetime:
+    """When the release asset was uploaded (the later of its creation and
+    last update: a re-upload under the same name counts as new), after
+    checking that GitHub's digest of the asset is the pinned checksum. An
+    asset without a digest, or a digest that differs, fails the lookup."""
+    def lookup() -> dt.datetime:
+        release = github_api(f"/repos/{repo}/releases/tags/{urllib.parse.quote(tag)}")
+        assets = release.get("assets", []) if isinstance(release, dict) else []
+        for item in assets:
+            if item.get("name") == asset:
+                if item.get("digest") != f"sha256:{sha256}":
+                    raise LookupFailed(f"GitHub's digest of {asset} is {item.get('digest')!r}, not the pinned sha256")
+                return max(parse_ts(item["created_at"]), parse_ts(item["updated_at"]))
+        raise LookupFailed(f"no asset {asset} in release {tag} of {repo}")
+
+    return lookup()  # M6: this version has no lookup cache
+
+
+def check_add_url(args: str, where: str, result: "Result") -> None:
+    """`ADD --checksum=sha256:<hex> <GitHub release asset URL> <dest>`: the
+    only form of ADD from a URL (the build verifies the checksum, the gate
+    compares it with GitHub's digest and dates the asset)."""
+    words = args.split()
+    flags = [w for w in words if w.startswith("--")]
+    rest = [w for w in words if not w.startswith("--")]
+    checksum = ADD_CHECKSUM.match(flags[0]) if len(flags) == 1 else None
+    url = GITHUB_RELEASE_ASSET.match(rest[0]) if len(rest) == 2 else None
+    if not checksum or not url:
+        result.errors.append(
+            f"{where}: ADD from a URL must be `ADD --checksum=sha256:<hex> "
+            f"https://github.com/<owner>/<repo>/releases/download/<tag>/<asset> <dest>`"
+        )
+        return
+    repo, tag, asset, sha256 = url.group("repo"), url.group("tag"), url.group("asset"), checksum.group("sha256")
+    result.add("asset", f"{repo}/{asset}", tag,
+               lambda: release_asset_published(repo, tag, asset, sha256), where)
 
 
 # ── Cargo ────────────────────────────────────────────────────────────────────
@@ -886,7 +934,7 @@ def check_dockerfile(path: Path, result: Result) -> None:
             for source in re.findall(r"--from=(\S+)", args):
                 check_from_source(source, stages, where, "--from=", result)
             if instruction == "ADD" and re.search(r"\b(https?|git|ssh)://|git@", args):
-                result.errors.append(f"{where}: ADD from a URL is not checked by the age gate yet")
+                check_add_url(args, where, result)  # M6: only checksum-pinned GitHub release assets
         elif instruction == "RUN":
             for mount in re.findall(r"--mount=(\S+)", args):
                 for option in mount.split(","):

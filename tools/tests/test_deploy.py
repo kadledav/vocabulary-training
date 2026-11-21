@@ -73,6 +73,71 @@ class Compose(unittest.TestCase):
         self.assertNotIn("hash-password", readme)
 
 
+def service(name: str) -> str:
+    """The block of one service in the compose file (up to the next one)."""
+    m = re.search(rf"(?ms)^  {re.escape(name)}:\n(.*?)(?=^  \S|^\S)", COMPOSE)
+    assert m, name
+    return m.group(1)
+
+
+class TtsService(unittest.TestCase):
+    def test_r83_tts_runs_hardened_on_the_internal_network_only(self):
+        tts = service("vocabulary-tts")
+        self.assertRegex(tts, r"(?m)^    image: ghcr\.io/kadledav/vocabulary-training-tts:\S+@sha256:\S+$")
+        for required in (
+            r'(?m)^    user: "3101:3101"$',
+            r"(?m)^    read_only: true$",
+            r"(?m)^    cap_drop: \[ALL\]$",
+            r'(?m)^    security_opt: \["no-new-privileges:true"\]$',
+            r"(?m)^    mem_limit: 1280m$",
+            r"(?m)^    memswap_limit: 1280m$",
+            r"(?m)^    cpus: 2\.0$",
+            r"(?m)^    pids_limit: 64$",
+            r'test: \["CMD", "/vocab-tts", "healthcheck"\]',
+        ):
+            self.assertRegex(tts, required)
+        self.assertEqual(re.findall(r"(?m)^      - (\S+)$", tts.split("networks:", 1)[1]), ["vocab-internal"])
+        for forbidden in (r"(?m)^\s*ports\s*:", r"(?m)^\s*volumes\s*:", r"traefik", r"(?m)^\s*tmpfs\s*:"):
+            self.assertNotRegex(tts, forbidden)
+
+    def test_r83_internal_network_shared_only_with_the_app(self):
+        self.assertRegex(COMPOSE, r"(?m)^  vocab-internal:\n    internal: true$")
+        app = service("vocabulary")
+        self.assertIn("      - vocab-internal\n", app)
+        self.assertIn("traefik.docker.network=proxy-net", app)
+        self.assertEqual(COMPOSE.count("      - vocab-internal\n"), 2)
+
+
+class TtsDockerfile(unittest.TestCase):
+    TEXT = (REPO / "docker" / "Dockerfile.tts").read_text()
+
+    def test_r83_tts_runtime_is_distroless_cc_nonroot_with_a_read_only_model(self):
+        stage = self.TEXT.rsplit("\nFROM ", 1)[1]
+        self.assertRegex(stage, r"^gcr\.io/distroless/cc-debian13:nonroot@sha256:[0-9a-f]{64}\n")
+        self.assertRegex(stage, r"(?m)^USER 65532:65532$")
+        self.assertRegex(stage, r'(?m)^ENTRYPOINT \["/vocab-tts"\]$')
+        self.assertRegex(stage, r"(?m)^COPY --from=model /out/model /model$")
+        self.assertNotRegex(stage, r"(?m)^(RUN|SHELL|VOLUME)\b")
+        self.assertIn("install -m 0444 model.onnx", self.TEXT)
+
+    def test_r90_tts_inputs_are_pinned_and_checksummed(self):
+        froms = re.findall(r"(?m)^FROM\s+(\S+)", self.TEXT)
+        external = [image for image in froms if image not in ("tools", "build")]
+        self.assertEqual(len(external), 2)
+        for image in external:
+            self.assertRegex(image, r":[^@]+@sha256:[0-9a-f]{64}$")
+        adds = re.findall(r"(?m)^ADD (.+)$", self.TEXT)
+        self.assertEqual(len(adds), 3)
+        for add in adds:
+            self.assertRegex(add, r"^--checksum=sha256:[0-9a-f]{64} https://github\.com/k2-fsa/sherpa-onnx/releases/download/\S+ /archives/$")
+
+    def test_r83_tts_image_ships_its_licences_and_no_espeak(self):
+        for name in ("SOURCE.md", "THIRD-PARTY.md", "onnxruntime-LICENSE.txt"):
+            self.assertTrue((REPO / "docker" / "tts-licenses" / name).is_file(), name)
+        self.assertIn("COPY docker/tts-licenses/ /licenses/", self.TEXT)
+        self.assertNotRegex(self.TEXT, r"(?m)^[^#]*install[^#\n]*espeak")
+
+
 class Dockerfile(unittest.TestCase):
     def runtime_stage(self) -> str:
         return DOCKERFILE.rsplit("\nFROM ", 1)[1]
