@@ -60,7 +60,8 @@ pub struct Settings {
     /// Items per practice block (default 20).
     pub block_size: u32,
     pub voice: Voice,
-    /// Play the word once when the answer is revealed.
+    /// Play the word once when the answer is revealed (off by default: the
+    /// first sound of a visit must come from a tap anyway, R-41).
     pub autoplay: bool,
     pub speed: Speed,
     pub theme: Theme,
@@ -73,7 +74,7 @@ impl Default for Settings {
             new_per_day: 5,
             block_size: 20,
             voice: Voice::Us,
-            autoplay: true,
+            autoplay: false,
             speed: Speed::Normal,
             theme: Theme::Dark,
             legend: Legend::Auto,

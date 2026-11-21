@@ -28,6 +28,9 @@ fsrs = { version = "=6.6.2", default-features = false }
 # Random practice-session ids (design §4.2 `practice_session.id`).
 getrandom = "=0.4.3"
 hex = "=0.4.3"
+# Response heads of the TTS service (`audio` client); already in the lock
+# file via hyper.
+httparse = "=1.10.1"
 # Reading request bodies frame by frame (import body limit with draining).
 http-body-util = "=0.1.5"
 # The server loop uses hyper directly for connection-level limits (header read

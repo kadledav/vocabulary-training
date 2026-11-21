@@ -127,9 +127,11 @@ function installFakeSpeech() {
 }
 
 export const test = base.extend(
-  /** @type {import('@playwright/test').Fixtures<{ app: App, pageErrors: string[] }, {}, import('@playwright/test').PlaywrightTestArgs & import('@playwright/test').PlaywrightTestOptions>} */ ({
-    app: async ({ context }, use) => {
-      const server = await startServer();
+  /** @type {import('@playwright/test').Fixtures<{ app: App, pageErrors: string[], ttsUrl: string | null }, {}, import('@playwright/test').PlaywrightTestArgs & import('@playwright/test').PlaywrightTestOptions>} */ ({
+    // The TTS service of the server (`test.use({ ttsUrl })`); null: none.
+    ttsUrl: [null, { option: true }],
+    app: async ({ context, ttsUrl }, use) => {
+      const server = await startServer(ttsUrl ? { ttsUrl } : {});
       const cookie = await signIn(server.serverUrl, server.url, '/api/auth/setup', {
         code: server.setupCode,
         password: PASSWORD,

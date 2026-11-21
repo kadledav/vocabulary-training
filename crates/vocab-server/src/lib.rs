@@ -4,6 +4,7 @@
 //! binary in `main.rs` only wires them together. Modules of later milestones
 //! (audio, exports) are added next to these.
 
+pub mod audio;
 pub mod auth;
 pub mod catalog;
 pub mod clock;

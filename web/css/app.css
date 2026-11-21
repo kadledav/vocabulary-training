@@ -1261,6 +1261,21 @@ input[aria-invalid="true"] {
   border-color: var(--accent);
 }
 
+/* Recorded clip on its way (M6). */
+.play.loading {
+  border-style: dashed;
+}
+
+/* The clip could not be played: the browser speaks instead. */
+.play.failed {
+  border-color: var(--error);
+}
+
+/* The clip has an approximate pronunciation: a dotted ring, and the title says so. */
+.play[data-approximate] {
+  border-style: dotted;
+}
+
 /* Words: the whole row is the link (bug 8). */
 .word-rows > li {
   padding: 0;

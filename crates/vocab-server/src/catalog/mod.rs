@@ -6,7 +6,8 @@
 //! catalog tables (design §3.2).
 //!
 //! Owned tables: `source`, `word`, `word_source`, `word_item`, `word_form`,
-//! `sentence`, `word_override`, `field_conflict`. All SQL touching them is in
+//! `sentence`, `word_override`, `field_conflict`. The `audio` module reads
+//! what can be spoken through [`speak_sources`]. All SQL touching them is in
 //! this module (R-92). Other modules use the functions re-exported here.
 //!
 //! Merging (R-03, R-22) is split into a read-only *plan* and its
@@ -17,6 +18,7 @@ mod merge;
 mod practice;
 mod read;
 mod source;
+mod speak;
 
 use serde::Serialize;
 
@@ -30,6 +32,7 @@ pub use read::{
     presentation, sources, word_view, words,
 };
 pub use source::{ReadingUpdate, SourceUpsert, source_titles, upsert_source};
+pub use speak::{SpeakSource, speak_source, speak_sources};
 
 /// Hard caps on what the catalog holds (R-84): far above any real use (a
 /// reader collects a few thousand words in years), low enough that a

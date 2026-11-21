@@ -19,6 +19,7 @@
  * the owner retries the same rating or first finds out what was saved.
  */
 
+import { clipFor, clipsFor, playClip, preloadClips, stopClip } from '../clips.js';
 import { h, mount } from '../dom.js';
 import { keyAction, keyTarget } from '../keys.js';
 import { answerView, criterion, questionView, revealLabel } from '../practice/card.js';
@@ -196,6 +197,27 @@ export function renderPractice(root, isCurrent) {
   };
   const speechOk = speechAvailable();
   prepareSpeech();
+  /** Recorded-clip info per word id, as far as it has arrived (M6). */
+  /** @type {Map<number, import('../clips.js').WordClips | null>} */
+  const clips = new Map();
+  /**
+   * Ask for the clips of the current item and the next unanswered one,
+   * and let the browser fetch the next one's clips ahead (R-40).
+   */
+  const loadClips = () => {
+    const session = state.session;
+    const item = state.item;
+    if (!session || !item) return;
+    const later = session.items.filter((i) => i.answered === null && i.item_id !== item.item_id);
+    for (const [index, wanted] of [item, ...later.slice(0, 1)].entries()) {
+      const id = wanted.word.id;
+      void clipsFor(id).then((info) => {
+        clips.set(id, info);
+        if (index > 0) preloadClips(info);
+        else if (info && state.item?.word.id === id) markApproximate(info);
+      });
+    }
+  };
 
   const top = h('div', { class: 'practice-top' });
   const help = h('div', { class: 'practice-help' });
@@ -317,20 +339,64 @@ export function renderPractice(root, isCurrent) {
     }
   };
 
+  /** @param {import('../clips.js').WordClips} info */
+  const markApproximate = (info) => {
+    const word = body.querySelector('button.play-word');
+    if (word && info.enabled && info.word.approximate && !word.hasAttribute('data-approximate')) {
+      word.setAttribute('data-approximate', '');
+      word.setAttribute('title', `${word.getAttribute('title') ?? 'Play word'} — approximate pronunciation`);
+    }
+  };
+
   /**
-   * Play `text`, showing the playing state on `button` (or the play button
-   * of that kind on screen, for the S/R keys).
+   * Speak `text` with the browser (the fallback, R-41).
    *
    * @param {string} text
-   * @param {'sentence' | 'word'} what
+   * @param {Element | null} button
    */
-  const play = (text, what) => {
-    const button = body.querySelector(`button.play-${what}`);
+  const speakFallback = (text, button) => {
     const result = speak(text, { voice: state.settings.voice, speed: state.settings.speed }, {
       onStart: () => button?.classList.add('playing'),
       onEnd: () => button?.classList.remove('playing'),
     });
     afterSpeak(result);
+  };
+
+  /**
+   * Play the recorded clip of `what` if one is ready, else speak `text`,
+   * showing loading/playing/failed on the play button of that kind. Runs
+   * synchronously in the tap or key handler (iOS starts media only there).
+   * `clipOnly`: auto-play, which never falls back to speech.
+   *
+   * @param {string} text
+   * @param {'sentence' | 'word'} what
+   * @param {number | null} sentenceId
+   * @param {boolean} [clipOnly]
+   */
+  const play = (text, what, sentenceId, clipOnly = false) => {
+    const button = body.querySelector(`button.play-${what}`);
+    const item = state.item;
+    const clip = item ? clipFor(clips.get(item.word.id), what, sentenceId) : null;
+    if (!clip || clip.url === null) {
+      if (!clipOnly) speakFallback(text, button);
+      return;
+    }
+    stopSpeaking();
+    button?.classList.remove('failed');
+    button?.classList.add('loading');
+    playClip(clip.url, state.settings.speed === '0.75' ? 0.75 : 1, {
+      onStart: () => {
+        button?.classList.remove('loading');
+        button?.classList.add('playing');
+      },
+      onEnd: () => button?.classList.remove('loading', 'playing'),
+      onFail: () => {
+        button?.classList.remove('loading', 'playing');
+        button?.classList.add('failed');
+        setTimeout(() => button?.classList.remove('failed'), 2_000);
+        if (!clipOnly) speakFallback(text, button);
+      },
+    });
   };
 
   const speakSentence = () => {
@@ -339,14 +405,14 @@ export function renderPractice(root, isCurrent) {
     const sentence =
       item.card.format === 'sentence' && item.sentence ? item.sentence : state.phase === 'question' ? null : exampleSentence(item);
     if (!sentence) return;
-    play(plainText(sentence.en), 'sentence');
+    play(plainText(sentence.en), 'sentence', sentence.id);
   };
   const speakWord = () => {
     const item = state.item;
     if (!item || state.phase === 'complete') return;
     // On the question side of a sentence card only the sentence plays.
     if (state.phase === 'question' && item.card.format === 'sentence' && item.sentence) return;
-    play(wordSpeech(item.word), 'word');
+    play(wordSpeech(item.word), 'word', null);
   };
   const audio = { speechOk, onSpeakSentence: speakSentence, onSpeakWord: speakWord };
 
@@ -527,7 +593,9 @@ export function renderPractice(root, isCurrent) {
     setPhase(state.item ? 'question' : 'complete');
     state.moreOpen = false;
     state.shownAt = now();
+    stopClip();
     render({ focus: true, scroll: true });
+    loadClips();
   };
 
   /**
@@ -558,6 +626,11 @@ export function renderPractice(root, isCurrent) {
     render({ focus: true });
     const word = state.item.word;
     announce(h('span', { lang: 'en' }, word.headword), ': ', h('span', { lang: 'cs' }, word.czech.join(', ')));
+    // Auto-play (off by default): the word's recorded clip, started by the
+    // reveal tap or key itself; never browser speech.
+    if (state.settings.autoplay) play(wordSpeech(word), 'word', null, true);
+    const info = clips.get(word.id);
+    if (info) markApproximate(info);
   };
 
   const next = () => {
@@ -959,6 +1032,7 @@ export function renderPractice(root, isCurrent) {
     if (savingTimer !== null) clearTimeout(savingTimer);
     if (guardTimer !== null) clearTimeout(guardTimer);
     stopSpeaking();
+    stopClip();
     if (releaseWakeLock) releaseWakeLock();
   };
 }

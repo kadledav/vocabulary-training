@@ -1,8 +1,10 @@
 // @ts-check
 /**
  * Settings (design §7.1 screen 10, M4 part): new words per day, block size,
- * theme, rating legend; voice, speed and auto-play are stored for the
- * neural audio of M6 (browser speech already uses voice and speed). Every
+ * theme, rating legend; audio: voice (US/UK), speed, auto-play, and the
+ * state of the recorded clips (ready / queued / failed / approximate) with
+ * "Retry failed" (M6; without a TTS service the app uses the browser's
+ * speech and says so). Every
  * change is saved at once; a number out of range is kept in the field with
  * a message saying the allowed range. Account: change the password (logs
  * out every other device), create the connector token (shown once), "Log
@@ -10,6 +12,8 @@
  */
 
 import { changePassword, connectorTokenStatus, createConnectorToken, logout, logoutEverywhere, newPasswordProblem } from '../auth.js';
+import { getJson, postJson } from '../api.js';
+import { forgetClips } from '../clips.js';
 import { h, keepFocus, mount } from '../dom.js';
 import { loadSettings, saveSettings } from '../settings.js';
 
@@ -17,6 +21,32 @@ import { loadSettings, saveSettings } from '../settings.js';
  * @typedef {import('../settings.js').Settings} Settings
  * @typedef {import('../settings.js').SettingsPatch} SettingsPatch
  */
+
+/**
+ * @typedef {{ enabled: false } | { enabled: true, connected: boolean, voice: 'us' | 'uk', ready: number,
+ *             pending: number, failed: number, approximate: number }} AudioStatus
+ */
+
+/**
+ * The line about recorded audio in Settings.
+ *
+ * @param {AudioStatus | null} status
+ * @returns {string}
+ */
+export function audioStatusText(status) {
+  if (status === null) return 'The state of the recorded audio could not be loaded.';
+  if (!status.enabled) return 'Recorded audio is not set up on this server: ▶ uses the browser’s own speech.';
+  if (!status.connected) return 'The audio service has not answered yet: ▶ uses the browser’s own speech for now.';
+  const parts = [`${status.ready} clips ready`];
+  if (status.pending > 0) parts.push(`${status.pending} being made`);
+  if (status.failed > 0) parts.push(`${status.failed} failed`);
+  let text = `Recorded audio: ${parts.join(', ')}.`;
+  if (status.approximate > 0) {
+    text += ` ${status.approximate} ${status.approximate === 1 ? 'has' : 'have'} an approximate pronunciation (a word not in the dictionaries).`;
+  }
+  if (status.pending > 0) text += ' Until a clip is ready, ▶ uses the browser’s own speech.';
+  return text;
+}
 
 /**
  * A group of radio buttons.
@@ -281,7 +311,27 @@ export function renderSettings(root, isCurrent) {
     const result = await saveSettings(patch);
     if (!isCurrent()) return;
     status.textContent = result.ok ? 'Saved.' : result.message;
+    if (result.ok && patch.voice) forgetClips();
     if (result.ok) keepFocus(form, () => draw(result.settings));
+    if (result.ok && patch.voice) void loadAudio();
+  };
+
+  const audioLine = h('p', { class: 'muted small', 'data-testid': 'audio-status', role: 'status' }, 'Loading…');
+  const retry = h('button', { type: 'button', 'data-testid': 'audio-retry', hidden: true }, 'Retry failed clips');
+  retry.addEventListener('click', () => {
+    retry.disabled = true;
+    void postJson('/api/audio/retry', {}).then(() => {
+      retry.disabled = false;
+      if (isCurrent()) void loadAudio();
+    });
+  });
+  const loadAudio = async () => {
+    /** @type {import('../api.js').ApiResult<AudioStatus>} */
+    const answer = await getJson('/api/audio/status');
+    if (!isCurrent()) return;
+    const audio = answer.ok ? answer.data : null;
+    audioLine.textContent = audioStatusText(audio);
+    retry.hidden = !(audio && audio.enabled && audio.failed > 0);
   };
 
   /** @param {Settings} s */
@@ -325,7 +375,8 @@ export function renderSettings(root, isCurrent) {
         (v) => void save({ theme: /** @type {Settings['theme']} */ (v) }),
       ),
       h('h2', {}, 'Audio'),
-      h('p', { class: 'muted small' }, 'Until recorded audio arrives, ▶ uses the browser’s own speech.'),
+      audioLine,
+      retry,
       radioGroup(
         'voice',
         'Voice',
@@ -358,5 +409,6 @@ export function renderSettings(root, isCurrent) {
   void (async () => {
     const settings = await loadSettings();
     if (isCurrent()) draw(settings);
+    await loadAudio();
   })();
 }

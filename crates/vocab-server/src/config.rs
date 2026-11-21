@@ -9,6 +9,7 @@
 //! | `VOCAB_LISTEN` | `0.0.0.0:8080` | listen address (development and tests) |
 //! | `VOCAB_DATA_DIR` | `/data` | the SQLite file set (and the cache below it) |
 //! | `VOCAB_CACHE_DIR` | `<data dir>/cache` | audio files |
+//! | `VOCAB_TTS_URL` | — (no neural audio) | the TTS service, `http://host[:port]` on the internal network |
 //!
 //! Any other `VOCAB_*` variable (a typo, a removed setting such as the M5
 //! secrets) and any invalid value is a startup error naming the variable.
@@ -20,6 +21,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::audio::TtsEndpoint;
 use crate::clock::{ClockError, DayRule};
 
 const DEFAULT_DATA_DIR: &str = "/data";
@@ -43,9 +45,10 @@ const LOG_LEVEL_ENV: &str = "VOCAB_LOG_LEVEL";
 const LISTEN_ENV: &str = "VOCAB_LISTEN";
 const DATA_DIR_ENV: &str = "VOCAB_DATA_DIR";
 const CACHE_DIR_ENV: &str = "VOCAB_CACHE_DIR";
+const TTS_URL_ENV: &str = "VOCAB_TTS_URL";
 
 /// Every `VOCAB_*` variable the app reads.
-const KNOWN: [&str; 7] = [
+const KNOWN: [&str; 8] = [
     PUBLIC_ORIGIN_ENV,
     TIMEZONE_ENV,
     ROLLOVER_ENV,
@@ -53,6 +56,7 @@ const KNOWN: [&str; 7] = [
     LISTEN_ENV,
     DATA_DIR_ENV,
     CACHE_DIR_ENV,
+    TTS_URL_ENV,
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -84,6 +88,9 @@ pub struct Config {
     pub session_max_days: u32,
     pub limits: Limits,
     pub paths: Paths,
+    /// The TTS service; `None`: no neural audio, the client speaks with the
+    /// browser (R-41).
+    pub tts: Option<TtsEndpoint>,
 }
 
 /// Request limits (§9.4). The import routes have their own body limit and
@@ -295,6 +302,12 @@ impl Config {
         };
         let data_dir = dir(DATA_DIR_ENV)?.unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIR));
         let cache_dir = dir(CACHE_DIR_ENV)?.unwrap_or_else(|| data_dir.join(CACHE_SUBDIR));
+        let tts = match text(TTS_URL_ENV)?.filter(|v| !v.is_empty()) {
+            None => None,
+            Some(url) => Some(
+                TtsEndpoint::parse(&url).map_err(|err| invalid(TTS_URL_ENV, &err.to_string()))?,
+            ),
+        };
         Ok(Self {
             public_origin,
             day_rule,
@@ -307,6 +320,7 @@ impl Config {
                 data_dir,
                 cache_dir,
             },
+            tts,
         })
     }
 }
@@ -437,6 +451,8 @@ mod tests {
             (ROLLOVER_ENV, "four"),
             (LOG_LEVEL_ENV, "loud"),
             (LISTEN_ENV, "8080"),
+            (TTS_URL_ENV, "https://vocabulary-tts:8090"),
+            (TTS_URL_ENV, "http://vocabulary-tts:8090/v1/speak"),
         ] {
             let err = load(&[ORIGIN, (var, value)]).expect_err(value);
             assert!(err.contains(var), "{var}={value}: {err}");
@@ -444,7 +460,7 @@ mod tests {
         for unknown in [
             "VOCAB_CONFIG",
             "VOCAB_TIMEZON",
-            "VOCAB_TTS_URL",
+            "VOCAB_TTS_TOKEN",
             // The M5 secrets: no secrets in the environment any more.
             "VOCAB_PASSWORD_HASH_B64",
             "VOCAB_IMPORT_TOKEN",
@@ -452,6 +468,17 @@ mod tests {
             let err = load(&[ORIGIN, (unknown, "x")]).expect_err(unknown);
             assert!(err.contains(&format!("unknown setting {unknown}")), "{err}");
         }
+    }
+
+    #[test]
+    fn r40_tts_url_is_optional() {
+        let config = load(&[ORIGIN]).expect("valid");
+        assert_eq!(config.tts, None);
+        let config = load(&[ORIGIN, (TTS_URL_ENV, "http://vocabulary-tts:8090")]).expect("valid");
+        assert_eq!(
+            config.tts.map(|t| t.to_string()).as_deref(),
+            Some("http://vocabulary-tts:8090")
+        );
     }
 
     #[test]

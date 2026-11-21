@@ -20,8 +20,9 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
+use vocab_server::audio::Audio;
 use vocab_server::auth::{self, Auth, SessionLifetime, SetupCode};
-use vocab_server::clock::{Moment, Timestamp};
+use vocab_server::clock::{Moment, SystemClock, Timestamp};
 use vocab_server::config::Config;
 use vocab_server::db::{DataDirLock, Db, DbError};
 use vocab_server::http::{self, AppState};
@@ -46,8 +47,9 @@ const USAGE: &str =
 Configuration (environment): $VOCAB_PUBLIC_ORIGIN (required), $VOCAB_TIMEZONE
 (default Europe/Prague), $VOCAB_DAY_ROLLOVER_HOUR (default 4), $VOCAB_LOG_LEVEL
 (default info), $VOCAB_LISTEN (default 0.0.0.0:8080), $VOCAB_DATA_DIR (default
-/data), $VOCAB_CACHE_DIR (default <data dir>/cache). No secrets: the password
-and the connector token are set in the app.";
+/data), $VOCAB_CACHE_DIR (default <data dir>/cache), $VOCAB_TTS_URL (the TTS
+service, e.g. http://vocabulary-tts:8090; unset: no neural audio). No secrets:
+the password and the connector token are set in the app.";
 
 fn main() -> ExitCode {
     // Everything the app creates (database, WAL, lock, cache files and
@@ -299,10 +301,23 @@ async fn run_server(
             )));
         }
     }
-    let app = http::app(
-        AppState::new(db, config.day_rule.clone(), auth),
-        &config.limits,
-    );
+    let mut state = AppState::new(db.clone(), config.day_rule.clone(), auth);
+    match &config.tts {
+        Some(endpoint) => {
+            let audio = Audio::new(
+                db,
+                &config.paths.cache_dir,
+                endpoint.clone(),
+                Arc::new(SystemClock),
+            )
+            .map_err(|err| std::io::Error::other(format!("cannot open the audio cache: {err}")))?;
+            tracing::info!(tts = %endpoint, "neural audio on");
+            audio.spawn();
+            state = state.with_audio(audio);
+        }
+        None => tracing::info!("neural audio off (no VOCAB_TTS_URL): browser speech only"),
+    }
+    let app = http::app(state, &config.limits);
     http::serve(listener, app, &config.limits, shutdown_signal()).await
 }
 

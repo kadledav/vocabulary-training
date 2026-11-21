@@ -2292,6 +2292,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hex",
  "http-body-util",
+ "httparse",
  "hyper",
  "hyper-util",
  "include_dir",

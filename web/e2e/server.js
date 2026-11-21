@@ -100,8 +100,11 @@ async function startProxy() {
  * `setupCode` comes from the server's "Setup required" log line.
  */
 
-/** @returns {Promise<RunningServer>} */
-export async function startServer() {
+/**
+ * @param {{ ttsUrl?: string }} [options] `ttsUrl`: the TTS service (`VOCAB_TTS_URL`; none: browser speech only)
+ * @returns {Promise<RunningServer>}
+ */
+export async function startServer({ ttsUrl } = {}) {
   const bin = binary();
   const proxy = await startProxy();
   const dir = mkdtempSync(path.join(tmpdir(), 'vocab-e2e-'));
@@ -115,6 +118,7 @@ export async function startServer() {
       VOCAB_PUBLIC_ORIGIN: proxy.origin,
       VOCAB_LISTEN: '127.0.0.1:0',
       VOCAB_DATA_DIR: data,
+      ...(ttsUrl ? { VOCAB_TTS_URL: ttsUrl } : {}),
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
