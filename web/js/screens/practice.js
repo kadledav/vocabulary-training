@@ -355,6 +355,9 @@ export function renderPractice(root, isCurrent) {
    * @param {Element | null} button
    */
   const speakFallback = (text, button) => {
+    // Never two sounds at once: a clip still playing (another button's)
+    // stops before the browser speaks.
+    stopClip();
     const result = speak(text, { voice: state.settings.voice, speed: state.settings.speed }, {
       onStart: () => button?.classList.add('playing'),
       onEnd: () => button?.classList.remove('playing'),

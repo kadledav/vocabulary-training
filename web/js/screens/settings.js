@@ -24,8 +24,13 @@ import { loadSettings, saveSettings } from '../settings.js';
 
 /**
  * @typedef {{ enabled: false } | { enabled: true, connected: boolean, voice: 'us' | 'uk', ready: number,
- *             pending: number, failed: number, approximate: number }} AudioStatus
+ *             pending: number, failed: number, approximate: number,
+ *             storage?: 'ok' | 'cache_full' | 'disk_low', cache_bytes?: number,
+ *             cache_limit_bytes?: number }} AudioStatus
  */
+
+/** @param {number} bytes */
+const gib = (bytes) => `${(bytes / 2 ** 30).toFixed(1)} GiB`;
 
 /**
  * The line about recorded audio in Settings.
@@ -43,6 +48,11 @@ export function audioStatusText(status) {
   let text = `Recorded audio: ${parts.join(', ')}.`;
   if (status.approximate > 0) {
     text += ` ${status.approximate} ${status.approximate === 1 ? 'has' : 'have'} an approximate pronunciation (a word not in the dictionaries).`;
+  }
+  if (status.storage === 'cache_full') {
+    text += ` No new clips are made: the audio cache is full (${gib(status.cache_bytes ?? 0)} of ${gib(status.cache_limit_bytes ?? 0)}).`;
+  } else if (status.storage === 'disk_low') {
+    text += ' No new clips are made: the server’s disk is nearly full.';
   }
   if (status.pending > 0) text += ' Until a clip is ready, ▶ uses the browser’s own speech.';
   return text;

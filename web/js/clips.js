@@ -148,8 +148,11 @@ export function preloadClips(info) {
     while (preloaded.size > MAX_PRELOADED) {
       const oldest = preloaded.keys().next().value;
       if (oldest === undefined) break;
-      preloaded.get(oldest)?.removeAttribute('src');
+      const element = preloaded.get(oldest);
       preloaded.delete(oldest);
+      // Removing `src` alone keeps the fetched media; load() releases it.
+      element?.removeAttribute('src');
+      element?.load();
     }
   }
 }

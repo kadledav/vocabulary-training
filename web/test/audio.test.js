@@ -45,4 +45,11 @@ test('R-40 Settings says how far the audio is and what is approximate', () => {
   assert.match(text, /40 clips ready, 12 being made, 1 failed\./);
   assert.match(text, /2 have an approximate pronunciation/);
   assert.match(audioStatusText(null), /could not be loaded/);
+  const counts = { enabled: true, connected: true, voice: 'us', ready: 3, pending: 2, failed: 0, approximate: 0 };
+  assert.doesNotMatch(audioStatusText({ ...counts, storage: 'ok' }), /No new clips/);
+  assert.match(
+    audioStatusText({ ...counts, storage: 'cache_full', cache_bytes: 2 ** 31, cache_limit_bytes: 2 ** 31 }),
+    /cache is full \(2\.0 GiB of 2\.0 GiB\)/,
+  );
+  assert.match(audioStatusText({ ...counts, storage: 'disk_low' }), /disk is nearly full/);
 });

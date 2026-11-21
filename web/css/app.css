@@ -2,6 +2,12 @@
    (data-theme on <html>) or, with "system", prefers-color-scheme (R-71).
    Sizes in rem. No inline styles anywhere (CSP style-src 'self'). */
 
+/* The `hidden` attribute always wins (a `display` rule such as the
+   buttons' inline-flex would otherwise show a hidden element). */
+[hidden] {
+  display: none !important;
+}
+
 :root {
   color-scheme: dark;
   --bg: #15171c;
