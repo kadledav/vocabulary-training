@@ -1,17 +1,30 @@
 //! What to say and how: the validated vocabulary of a speak request.
 //!
 //! Every value that reaches the engine went through here: the text (plain
-//! text only, bounded length, no control characters, no markup; R-84-style
-//! limits for untrusted input), the voice (one of the two voices the app
-//! offers, R-42) and the speed.
+//! text only, bounded length, no control characters, no markup, bounded
+//! words and numbers; R-84-style limits for untrusted input), the voice (one
+//! of the two voices the app offers, R-42) and the speed.
+//!
+//! Normalisation before the checks: invisible formatting characters are
+//! removed (the set the pack keys ignore, `vocab_pack::keys::is_invisible`;
+//! a soft hyphen joins its word again) and every whitespace character
+//! (tab, line breaks) becomes a space.
 
 use std::fmt;
 
 use sha2::{Digest, Sha256};
+use vocab_pack::keys::is_invisible;
 
 /// Longest text accepted, in characters (design §10.2). The app sends a
 /// headword or one book sentence; 600 characters is several long sentences.
 pub const MAX_CHARS: usize = 600;
+/// Longest run of non-space characters ("pneumonoultramicroscopicsilico-
+/// volcanoconiosis" has 45): anything longer is not a word to speak and
+/// would make one oversized piece for the engine.
+pub const MAX_TOKEN_CHARS: usize = 64;
+/// Longest run of digits (longer ones are read digit by digit anyway, and
+/// only an id or a garbled text has more).
+pub const MAX_DIGITS: usize = 15;
 
 /// Text to speak: trimmed, non-empty, at most [`MAX_CHARS`] characters, no
 /// control or invisible formatting characters, no markup.
@@ -34,12 +47,37 @@ pub enum TextError {
     ControlCharacter,
     #[error("the text contains markup ('<' or '>'); only plain text is spoken (no SSML)")]
     Markup,
+    #[error("the text contains a word longer than {MAX_TOKEN_CHARS} characters")]
+    TokenTooLong,
+    #[error("the text contains a number longer than {MAX_DIGITS} digits")]
+    NumberTooLong,
+}
+
+impl TextError {
+    /// The API error code: format problems are `invalid_text` (400); a text
+    /// that is valid but cannot be spoken sensibly is unprocessable (422).
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::TokenTooLong => "token_too_long",
+            Self::NumberTooLong => "number_too_long",
+            _ => "invalid_text",
+        }
+    }
+
+    pub fn unprocessable(self) -> bool {
+        matches!(self, Self::TokenTooLong | Self::NumberTooLong)
+    }
 }
 
 impl SpeakText {
-    /// Validate `text` (surrounding whitespace is trimmed first).
+    /// Normalise and validate `text` (see the module documentation).
     pub fn new(text: &str) -> Result<Self, TextError> {
-        let text = text.trim();
+        let normalised: String = text
+            .chars()
+            .filter(|c| !is_invisible(*c))
+            .map(|c| if c.is_whitespace() { ' ' } else { c })
+            .collect();
+        let text = normalised.trim();
         if text.is_empty() {
             return Err(TextError::Empty);
         }
@@ -51,6 +89,18 @@ impl SpeakText {
         }
         if text.contains(['<', '>']) {
             return Err(TextError::Markup);
+        }
+        for token in text.split(' ') {
+            if token.chars().count() > MAX_TOKEN_CHARS {
+                return Err(TextError::TokenTooLong);
+            }
+            let mut run = 0;
+            for c in token.chars() {
+                run = if c.is_ascii_digit() { run + 1 } else { 0 };
+                if run > MAX_DIGITS {
+                    return Err(TextError::NumberTooLong);
+                }
+            }
         }
         Ok(Self(text.to_owned()))
     }
@@ -89,20 +139,11 @@ impl fmt::Display for SpeakText {
     }
 }
 
-/// Control characters (C0, C1, DEL; also tab and line breaks: a sentence is
-/// one line), line/paragraph separators and the invisible bidirectional and
-/// zero-width formatting characters, which can hide text from a reviewer.
+/// Control characters left after normalisation (C0, C1, DEL; whitespace
+/// ones became spaces) and the interlinear annotation characters, which
+/// can hide text.
 fn is_forbidden_char(c: char) -> bool {
-    c.is_control()
-        || matches!(c,
-            '\u{200B}'..='\u{200F}' // zero-width space/joiners, LRM/RLM
-            | '\u{2028}' | '\u{2029}' // line and paragraph separator
-            | '\u{202A}'..='\u{202E}' // bidi embeddings and overrides
-            | '\u{2060}'..='\u{2064}' // word joiner, invisible operators
-            | '\u{2066}'..='\u{2069}' // bidi isolates
-            | '\u{FEFF}' // byte order mark / zero-width no-break space
-            | '\u{FFF9}'..='\u{FFFB}' // interlinear annotation
-        )
+    c.is_control() || matches!(c, '\u{FFF9}'..='\u{FFFB}')
 }
 
 /// The voices the app offers (design §10.1, decision 7, R-42).
@@ -193,24 +234,21 @@ mod tests {
 
     #[test]
     fn r84_length_limit_counts_characters_not_bytes() {
-        let at_limit = "é".repeat(MAX_CHARS);
+        let at_limit = vec!["éé"; MAX_CHARS / 3].join(" ");
+        assert_eq!(at_limit.chars().count(), MAX_CHARS - 1);
         assert!(SpeakText::new(&at_limit).is_ok());
         let over = "a".repeat(MAX_CHARS + 1);
         assert_eq!(SpeakText::new(&over), Err(TextError::TooLong));
     }
 
     #[test]
-    fn r84_control_and_invisible_characters_are_rejected() {
+    fn r84_control_characters_are_rejected() {
         for bad in [
-            "line\nbreak",
-            "tab\there",
-            "nul\0",
+            "nul\0here",
             "esc\u{1b}[31m",
-            "c1\u{85}next",
-            "bidi\u{202e}txet",
-            "zero\u{200b}width",
-            "iso\u{2066}late",
-            "bom\u{feff}",
+            "c1\u{9b}x",
+            "del\u{7f}x",
+            "ann\u{FFF9}x",
         ] {
             assert_eq!(
                 SpeakText::new(bad),
@@ -218,6 +256,49 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn r84_whitespace_is_normalised_and_invisible_characters_removed() {
+        for (input, spoken) in [
+            ("line\nbreak", "line break"),
+            ("tab\there", "tab here"),
+            ("cr\r\nlf", "cr  lf"),
+            ("nel\u{85}x", "nel x"),
+            ("ls\u{2028}x", "ls x"),
+            ("loi\u{00AD}ter", "loiter"),
+            ("zero\u{200b}width", "zerowidth"),
+            ("bidi\u{202e}x\u{2069}", "bidix"),
+            ("\u{feff}bom", "bom"),
+            ("mark\u{200e}", "mark"),
+        ] {
+            assert_eq!(
+                SpeakText::new(input).map(|t| t.as_str().to_owned()),
+                Ok(spoken.to_owned()),
+                "{input:?}"
+            );
+        }
+        assert_eq!(SpeakText::new("\u{200b}\u{feff}"), Err(TextError::Empty));
+    }
+
+    #[test]
+    fn r84_overlong_words_and_numbers_are_unprocessable() {
+        let compound = vec!["internationalization"; 20].join("-");
+        assert_eq!(SpeakText::new(&compound), Err(TextError::TokenTooLong));
+        assert_eq!(
+            SpeakText::new(&"9".repeat(16)),
+            Err(TextError::NumberTooLong)
+        );
+        assert_eq!(
+            SpeakText::new(&format!("call {}", "1".repeat(16))),
+            Err(TextError::NumberTooLong)
+        );
+        assert!(SpeakText::new(&"9".repeat(15)).is_ok());
+        assert!(SpeakText::new("pneumonoultramicroscopicsilicovolcanoconiosis").is_ok());
+        assert!(SpeakText::new("1,000,000,000,000,000").is_ok());
+        assert!(TextError::TokenTooLong.unprocessable());
+        assert_eq!(TextError::NumberTooLong.code(), "number_too_long");
+        assert_eq!(TextError::Markup.code(), "invalid_text");
     }
 
     #[test]

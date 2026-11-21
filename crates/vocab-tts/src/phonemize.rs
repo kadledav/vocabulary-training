@@ -41,7 +41,7 @@ const FALLBACK: &str = "cmudict.dict";
 /// Version of this front-end: part of the app's clip identity, so a change
 /// in how text becomes phonemes regenerates the clips. Bump it with every
 /// change of the rules or the dictionaries.
-pub const FRONTEND_VERSION: &str = "g2p-2";
+pub const FRONTEND_VERSION: &str = "g2p-3";
 /// Phoneme symbols per chunk the engine synthesises in one pass; Kokoro's
 /// context is 510 symbols, and shorter chunks keep the prosody stable.
 const MAX_CHUNK_SYMBOLS: usize = 300;
@@ -176,13 +176,16 @@ pub struct Tally {
     pub fallback: usize,
     /// Not found anywhere: spoken letter by letter.
     pub spelled: usize,
+    /// Nothing speakable came out of it (another script, a symbol): it is
+    /// not spoken at all.
+    pub dropped: usize,
 }
 
 impl Tally {
     /// Words whose pronunciation is a guess rather than a dictionary entry
     /// for this accent: fallback-dictionary words and spelled words.
     pub fn approximate(&self) -> usize {
-        self.fallback + self.spelled
+        self.fallback + self.spelled + self.dropped
     }
 }
 
@@ -237,6 +240,8 @@ impl Phonemes {
 enum Piece {
     Word(String),
     Pause(char),
+    /// A symbol that is not read (counted as approximate).
+    Dropped,
 }
 
 impl Phonemizer {
@@ -316,46 +321,34 @@ impl Phonemizer {
             Accent::Gb => &self.gb,
         };
         let mut tally = Tally::default();
-        let mut chunks = Vec::new();
-        let mut current = String::new();
-        let mut current_len = 0;
+        let mut chunks = Chunks::default();
         for piece in pieces(text.as_str()) {
             match piece {
                 Piece::Word(word) => {
                     let phonemes =
                         self.known(&word_phonemes(dictionaries, accent, &word, &mut tally));
-                    let len = phonemes.chars().count();
-                    if len == 0 {
+                    if phonemes.trim().is_empty() {
+                        tally.dropped += 1;
                         continue;
                     }
-                    if current_len > 0 && current_len + 1 + len > MAX_CHUNK_SYMBOLS {
-                        chunks.push(std::mem::take(&mut current));
-                        current_len = 0;
+                    // A number or a compound is several words: each is a
+                    // unit of its own, so even a long one is chunked.
+                    for part in phonemes.split(' ').filter(|p| !p.is_empty()) {
+                        chunks.word(part);
                     }
-                    if current_len > 0 {
-                        current.push(' ');
-                        current_len += 1;
-                    }
-                    current.push_str(&phonemes);
-                    current_len += len;
                 }
                 Piece::Pause(mark) => {
-                    if current_len == 0 || !self.symbols.contains(&mark) {
-                        continue; // nothing to pause after
-                    }
-                    current.push(mark);
-                    current_len += 1;
-                    if matches!(mark, '.' | '!' | '?') {
-                        chunks.push(std::mem::take(&mut current));
-                        current_len = 0;
+                    if self.symbols.contains(&mark) {
+                        chunks.pause(mark);
                     }
                 }
+                Piece::Dropped => tally.dropped += 1,
             }
         }
-        if current_len > 0 {
-            chunks.push(current);
+        Phonemes {
+            chunks: chunks.finish(),
+            tally,
         }
-        Phonemes { chunks, tally }
     }
 
     /// `phonemes` without symbols the model does not know.
@@ -364,6 +357,100 @@ impl Phonemizer {
             .chars()
             .filter(|c| self.symbols.contains(c))
             .collect()
+    }
+}
+
+/// Builds chunks of at most [`MAX_CHUNK_SYMBOLS`] symbols: breaks after a
+/// sentence end, before a word that would not fit, and inside a single
+/// word that alone is longer than a chunk (no chunk ever exceeds the limit,
+/// whatever the input).
+#[derive(Debug, Default)]
+struct Chunks {
+    done: Vec<String>,
+    current: String,
+    len: usize,
+}
+
+impl Chunks {
+    fn close(&mut self) {
+        if self.len > 0 {
+            self.done.push(std::mem::take(&mut self.current));
+            self.len = 0;
+        }
+    }
+
+    fn word(&mut self, phonemes: &str) {
+        let symbols: Vec<char> = phonemes.chars().collect();
+        for piece in symbols.chunks(MAX_CHUNK_SYMBOLS) {
+            if self.len > 0 && self.len + 1 + piece.len() > MAX_CHUNK_SYMBOLS {
+                self.close();
+            }
+            if self.len > 0 {
+                self.current.push(' ');
+                self.len += 1;
+            }
+            self.current.extend(piece);
+            self.len += piece.len();
+        }
+    }
+
+    fn pause(&mut self, mark: char) {
+        if self.len == 0 {
+            return; // nothing to pause after
+        }
+        if self.len + 1 > MAX_CHUNK_SYMBOLS {
+            self.close();
+            return;
+        }
+        self.current.push(mark);
+        self.len += 1;
+        if matches!(mark, '.' | '!' | '?') {
+            self.close();
+        }
+    }
+
+    fn finish(mut self) -> Vec<String> {
+        self.close();
+        self.done
+    }
+}
+
+/// Characters that separate words without being read and without counting
+/// as dropped (quotes and typographic marks).
+fn silent(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(
+            c,
+            '"' | '“'
+                | '”'
+                | '„'
+                | '‟'
+                | '«'
+                | '»'
+                | '‹'
+                | '›'
+                | '‚'
+                | '`'
+                | '´'
+                | '*'
+                | '_'
+                | '/'
+                | '\\'
+                | '•'
+                | '·'
+                | '|'
+                | '~'
+                | '^'
+        )
+}
+
+/// Currency signs read after their amount ("$5" → "five dollars").
+fn currency(c: char) -> Option<(&'static str, &'static str)> {
+    match c {
+        '$' => Some(("dollar", "dollars")),
+        '€' => Some(("euro", "euros")),
+        '£' => Some(("pound", "pounds")),
+        _ => None,
     }
 }
 
@@ -412,18 +499,46 @@ fn pieces(text: &str) -> Vec<Piece> {
                 flush(&mut word, &mut out);
                 out.push(Piece::Pause(','));
             }
-            '&' | '%' | '+' | '@' => {
+            '&' | '%' | '+' | '@' | '°' | '=' => {
                 flush(&mut word, &mut out);
                 let said = match c {
                     '&' => "and",
                     '%' => "percent",
                     '+' => "plus",
+                    '°' => "degrees",
+                    '=' => "equals",
                     _ => "at",
                 };
                 out.push(Piece::Word(said.to_owned()));
             }
+            _ if currency(c).is_some() && next.is_some_and(|n| n.is_ascii_digit()) => {
+                // "$5" / "$1,000.50": the amount, then the currency.
+                flush(&mut word, &mut out);
+                let mut j = i + 1;
+                let mut amount = String::new();
+                while let Some(&d) = chars.get(j) {
+                    let inside = matches!(d, '.' | ',')
+                        && chars.get(j + 1).is_some_and(char::is_ascii_digit);
+                    if !(d.is_ascii_digit() || inside) {
+                        break;
+                    }
+                    amount.push(d);
+                    j += 1;
+                }
+                if let Some((one, many)) = currency(c) {
+                    let name = if amount == "1" { one } else { many };
+                    out.push(Piece::Word(amount));
+                    out.push(Piece::Word(name.to_owned()));
+                }
+                i = j;
+                continue;
+            }
             _ if c.is_alphanumeric() || c == '-' || is_combining_mark(c) => word.push(c),
-            _ => flush(&mut word, &mut out),
+            _ if silent(c) => flush(&mut word, &mut out),
+            _ => {
+                flush(&mut word, &mut out);
+                out.push(Piece::Dropped);
+            }
         }
         i += 1;
     }
@@ -792,7 +907,8 @@ a ˈ A
                 lexicon: 1,
                 derived: 0,
                 fallback: 2,
-                spelled: 0
+                spelled: 0,
+                dropped: 0
             }
         );
         assert_eq!(us.tally().approximate(), 2);
@@ -819,7 +935,8 @@ a ˈ A
                 lexicon: 2,
                 derived: 2,
                 fallback: 0,
-                spelled: 1
+                spelled: 1,
+                dropped: 0
             }
         );
         assert_eq!(p.tally().approximate(), 1);
@@ -851,6 +968,65 @@ a ˈ A
                 .all(|c| c.chars().count() <= MAX_CHUNK_SYMBOLS)
         );
         assert_eq!(p.chunks().concat().matches("həlˈO").count(), 90);
+    }
+
+    #[test]
+    fn r40_no_chunk_exceeds_the_limit_even_for_one_huge_word() {
+        let mut chunks = Chunks::default();
+        chunks.word("həlˈO");
+        chunks.word(&"ab".repeat(400));
+        chunks.pause(',');
+        chunks.word("kˈæt");
+        let done = chunks.finish();
+        assert!(
+            done.iter().all(|c| c.chars().count() <= MAX_CHUNK_SYMBOLS),
+            "{done:?}"
+        );
+        let symbols: usize = done
+            .iter()
+            .map(|c| c.chars().filter(|c| *c != ' ').count())
+            .sum();
+        assert_eq!(symbols, 5 + 800 + 1 + 4);
+        // Hyphenated compounds and long numbers are several words each.
+        for text in [["zxc"; 10].join("-"), "zxc".repeat(21)] {
+            let p = us(&text);
+            assert!(!p.is_empty());
+            assert!(
+                p.chunks()
+                    .iter()
+                    .all(|c| c.chars().count() <= MAX_CHUNK_SYMBOLS),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn r40_invisible_characters_join_the_word_instead_of_spelling_it() {
+        let p = us("do\u{00AD}g ca\u{200B}t");
+        assert_eq!(p.chunks(), ["dˈɔɡ kˈæt"]);
+        assert_eq!(p.tally().approximate(), 0);
+    }
+
+    #[test]
+    fn r40_symbols_are_read_or_counted_as_dropped() {
+        assert_eq!(
+            pieces("$5 €1 £2.50"),
+            ["5", "dollars", "1", "euro", "2.50", "pounds"].map(|w| Piece::Word(w.to_owned()))
+        );
+        assert_eq!(
+            pieces("20° = x"),
+            ["20", "degrees", "equals", "x"].map(|w| Piece::Word(w.to_owned()))
+        );
+        // A lone currency sign is not read; quotes are silent, not dropped.
+        assert_eq!(
+            pieces("$ \"cat\""),
+            [Piece::Dropped, Piece::Word("cat".to_owned())]
+        );
+        let p = us("cat ¶ dog §");
+        assert_eq!(p.chunks(), ["kˈæt dˈɔɡ"]);
+        assert_eq!(p.tally().dropped, 2);
+        assert_eq!(p.tally().approximate(), 2);
+        assert_eq!(us("“cat”").tally().approximate(), 0);
     }
 
     #[test]

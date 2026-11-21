@@ -29,6 +29,7 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 unicode-normalization.workspace = true
+vocab-pack.workspace = true
 
 # The engine links the sherpa-onnx static libraries; only builds with
 # RUSTFLAGS="--cfg vocab_tts_engine" (docker/Dockerfile.tts) have it, so the

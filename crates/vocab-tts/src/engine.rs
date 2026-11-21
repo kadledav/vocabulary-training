@@ -14,6 +14,8 @@
 //! ([`crate::phonemize`]), so nothing it logs can contain a word of a book.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(vocab_tts_engine)]
 mod kokoro;
@@ -32,15 +34,37 @@ const SPEAKERS: usize = 54;
 /// here makes the app generate its clips again.
 pub const ENGINE_VERSION: &str = "kokoro-multi-lang-v1_0+sherpa-onnx-2.0.1";
 
+/// Set when nobody waits for the audio any more (the request timed out or
+/// the client went away): work that has not started is skipped, and the
+/// engine stops after the chunk it is on.
+#[derive(Debug, Clone, Default)]
+pub struct Cancel(Arc<AtomicBool>);
+
+impl Cancel {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
 /// Turns phonemes into samples. Implementations need not be thread-safe:
 /// callers serialise them (one synthesis at a time, see `speaker`).
 pub trait Synthesizer: Send {
-    /// Speak `phonemes` (not empty) with `voice` at `speed`.
+    /// Speak `phonemes` (not empty) with `voice` at `speed`; stop between
+    /// chunks once `cancel` is set (then [`EngineError::Cancelled`]).
     fn synthesize(
         &mut self,
         phonemes: &Phonemes,
         voice: Voice,
         speed: Speed,
+        cancel: &Cancel,
     ) -> Result<Pcm, EngineError>;
 }
 
@@ -54,6 +78,8 @@ pub enum EngineError {
     WrongModel { found: i32 },
     #[error("the engine produced no audio")]
     NoAudio,
+    #[error("nobody waits for the audio any more")]
+    Cancelled,
     #[error(
         "this build has no TTS engine (build with RUSTFLAGS=\"--cfg vocab_tts_engine\" and SHERPA_ONNX_LIB_DIR, see docker/Dockerfile.tts)"
     )]

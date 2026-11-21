@@ -8,7 +8,7 @@ use sherpa_onnx::{
     OfflineTtsModelConfig,
 };
 
-use super::{EngineError, MODEL, SPEAKERS, SYMBOLS, Synthesizer, VOICES};
+use super::{Cancel, EngineError, MODEL, SPEAKERS, SYMBOLS, Synthesizer, VOICES};
 use crate::phonemize::Phonemes;
 use crate::postprocess::Pcm;
 use crate::speech::{Speed, Voice};
@@ -78,7 +78,11 @@ impl Synthesizer for Kokoro {
         phonemes: &Phonemes,
         voice: Voice,
         speed: Speed,
+        cancel: &Cancel,
     ) -> Result<Pcm, EngineError> {
+        if cancel.is_cancelled() {
+            return Err(EngineError::Cancelled);
+        }
         let codepoints = phonemes
             .chunks()
             .iter()
@@ -96,10 +100,17 @@ impl Synthesizer for Kokoro {
             phoneme_codepoints: Some(codepoints),
             ..Default::default()
         };
+        // Called after each chunk (one chunk per batch, `max_num_sentences`
+        // 1): returning false stops the engine there.
+        let watch = cancel.clone();
+        let progress = move |_samples: &[f32], _progress: f32| !watch.is_cancelled();
         let audio = self
             .tts
-            .generate_with_config::<fn(&[f32], f32) -> bool>("", &config, None)
+            .generate_with_config("", &config, Some(progress))
             .ok_or(EngineError::NoAudio)?;
+        if cancel.is_cancelled() {
+            return Err(EngineError::Cancelled);
+        }
         let rate = u32::try_from(audio.sample_rate()).map_err(|_| EngineError::NoAudio)?;
         if audio.samples().is_empty() {
             return Err(EngineError::NoAudio);

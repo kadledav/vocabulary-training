@@ -15,9 +15,8 @@
 //!   equivalents, accepted answers, confusables, forms).
 //!
 //! All three first remove invisible characters that copy-paste or a model
-//! can slip into a word without changing how it looks: zero-width space,
-//! non-joiner and joiner (U+200B–U+200D), word joiner (U+2060), byte order
-//! mark (U+FEFF) and soft hyphen (U+00AD).
+//! can slip into a word without changing how it looks ([`strip_invisible`];
+//! the server removes the same set from the text it sends to speech).
 
 use unicode_normalization::UnicodeNormalization;
 
@@ -86,14 +85,25 @@ pub fn item_key(item: &str) -> String {
     collapse_whitespace(&nfc(&strip_invisible(item))).to_lowercase()
 }
 
-fn is_invisible(c: char) -> bool {
+/// Invisible formatting characters: zero-width space, non-joiner and
+/// joiner, left-to-right and right-to-left marks (U+200B–U+200F), word
+/// joiner and invisible operators (U+2060–U+2064), bidirectional embeddings,
+/// overrides and isolates (U+202A–U+202E, U+2066–U+2069), byte order mark
+/// (U+FEFF) and soft hyphen (U+00AD: removing it joins the word again).
+pub fn is_invisible(c: char) -> bool {
     matches!(
         c,
-        '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{2060}' | '\u{FEFF}' | '\u{00AD}'
+        '\u{200B}'..='\u{200F}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+            | '\u{00AD}'
     )
 }
 
-fn strip_invisible(text: &str) -> String {
+/// `text` without [invisible](is_invisible) characters.
+pub fn strip_invisible(text: &str) -> String {
     text.chars().filter(|&c| !is_invisible(c)).collect()
 }
 

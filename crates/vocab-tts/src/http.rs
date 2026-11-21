@@ -133,7 +133,14 @@ async fn speak(
         };
     let text = match SpeakText::new(&request.text) {
         Ok(text) => text,
-        Err(err) => return error(StatusCode::BAD_REQUEST, "invalid_text", &err.to_string()),
+        Err(err) => {
+            let status = if err.unprocessable() {
+                StatusCode::UNPROCESSABLE_ENTITY
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            return error(status, err.code(), &err.to_string());
+        }
     };
     let voice = match request.voice.as_deref() {
         None => Voice::DEFAULT,
@@ -190,6 +197,16 @@ async fn speak(
             StatusCode::UNPROCESSABLE_ENTITY,
             "nothing_to_say",
             "nothing in the text can be spoken",
+        ),
+        Err(SpeakError::TooLong(_)) => error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "too_long_to_speak",
+            "the text would take too long to speak (numbers or letters spelled out)",
+        ),
+        Err(SpeakError::Cancelled) => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "timeout",
+            "the request took too long",
         ),
         Err(SpeakError::Busy) => {
             let mut response = error(

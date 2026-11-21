@@ -11,7 +11,7 @@ use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode, header};
 use tower::ServiceExt;
-use vocab_tts::engine::{EngineError, Synthesizer};
+use vocab_tts::engine::{Cancel, EngineError, Synthesizer};
 use vocab_tts::http;
 use vocab_tts::phonemize::{Lexicon, Phonemes, Phonemizer, parse_symbols};
 use vocab_tts::postprocess::Pcm;
@@ -46,10 +46,14 @@ impl Synthesizer for FakeEngine {
         phonemes: &Phonemes,
         voice: Voice,
         speed: Speed,
+        cancel: &Cancel,
     ) -> Result<Pcm, EngineError> {
         if let Some((started, release)) = &self.gate {
             started.send(()).ok();
             release.recv().ok();
+        }
+        if cancel.is_cancelled() {
+            return Err(EngineError::Cancelled);
         }
         self.calls.lock().expect("test setup").push(Call {
             voice,
