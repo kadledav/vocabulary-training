@@ -32,6 +32,8 @@ design's choice works; three findings change details of §10 (below).
 | RTF overall in the container (11 items, 42 s of audio) | **0.36** | – |
 | 598-character text in the container | 10.6 s for 31 s of audio | – |
 | Peak container memory (`docker stats`, incl. the 598-char text) | **0.91 GB** | – |
+| Fix round, 150-symbol chunks, 1280 MB limit: idle / 50 × the 600-char text / 30 × worst accepted texts alternated (compounds, 15-digit numbers, long sentences) | 567 / 760 (flat) / 980 (plateau) MiB, never OOM | – |
+| One unpunctuated chunk of 150 / 210 / 300 symbols (fresh container) | 753 / 887 / 998 MiB; two different 300-symbol chunks 1353 MiB (why chunks are ≤ 150) | – |
 | Threads/PIDs in the container | 5 | – |
 | Image size (linux/arm64) | 433 MB | – |
 | MP3 size | ≈ 7.5 KB/s (≈ 60 kbit/s VBR q5): word ≈ 5 KB, sentence ≈ 25–40 KB | |

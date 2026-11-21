@@ -135,8 +135,10 @@ voices, US `af_heart` and UK `bf_emma`). It needs no setup:
   accepts only an internal `VOCAB_TTS_URL` — a host name without dots (the
   compose service name), `localhost`, or a loopback, private or link-local
   IP address — and refuses to start with anything else.
-- Limits: 1280 MB memory without swap, 2 CPUs, 64 PIDs (measured peak about
-  0.9 GB for the longest text, 5 threads). `docker ps` shows it `healthy`
+- Limits: 1280 MB memory without swap, 2 CPUs, 64 PIDs (measured under
+  these limits: idle 0.57 GiB; 50 of the longest texts in a row stay at
+  0.76 GiB; the worst texts the service accepts, alternated, settle at
+  0.98 GiB; 5 threads). `docker ps` shows it `healthy`
   about 10 s after the start (model load and a self-test of both voices).
 - Its log has one line per clip with lengths and a hash of the text, never
   the text itself (`docker logs vocabulary-tts`).
