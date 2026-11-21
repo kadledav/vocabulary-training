@@ -53,6 +53,11 @@ pub trait Backend: Send + Sync + std::fmt::Debug {
     fn healthy(&self) -> bool {
         true
     }
+
+    /// Whether the model is in memory now (or being loaded or used).
+    fn loaded(&self) -> bool {
+        true
+    }
 }
 
 /// A spoken text with what the log may say about it.
@@ -144,6 +149,11 @@ impl Speaker {
     /// See [`Backend::healthy`].
     pub fn healthy(&self) -> bool {
         self.backend.healthy()
+    }
+
+    /// See [`Backend::loaded`].
+    pub fn loaded(&self) -> bool {
+        self.backend.loaded()
     }
 }
 

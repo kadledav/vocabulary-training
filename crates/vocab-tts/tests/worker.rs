@@ -67,6 +67,16 @@ async fn r83_started_on_demand_reused_and_stopped_when_idle() {
         }
     }
     assert!(stopped, "stopped after the idle time");
+    let app = vocab_tts::http::app(Arc::clone(&speaker));
+    let request = axum::http::Request::get("/healthz")
+        .body(axum::body::Body::empty())
+        .expect("test setup");
+    let (status, _, body) = send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).expect("json"),
+        serde_json::json!({ "status": "ok", "engine": "unloaded" })
+    );
     // And started again for the next request.
     say(&speaker).await.expect("spoken again");
     assert!(worker.healthy());

@@ -13,9 +13,10 @@
 //!   this text), `503` busy or timeout.
 //! * `GET /v1/voices` → the voices and their accents, and the front-end and
 //!   engine versions (the app's clip identity).
-//! * `GET /healthz` → `200` once the start self-test spoke (before the
-//!   listener opens), `503` `engine_failed` while the engine process cannot
-//!   be started (until a start succeeds).
+//! * `GET /healthz` → `200` `{"status": "ok", "engine": "loaded" |
+//!   "unloaded"}` (whether the model is in memory now) once the start
+//!   self-test spoke (before the listener opens), `503` `engine_failed`
+//!   while the engine process cannot be started (until a start succeeds).
 //!
 //! No authentication: the container is reachable only from the app, on an
 //! internal network without a route anywhere else (R-83). Every input is
@@ -95,7 +96,12 @@ async fn not_found() -> Response {
 
 async fn healthz(State(speaker): State<Arc<Speaker>>) -> Response {
     if speaker.healthy() {
-        Json(serde_json::json!({ "status": "ok" })).into_response()
+        let engine = if speaker.loaded() {
+            "loaded"
+        } else {
+            "unloaded"
+        };
+        Json(serde_json::json!({ "status": "ok", "engine": engine })).into_response()
     } else {
         error(
             StatusCode::SERVICE_UNAVAILABLE,

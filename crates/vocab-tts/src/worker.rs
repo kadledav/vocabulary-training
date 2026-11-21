@@ -441,6 +441,13 @@ impl Backend for Worker {
     fn healthy(&self) -> bool {
         self.healthy.load(Ordering::SeqCst)
     }
+
+    /// Busy (the slot is held by work): loaded or loading.
+    fn loaded(&self) -> bool {
+        self.slot
+            .try_lock()
+            .map_or(true, |slot| slot.running.is_some())
+    }
 }
 
 impl Running {
