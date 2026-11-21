@@ -29,13 +29,15 @@ pub fn tts_voice(voice: Voice) -> &'static str {
 /// text exists, so switching back and forth does not regenerate).
 pub const VOICES: [Voice; 2] = [Voice::Us, Voice::Uk];
 
-/// The text to speak for a catalog text: whitespace collapsed, a leading or
+/// The text to speak for a catalog text: invisible characters removed (the
+/// set the pack keys ignore, [`vocab_pack::keys::strip_invisible`]: a soft
+/// hyphen joins its word again), whitespace collapsed, a leading or
 /// trailing ellipsis (`…`, `...`) removed (a book excerpt often starts or
 /// ends mid-sentence), angle brackets dropped (the service speaks plain text
 /// only). `None` if nothing is left or the text is longer than the service
 /// accepts (then the browser's speech is the fallback, R-41).
 pub fn spoken(raw: &str) -> Option<String> {
-    let mut text: String = raw
+    let mut text: String = vocab_pack::keys::strip_invisible(raw)
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -101,6 +103,20 @@ mod tests {
         assert_eq!(spoken("…"), None);
         assert_eq!(spoken("  "), None);
         assert_eq!(spoken(&"word ".repeat(130)), None);
+    }
+
+    #[test]
+    fn r40_invisible_characters_are_not_spoken() {
+        assert_eq!(spoken("loi\u{00AD}ter").as_deref(), Some("loiter"));
+        assert_eq!(
+            spoken("\u{feff}zero\u{200b}width \u{202e}mark\u{2069}\u{200e}").as_deref(),
+            Some("zerowidth mark")
+        );
+        assert_eq!(
+            spoken("tab\there\r\nnext").as_deref(),
+            Some("tab here next")
+        );
+        assert_eq!(spoken("\u{200b}\u{00ad}"), None);
     }
 
     #[test]

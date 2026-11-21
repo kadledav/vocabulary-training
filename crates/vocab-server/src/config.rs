@@ -9,7 +9,7 @@
 //! | `VOCAB_LISTEN` | `0.0.0.0:8080` | listen address (development and tests) |
 //! | `VOCAB_DATA_DIR` | `/data` | the SQLite file set (and the cache below it) |
 //! | `VOCAB_CACHE_DIR` | `<data dir>/cache` | audio files |
-//! | `VOCAB_TTS_URL` | — (no neural audio) | the TTS service, `http://host[:port]` on the internal network |
+//! | `VOCAB_TTS_URL` | — (no neural audio) | the TTS service, `http://host[:port]` on the internal network: a host name without dots (the compose service name), `localhost`, or a loopback, private or link-local IP address; anything else is refused at start (the service has no authentication) |
 //!
 //! Any other `VOCAB_*` variable (a typo, a removed setting such as the M5
 //! secrets) and any invalid value is a startup error naming the variable.
@@ -479,6 +479,31 @@ mod tests {
             config.tts.map(|t| t.to_string()).as_deref(),
             Some("http://vocabulary-tts:8090")
         );
+    }
+
+    #[test]
+    fn r83_tts_url_must_be_on_the_internal_network() {
+        for public in [
+            "http://tts.example.org:8090",
+            "http://203.0.113.9:8090",
+            "http://[2001:db8::5]:8090",
+        ] {
+            let err = load(&[ORIGIN, (TTS_URL_ENV, public)]).expect_err(public);
+            assert!(
+                err.contains(TTS_URL_ENV) && err.contains("internal network"),
+                "{public}: {err}"
+            );
+        }
+        for internal in [
+            "http://localhost:8090",
+            "http://10.1.2.3:8090",
+            "http://[::1]:8090",
+        ] {
+            assert!(
+                load(&[ORIGIN, (TTS_URL_ENV, internal)]).is_ok(),
+                "{internal}"
+            );
+        }
     }
 
     #[test]

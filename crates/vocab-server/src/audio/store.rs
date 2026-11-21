@@ -64,6 +64,12 @@ impl Store {
         File::open(parent)?.sync_all()
     }
 
+    /// Bytes available to this process on the store's file system.
+    pub fn free_bytes(&self) -> io::Result<u64> {
+        let stats = rustix::fs::statvfs(&self.dir)?;
+        Ok(stats.f_bavail.saturating_mul(stats.f_frsize))
+    }
+
     /// The clip's file, if there is one.
     pub fn open_clip(&self, hash: &str) -> io::Result<Option<File>> {
         if !is_clip_hash(hash) {
@@ -144,6 +150,13 @@ mod tests {
         store.remove(HASH).expect("remove");
         assert!(store.open_clip(HASH).expect("open").is_none());
         assert!(store.open_clip(HASH).expect("open").is_none());
+    }
+
+    #[test]
+    fn r85_free_space_is_measured() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("store");
+        assert!(store.free_bytes().expect("statvfs") > 0);
     }
 
     #[test]

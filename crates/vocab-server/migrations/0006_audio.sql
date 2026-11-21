@@ -9,13 +9,22 @@
 ALTER TABLE audio_clip ADD COLUMN approximate INTEGER NOT NULL DEFAULT 0
   CHECK (approximate >= 0);
 
--- 2. Counts per status for Settings.
-CREATE INDEX audio_clip_status ON audio_clip(status);
+-- 2. `crashes`: how often the TTS service dropped the connection while
+--    making this clip (it may crash on the text); three crashes and the
+--    clip fails for good, so one text cannot keep the service restarting.
+ALTER TABLE audio_clip ADD COLUMN crashes INTEGER NOT NULL DEFAULT 0
+  CHECK (crashes >= 0);
 
--- 3. The TTS service's front-end and engine versions, part of every clip's
+-- 3. Counts per status for Settings; lookups by text (a clip of an older
+--    TTS version is played until its replacement is ready).
+CREATE INDEX audio_clip_status ON audio_clip(status);
+CREATE INDEX audio_clip_text ON audio_clip(voice, text);
+
+-- 4. The TTS service's front-end and engine versions, part of every clip's
 --    identity: one row, written when the service first answers and
---    whenever its versions change (then all clips are made again and the
---    old ones are garbage-collected).
+--    whenever its versions change (then all clips are made again; an old
+--    clip stays playable until its replacement is ready, then it is
+--    garbage-collected).
 CREATE TABLE audio_engine (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   frontend TEXT NOT NULL,

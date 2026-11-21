@@ -40,6 +40,14 @@ pub struct Job {
     pub text: String,
     pub voice: String,
     pub attempts: i64,
+    pub crashes: i64,
+}
+
+/// A ready clip that can be played.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Playable {
+    pub hash: String,
+    pub approximate: bool,
 }
 
 /// The stored state of one clip.
@@ -123,12 +131,15 @@ pub fn ready_hashes(conn: &Connection) -> rusqlite::Result<Vec<String>> {
     stmt.query_map([], |row| row.get(0))?.collect()
 }
 
-/// The next due clip: words before sentences, oldest first.
+/// The next due clip: words before sentences, then by when it became due
+/// (a clip that failed waits behind the others with its backoff, so one
+/// clip never starves the rest), oldest first.
 pub fn next_due(conn: &Connection, now: &str) -> rusqlite::Result<Option<Job>> {
     conn.query_row(
-        "SELECT hash, text, voice, attempts FROM audio_clip \
+        "SELECT hash, text, voice, attempts, crashes FROM audio_clip \
          WHERE status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?1) \
-         ORDER BY kind = 'word' DESC, created_at, hash LIMIT 1",
+         ORDER BY kind = 'word' DESC, attempts > 0, COALESCE(next_attempt_at, created_at), \
+         created_at, hash LIMIT 1",
         [now],
         |row| {
             Ok(Job {
@@ -136,10 +147,74 @@ pub fn next_due(conn: &Connection, now: &str) -> rusqlite::Result<Option<Job>> {
                 text: row.get(1)?,
                 voice: row.get(2)?,
                 attempts: row.get(3)?,
+                crashes: row.get(4)?,
             })
         },
     )
     .optional()
+}
+
+/// Bytes of all clip files (every voice and version).
+pub fn total_bytes(conn: &Connection) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT COALESCE(SUM(bytes), 0) FROM audio_clip WHERE status = 'ready'",
+        [],
+        |row| row.get(0),
+    )
+}
+
+/// The newest ready clip of `text` in the TTS voice `voice`, whatever
+/// versions made it (an older one plays until its replacement is ready).
+pub fn ready_by_text(
+    conn: &Connection,
+    voice: &str,
+    text: &str,
+) -> rusqlite::Result<Option<Playable>> {
+    conn.query_row(
+        "SELECT hash, approximate FROM audio_clip WHERE voice = ?1 AND text = ?2 \
+         AND status = 'ready' ORDER BY updated_at DESC, hash LIMIT 1",
+        params![voice, text],
+        |row| {
+            Ok(Playable {
+                hash: row.get(0)?,
+                approximate: row.get::<_, i64>(1)? > 0,
+            })
+        },
+    )
+    .optional()
+}
+
+/// Ready clips that still stand in for a wanted clip that is not ready
+/// yet (same text and voice, older versions): kept by garbage collection.
+pub fn stand_ins(conn: &Connection, wanted: &[Wanted]) -> rusqlite::Result<HashSet<String>> {
+    let mut keep = HashSet::new();
+    for w in wanted {
+        if clip_state(conn, &w.hash)?.is_some_and(|s| s.ready) {
+            continue;
+        }
+        if let Some(old) = ready_by_text(conn, w.voice, &w.text)? {
+            keep.insert(old.hash);
+        }
+    }
+    Ok(keep)
+}
+
+/// Delete the other clips of the same text and voice as `hash` (made by
+/// older versions, replaced now); returns their hashes (their files go too).
+pub fn delete_replaced(tx: &Transaction<'_>, hash: &str) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = tx.prepare(
+        "SELECT old.hash FROM audio_clip AS old JOIN audio_clip AS new \
+         ON new.hash = ?1 AND old.voice = new.voice AND old.text = new.text AND old.hash != new.hash \
+         ORDER BY old.hash",
+    )?;
+    let replaced: Vec<String> = stmt
+        .query_map([hash], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    let mut delete = tx.prepare("DELETE FROM audio_clip WHERE hash = ?1")?;
+    for old in &replaced {
+        delete.execute([old])?;
+    }
+    Ok(replaced)
 }
 
 /// When the earliest pending clip is due (none: `None`).
@@ -167,18 +242,25 @@ pub fn mark_ready(
     Ok(())
 }
 
+/// How far a clip got: its attempts and crashes so far.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tries {
+    pub attempts: i64,
+    pub crashes: i64,
+}
+
 pub fn mark_retry(
     tx: &Transaction<'_>,
     hash: &str,
-    attempts: i64,
+    tries: Tries,
     next_at: &str,
     error: &str,
     now: &str,
 ) -> rusqlite::Result<()> {
     tx.execute(
-        "UPDATE audio_clip SET attempts = ?2, next_attempt_at = ?3, last_error = ?4, updated_at = ?5 \
-         WHERE hash = ?1 AND status = 'pending'",
-        params![hash, attempts, next_at, error, now],
+        "UPDATE audio_clip SET attempts = ?2, crashes = ?3, next_attempt_at = ?4, last_error = ?5, \
+         updated_at = ?6 WHERE hash = ?1 AND status = 'pending'",
+        params![hash, tries.attempts, tries.crashes, next_at, error, now],
     )?;
     Ok(())
 }
@@ -186,14 +268,14 @@ pub fn mark_retry(
 pub fn mark_failed(
     tx: &Transaction<'_>,
     hash: &str,
-    attempts: i64,
+    tries: Tries,
     error: &str,
     now: &str,
 ) -> rusqlite::Result<()> {
     tx.execute(
-        "UPDATE audio_clip SET status = 'failed', attempts = ?2, last_error = ?3, next_attempt_at = NULL, \
-         updated_at = ?4 WHERE hash = ?1",
-        params![hash, attempts, error, now],
+        "UPDATE audio_clip SET status = 'failed', attempts = ?2, crashes = ?3, last_error = ?4, \
+         next_attempt_at = NULL, updated_at = ?5 WHERE hash = ?1",
+        params![hash, tries.attempts, tries.crashes, error, now],
     )?;
     Ok(())
 }
@@ -201,8 +283,8 @@ pub fn mark_failed(
 /// Back to the queue (a ready clip whose file is gone, R-85).
 pub fn requeue(tx: &Transaction<'_>, hash: &str, now: &str) -> rusqlite::Result<()> {
     tx.execute(
-        "UPDATE audio_clip SET status = 'pending', attempts = 0, next_attempt_at = ?2, bytes = NULL, \
-         duration_ms = NULL, updated_at = ?2 WHERE hash = ?1",
+        "UPDATE audio_clip SET status = 'pending', attempts = 0, crashes = 0, next_attempt_at = ?2, \
+         bytes = NULL, duration_ms = NULL, updated_at = ?2 WHERE hash = ?1",
         params![hash, now],
     )?;
     Ok(())
@@ -211,8 +293,8 @@ pub fn requeue(tx: &Transaction<'_>, hash: &str, now: &str) -> rusqlite::Result<
 /// Failed clips get a fresh start; returns how many.
 pub fn retry_failed(tx: &Transaction<'_>, now: &str) -> rusqlite::Result<usize> {
     tx.execute(
-        "UPDATE audio_clip SET status = 'pending', attempts = 0, next_attempt_at = ?1, last_error = NULL, \
-         updated_at = ?1 WHERE status = 'failed'",
+        "UPDATE audio_clip SET status = 'pending', attempts = 0, crashes = 0, next_attempt_at = ?1, \
+         last_error = NULL, updated_at = ?1 WHERE status = 'failed'",
         [now],
     )
 }

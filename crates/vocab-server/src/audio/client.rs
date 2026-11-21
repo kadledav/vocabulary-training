@@ -2,12 +2,14 @@
 //! and `POST /v1/speak`, over plain HTTP/1.1 on the internal network.
 //!
 //! Deliberately small and strict: only the one configured endpoint
-//! (`VOCAB_TTS_URL`, `http://host[:port]`, no path), one request per
+//! (`VOCAB_TTS_URL`, `http://host[:port]`, no path, an internal host only:
+//! see [`TtsEndpoint::parse`]), one request per
 //! connection, no redirects (a 3xx is an error), a timeout for the whole
 //! exchange, response heads up to 16 KiB and bodies up to a cap, a
 //! `Content-Length` is required (no chunked bodies). The text sent is never
 //! logged here or in the errors (R-24).
 
+use std::net::IpAddr;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -16,11 +18,14 @@ use tokio::net::TcpStream;
 use super::key::Versions;
 
 const MAX_HEAD: usize = 16 * 1024;
-/// A clip of the longest text is about 250 KB; far below this.
-const MAX_CLIP_BYTES: usize = 4 * 1024 * 1024;
+/// Largest clip accepted: 60 s (the longest clip, [`super::MAX_CLIP_MS`])
+/// at the service's 64 kbit/s is 480 KB; the longest text makes about 250 KB.
+pub const MAX_CLIP_BYTES: usize = 1024 * 1024;
 const MAX_JSON_BYTES: usize = 64 * 1024;
 const VOICES_TIMEOUT: Duration = Duration::from_secs(10);
-/// The service's own request timeout is 60 s.
+/// Longer than the service's own request timeout (60 s): a slow synthesis
+/// ends with the service's `503 timeout` (and the service cancels the
+/// work), not with this side hanging up first.
 const SPEAK_TIMEOUT: Duration = Duration::from_secs(75);
 
 /// The configured TTS service.
@@ -31,43 +36,103 @@ pub struct TtsEndpoint {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("must be http://host[:port] (an internal host name or IP address, no path)")]
-pub struct EndpointError;
+pub enum EndpointError {
+    #[error("must be http://host[:port] (a host name or IP address, no path)")]
+    Format,
+    #[error(
+        "must be on the internal network: a host name without dots (a compose service \
+         name such as vocabulary-tts), localhost, or a loopback, private or link-local \
+         IP address (the service has no authentication of its own)"
+    )]
+    NotInternal,
+}
+
+/// A loopback, private or link-local address (never one on the internet).
+fn is_internal(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            let first = v6.segments()[0];
+            v6.is_loopback() || first & 0xfe00 == 0xfc00 || first & 0xffc0 == 0xfe80
+        }
+    }
+}
 
 impl TtsEndpoint {
+    /// `http://host[:port]` where host is a name without dots (a compose
+    /// service name; a dotted name could resolve to anything on the
+    /// internet), `localhost`, an IPv4 address or a bracketed IPv6 address
+    /// in a loopback, private or link-local range.
     pub fn parse(url: &str) -> Result<Self, EndpointError> {
-        let rest = url.strip_prefix("http://").ok_or(EndpointError)?;
+        let rest = url.strip_prefix("http://").ok_or(EndpointError::Format)?;
         let rest = rest.strip_suffix('/').unwrap_or(rest);
-        let (host, port) = match rest.rsplit_once(':') {
-            Some((host, port)) => {
-                let port = port
-                    .parse::<u16>()
-                    .ok()
-                    .filter(|p| *p > 0 && !port.starts_with('0'))
-                    .ok_or(EndpointError)?;
-                (host, port)
+        let (host, port, bracketed) = if let Some(inner) = rest.strip_prefix('[') {
+            let (host, after) = inner.split_once(']').ok_or(EndpointError::Format)?;
+            (host, after.strip_prefix(':'), true)
+        } else {
+            match rest.rsplit_once(':') {
+                Some((host, port)) => (host, Some(port), false),
+                None => (rest, None, false),
             }
-            None => (rest, 80),
         };
-        let host_ok = !host.is_empty()
+        let port = match port {
+            Some(port) => port
+                .parse::<u16>()
+                .ok()
+                .filter(|p| *p > 0 && !port.starts_with('0'))
+                .ok_or(EndpointError::Format)?,
+            None if bracketed && !rest.ends_with(']') => return Err(EndpointError::Format),
+            None => 80,
+        };
+        if bracketed {
+            let ip = host
+                .parse::<std::net::Ipv6Addr>()
+                .map_err(|_| EndpointError::Format)?;
+            return if is_internal(IpAddr::V6(ip)) {
+                Ok(Self {
+                    host: ip.to_string(),
+                    port,
+                })
+            } else {
+                Err(EndpointError::NotInternal)
+            };
+        }
+        let syntax_ok = !host.is_empty()
             && host.len() <= 253
             && host
                 .bytes()
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
-            && !host.starts_with(['.', '-']);
-        if !host_ok {
-            return Err(EndpointError);
+            && !host.starts_with(['.', '-'])
+            && !host.ends_with(['.', '-']);
+        if !syntax_ok {
+            return Err(EndpointError::Format);
+        }
+        let internal = match host.parse::<std::net::Ipv4Addr>() {
+            Ok(ip) => is_internal(IpAddr::V4(ip)),
+            Err(_) => !host.contains('.') && host.len() <= 63,
+        };
+        if !internal {
+            return Err(EndpointError::NotInternal);
         }
         Ok(Self {
             host: host.to_owned(),
             port,
         })
     }
+
+    /// The host as it goes into a URL or a `Host` header.
+    fn authority(&self) -> String {
+        if self.host.contains(':') {
+            format!("[{}]:{}", self.host, self.port)
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
+    }
 }
 
 impl std::fmt::Display for TtsEndpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "http://{}:{}", self.host, self.port)
+        write!(f, "http://{}", self.authority())
     }
 }
 
@@ -78,6 +143,10 @@ pub enum CallError {
     /// worth trying again later.
     #[error("{0}")]
     Temporary(String),
+    /// The request was sent, then the connection died without a complete
+    /// answer: the service may have crashed on this text.
+    #[error("connection dropped: {0}")]
+    Dropped(String),
     /// The service refused this text for good (4xx): its error code.
     #[error("refused: {0}")]
     Refused(String),
@@ -125,8 +194,8 @@ async fn exchange(
             .await
             .map_err(|err| temporary(format!("connect {endpoint}: {err}")))?;
         let mut request = format!(
-            "{method} {path} HTTP/1.1\r\nHost: {}:{}\r\nAccept: */*\r\nConnection: close\r\n",
-            endpoint.host, endpoint.port
+            "{method} {path} HTTP/1.1\r\nHost: {}\r\nAccept: */*\r\nConnection: close\r\n",
+            endpoint.authority()
         );
         if let Some(body) = body {
             request.push_str(&format!(
@@ -148,6 +217,12 @@ async fn exchange(
         .map_err(|_| temporary(format!("no answer within {} s", timeout.as_secs())))?
 }
 
+fn dropped(message: impl Into<String>) -> CallError {
+    CallError::Dropped(message.into())
+}
+
+/// Read the answer to a request that was sent: a connection that dies
+/// before the answer is complete is [`CallError::Dropped`].
 async fn read_response(stream: &mut TcpStream, max_body: usize) -> Result<Response, CallError> {
     let mut buffer = Vec::with_capacity(8192);
     let mut chunk = [0u8; 8192];
@@ -155,9 +230,9 @@ async fn read_response(stream: &mut TcpStream, max_body: usize) -> Result<Respon
         let n = stream
             .read(&mut chunk)
             .await
-            .map_err(|err| temporary(format!("read: {err}")))?;
+            .map_err(|err| dropped(format!("read: {err}")))?;
         if n == 0 {
-            return Err(temporary("connection closed before the response head"));
+            return Err(dropped("closed before the response head"));
         }
         buffer.extend_from_slice(&chunk[..n]);
         let mut slots = [httparse::EMPTY_HEADER; 32];
@@ -200,9 +275,9 @@ async fn read_response(stream: &mut TcpStream, max_body: usize) -> Result<Respon
         let n = stream
             .read(&mut chunk)
             .await
-            .map_err(|err| temporary(format!("read: {err}")))?;
+            .map_err(|err| dropped(format!("read: {err}")))?;
         if n == 0 {
-            return Err(temporary("connection closed in the body"));
+            return Err(dropped("closed in the body"));
         }
         if body.len() + n > length {
             return Err(temporary("more data than Content-Length"));
@@ -267,6 +342,7 @@ pub async fn versions(endpoint: &TtsEndpoint) -> Result<Versions, CallError> {
         CallError::Refused(code) => temporary(code),
         other => other,
     })?;
+    // (A dropped connection here is just "unreachable" to the caller.)
     let json: serde_json::Value =
         serde_json::from_slice(&response.body).map_err(|_| temporary("/v1/voices: not JSON"))?;
     match (
@@ -336,12 +412,35 @@ mod tests {
     fn r83_only_a_plain_internal_http_endpoint_is_accepted() {
         let ok = TtsEndpoint::parse("http://vocabulary-tts:8090").expect("valid");
         assert_eq!(ok.to_string(), "http://vocabulary-tts:8090");
-        assert_eq!(
-            TtsEndpoint::parse("http://192.0.2.5/")
-                .expect("valid")
-                .to_string(),
-            "http://192.0.2.5:80"
-        );
+        for (url, shown) in [
+            ("http://10.0.0.5/", "http://10.0.0.5:80"),
+            ("http://localhost:8090", "http://localhost:8090"),
+            ("http://127.0.0.1:8090", "http://127.0.0.1:8090"),
+            ("http://172.20.0.3:8090", "http://172.20.0.3:8090"),
+            ("http://192.168.1.20:8090", "http://192.168.1.20:8090"),
+            ("http://169.254.10.1:8090", "http://169.254.10.1:8090"),
+            ("http://[::1]:8090", "http://[::1]:8090"),
+            ("http://[fd00::5]:8090", "http://[fd00::5]:8090"),
+            ("http://[fe80::1]", "http://[fe80::1]:80"),
+            ("http://tts", "http://tts:80"),
+        ] {
+            let endpoint = TtsEndpoint::parse(url).unwrap_or_else(|err| panic!("{url}: {err}"));
+            assert_eq!(endpoint.to_string(), shown);
+        }
+        for public in [
+            "http://192.0.2.5:8090",
+            "http://8.8.8.8:8090",
+            "http://tts.example.org:8090",
+            "http://tts.internal:8090",
+            "http://[2001:db8::1]:8090",
+            "http://0.0.0.0:8090",
+        ] {
+            assert_eq!(
+                TtsEndpoint::parse(public),
+                Err(EndpointError::NotInternal),
+                "{public}"
+            );
+        }
         for bad in [
             "https://vocabulary-tts:8090",
             "vocabulary-tts:8090",
@@ -352,9 +451,12 @@ mod tests {
             "http://vocabulary-tts:99999",
             "http://:8090",
             "http://tts:8090?x=1",
-            "http://[::1]:8090",
+            "http://[::1",
+            "http://[::1]8090",
+            "http://[nope]:8090",
+            "http://tts-:8090",
         ] {
-            assert_eq!(TtsEndpoint::parse(bad), Err(EndpointError), "{bad}");
+            assert_eq!(TtsEndpoint::parse(bad), Err(EndpointError::Format), "{bad}");
         }
     }
 
