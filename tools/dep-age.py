@@ -96,6 +96,9 @@ Immutable lookups (crate/npm/Rust/Node versions, image digests, Debian
 packages) are cached in .cache/dep-age/ (ignored by git; `--no-cache` or
 DEP_AGE_CACHE=<dir> to change); action tags are looked up on every run.
 
+On GitHub Actions (GITHUB_ACTIONS=true) every problem is also an `::error`
+annotation (the public API shows those without a login); at most 10 per step.
+
 Standard library only. Set GITHUB_TOKEN to raise the GitHub API rate limit
 (CI does this automatically). Self-tests: tools/tests/test_dep_age.py.
 """
@@ -115,6 +118,8 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
+
+import gha
 
 USER_AGENT = "dep-age-check/1.0 (dependency age gate; python urllib)"
 CRATES_IO = "registry+https://github.com/rust-lang/crates.io-index"
@@ -163,13 +168,16 @@ class Finding:
 class Result:
     findings: list[Finding] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    lookup_errors: list[str] = field(default_factory=list)  # the errors (also in `errors`) of failed lookups
 
     def add(self, kind: str, name: str, version: str, lookup, where: str = "") -> None:
         """Record a finding; a failed lookup becomes an error."""
         try:
             self.findings.append(Finding(kind, name, version, lookup()))
         except (LookupFailed, KeyError, TypeError, ValueError) as err:
-            self.errors.append(f"{where}{': ' if where else ''}{kind} {name} {version}: {err}")
+            message = f"{where}{': ' if where else ''}{kind} {name} {version}: {err}"
+            self.errors.append(message)
+            self.lookup_errors.append(message)
 
 
 # ── HTTP ─────────────────────────────────────────────────────────────────────
@@ -1574,6 +1582,28 @@ def evaluate(root: Path) -> Result:
     return result
 
 
+# GitHub shows at most 10 error annotations per step; the last one is the overflow note.
+MAX_ANNOTATIONS = 10
+
+
+def annotation_lines(too_young: list[str], result: Result) -> list[str]:
+    """`::error` workflow commands for the problems (lookup failures first),
+    only on GitHub Actions; the last one says how many more were left out."""
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        return []
+    lookups = set(result.lookup_errors)
+    others = [e for e in result.errors if e not in lookups]
+    problems = [("lookup failed", e) for e in result.lookup_errors]
+    problems += [("error", e) for e in others]
+    problems += [("too young", m) for m in too_young]
+    shown = problems if len(problems) <= MAX_ANNOTATIONS else problems[: MAX_ANNOTATIONS - 1]
+    lines = [gha.error_line(f"dep-age {t}", m) for t, m in shown]
+    if len(shown) < len(problems):
+        more = f"{len(problems) - len(shown)} more problems; see the job log"
+        lines.append(gha.error_line("dep-age", more))
+    return lines
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent)
@@ -1592,11 +1622,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.verbose:
         for f in sorted(result.findings, key=lambda f: (f.kind, f.name, f.version)):
             print(f"  {f.kind:6} {f.name} {f.version}  {f.published:%Y-%m-%d}  {f.age_days(now):6.1f} d")
-    for f in sorted(too_young, key=lambda f: f.published, reverse=True):
-        print(
-            f"TOO YOUNG: {f.kind} {f.name} {f.version} published {f.published:%Y-%m-%d %H:%M} UTC "
-            f"({f.age_days(now):.1f} days < {args.min_age_days:g})"
-        )
+    young_lines = [
+        f"{f.kind} {f.name} {f.version} published {f.published:%Y-%m-%d %H:%M} UTC "
+        f"({f.age_days(now):.1f} days < {args.min_age_days:g})"
+        for f in sorted(too_young, key=lambda f: f.published, reverse=True)
+    ]
+    for line in young_lines:
+        print(f"TOO YOUNG: {line}")
     for e in result.errors:
         print(f"ERROR: {e}")
     counts: dict[str, int] = {}
@@ -1607,6 +1639,8 @@ def main(argv: list[str] | None = None) -> int:
         f"dep-age: checked {len(result.findings)} items ({summary or 'none'}) as of {now:%Y-%m-%d %H:%M} UTC, "
         f"minimum age {args.min_age_days:g} days: {len(too_young)} too young, {len(result.errors)} errors"
     )
+    for line in annotation_lines(young_lines, result):
+        print(line)
     return 1 if too_young or result.errors else 0
 
 

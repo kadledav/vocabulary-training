@@ -13,9 +13,11 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
 from pathlib import Path
 
 TOOLS = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(TOOLS))  # dep-age.py imports gha
 _spec = importlib.util.spec_from_file_location("dep_age", TOOLS / "dep-age.py")
 assert _spec and _spec.loader
 dep_age = importlib.util.module_from_spec(_spec)
@@ -1344,6 +1346,59 @@ class ImageDates(unittest.TestCase):
         dep_age.fetch_json = lambda url, **kw: answer(None)
         with self.assertRaisesRegex(dep_age.LookupFailed, "arm64"):
             dep_age.debian_published("musl", "1")
+
+
+class Annotations(unittest.TestCase):
+    """GitHub Actions `::error` annotations (public, unlike the job log)."""
+
+    def result(self, errors=(), lookups=()):
+        res = dep_age.Result()
+        res.errors = [*lookups, *errors]
+        res.lookup_errors = list(lookups)
+        return res
+
+    def lines(self, res, young=(), actions="true"):
+        env = {"GITHUB_ACTIONS": actions} if actions is not None else {}
+        with mock.patch.dict(dep_age.os.environ, env, clear=True):
+            return dep_age.annotation_lines(list(young), res)
+
+    def test_only_on_github_actions(self):
+        res = self.result(errors=["boom"])
+        self.assertEqual(self.lines(res, actions=None), [])
+        self.assertEqual(self.lines(res, actions="false"), [])
+        self.assertEqual(len(self.lines(res)), 1)
+
+    def test_one_annotation_per_problem_lookups_first(self):
+        res = self.result(errors=["bad pin"], lookups=["crate x 1: GET https://h: HTTP 403"])
+        got = self.lines(res, young=["crate y 2 published today"])
+        self.assertEqual(len(got), 3)
+        self.assertIn("HTTP 403", got[0])
+        self.assertIn("bad pin", got[1])
+        self.assertIn("crate y 2", got[2])
+        self.assertTrue(all(line.startswith("::error title=") for line in got))
+
+    def test_escaping(self):
+        got = self.lines(self.result(errors=["50% a:b,c\r\nnext"]))[0]
+        self.assertEqual(got.count("\n"), 0)
+        self.assertTrue(got.endswith("::50%25 a:b,c%0D%0Anext"))
+        self.assertEqual(dep_age.gha.escape_property("a:b,c%\n"), "a%3Ab%2Cc%25%0A")
+
+    def test_cap_leaves_room_for_the_overflow_note(self):
+        got = self.lines(self.result(errors=[f"e{i}" for i in range(25)]))
+        self.assertEqual(len(got), 10)
+        self.assertTrue(got[8].endswith("::e8"))
+        self.assertTrue(got[9].endswith("::16 more problems; see the job log"))
+        self.assertEqual(len(self.lines(self.result(errors=[f"e{i}" for i in range(10)]))), 10)
+
+    def test_main_prints_annotations_and_keeps_the_exit_code(self):
+        out = io.StringIO()
+        with mock.patch.dict(dep_age.os.environ, {"GITHUB_ACTIONS": "true"}), \
+                mock.patch.object(dep_age, "evaluate", return_value=self.result(errors=["boom"])), \
+                contextlib.redirect_stdout(out):
+            code = dep_age.main(["--root", ".", "--now", NOW])
+        self.assertEqual(code, 1)
+        self.assertIn("ERROR: boom", out.getvalue())
+        self.assertIn("::error title=dep-age error::boom", out.getvalue())
 
 
 if __name__ == "__main__":

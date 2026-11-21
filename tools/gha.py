@@ -1,4 +1,4 @@
-"""GitHub Actions output of the image tools (image-smoke.py, release-promote.py):
+"""GitHub Actions output of the tools (dep-age.py, image-smoke.py, release-promote.py):
 annotations, the job summary and step outputs.
 
 Failures are printed as workflow commands (`::error title=…::…`), which
