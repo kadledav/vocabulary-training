@@ -41,7 +41,9 @@ deliberate shell obfuscation is out of scope (review covers that).
       with a GitHub release asset URL (the checksum must equal GitHub's
       digest of the asset; dated by the asset's upload) or a file of a
       repository at a full commit SHA on raw.githubusercontent.com (the
-      content of a commit never changes; dated by the commit) -> GitHub API
+      content of a commit never changes; dated by the commit) -> GitHub API,
+      or a PyPI release file on files.pythonhosted.org (the checksum must
+      equal PyPI's SHA-256 of that file; dated by its upload) -> PyPI JSON
 * everywhere: `cargo update|generate-lockfile|add` are errors, cargo commands
   that resolve dependencies must use `--locked`, `cargo --config` is an error;
   settings that redirect downloads (registry/source variables, CARGO_HOME,
@@ -370,7 +372,31 @@ GITHUB_RAW_AT_COMMIT = re.compile(
     r"^https://raw\.githubusercontent\.com/(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/"
     r"(?P<sha>[0-9a-f]{40})/(?P<path>(?!\.)[A-Za-z0-9_.+-]+(?:/(?!\.)[A-Za-z0-9_.+-]+)*)$"
 )
+# a file of a PyPI release (a wheel or sdist), named <project>-<version>-….
+PYPI_FILE = re.compile(
+    r"^https://files\.pythonhosted\.org/packages/[0-9a-f]{2}/[0-9a-f]{2}/[0-9a-f]{60}/"
+    r"(?P<file>(?P<project>[A-Za-z0-9_.]+)-(?P<version>[0-9][A-Za-z0-9_.+!]*)(?:-[A-Za-z0-9_.+]+)*\.(?:whl|tar\.gz))$"
+)
 ADD_CHECKSUM = re.compile(r"^--checksum=sha256:(?P<sha256>[0-9a-f]{64})$")
+
+
+def pypi_file_published(project: str, version: str, file: str, sha256: str) -> dt.datetime:
+    """When the file of a PyPI release was uploaded, after checking that
+    PyPI's SHA-256 of it is the pinned checksum (PyPI never lets a file name
+    be reused, so the upload is the file's date)."""
+    def lookup() -> dt.datetime:
+        release = fetch_json(f"https://pypi.org/pypi/{urllib.parse.quote(project)}/{urllib.parse.quote(version)}/json")
+        files = release.get("urls", []) if isinstance(release, dict) else []
+        for item in files:
+            if item.get("filename") == file:
+                if item.get("digests", {}).get("sha256") != sha256:
+                    raise LookupFailed(f"PyPI's sha256 of {file} is not the pinned one")
+                if item.get("yanked"):
+                    raise LookupFailed(f"{file} was yanked")
+                return parse_ts(item["upload_time_iso_8601"])
+        raise LookupFailed(f"no file {file} in {project} {version} on PyPI")
+
+    return cached("pypi-file", f"{project}=={version}/{file}#{sha256}", lookup)
 
 
 def release_asset_published(repo: str, tag: str, asset: str, sha256: str) -> dt.datetime:
@@ -415,6 +441,13 @@ def check_add_url(args: str, where: str, result: "Result") -> None:
     checksum = ADD_CHECKSUM.match(flags[0]) if len(flags) == 1 else None
     url = GITHUB_RELEASE_ASSET.match(rest[0]) if len(rest) == 2 else None
     raw = GITHUB_RAW_AT_COMMIT.match(rest[0]) if len(rest) == 2 else None
+    pypi = PYPI_FILE.match(rest[0]) if len(rest) == 2 else None
+    if checksum and pypi:
+        project, version, file = pypi.group("project"), pypi.group("version"), pypi.group("file")
+        sha256 = checksum.group("sha256")
+        result.add("pypi", f"{project}/{file}", version,
+                   lambda: pypi_file_published(project, version, file, sha256), where)
+        return
     if checksum and raw:
         repo, sha = raw.group("repo"), raw.group("sha")
         result.add("commit", f"{repo}/{raw.group('path')}", sha[:12],
@@ -424,7 +457,8 @@ def check_add_url(args: str, where: str, result: "Result") -> None:
         result.errors.append(
             f"{where}: ADD from a URL must be `ADD --checksum=sha256:<hex> "
             f"https://github.com/<owner>/<repo>/releases/download/<tag>/<asset> <dest>` or "
-            f"`… https://raw.githubusercontent.com/<owner>/<repo>/<commit sha>/<path> <dest>`"
+            f"`… https://raw.githubusercontent.com/<owner>/<repo>/<commit sha>/<path> <dest>` or "
+            f"`… https://files.pythonhosted.org/packages/…/<project>-<version>-….whl <dest>`"
         )
         return
     repo, tag, asset, sha256 = url.group("repo"), url.group("tag"), url.group("asset"), checksum.group("sha256")

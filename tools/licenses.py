@@ -23,8 +23,9 @@ Besides the crates, the server binary contains the Rust standard library,
 musl libc, LLVM's libunwind (both linked statically by the musl targets) and
 SQLite (bundled by libsqlite3-sys); they are listed as extras. The TTS
 image's extras are what docker/Dockerfile.tts adds besides crates: the
-sherpa-onnx static libraries and what they contain (ONNX Runtime, kaldi,
-OpenFst, sentencepiece, kissfft, utf8proc), LAME (bundled by mp3lame-sys),
+sherpa-onnx static libraries and what they contain (ONNX Runtime and the
+libraries ONNX Runtime links in, whose notices the image ships verbatim as
+ORT_NOTICES; kaldi, OpenFst, sentencepiece, kissfft, utf8proc), LAME (bundled by mp3lame-sys),
 the Kokoro model files and CMUdict; their licence texts come from the
 crates' sources and from docker/tts-licenses/. For the TTS image, cargo
 metadata runs with `RUSTFLAGS=--cfg vocab_tts_engine` (the engine's
@@ -55,6 +56,9 @@ DOCKERFILE = "docker/Dockerfile.server"
 PACKAGE = "vocab-server"
 TARGETS = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
 OWN_LICENSE = "MIT"
+# ONNX Runtime's ThirdPartyNotices.txt, taken from its wheel by
+# docker/Dockerfile.tts (--check verifies the Dockerfile ships it).
+ORT_NOTICES = "/licenses/onnxruntime-ThirdPartyNotices.txt"
 
 
 @dataclass(frozen=True)
@@ -411,6 +415,17 @@ def tts_extras(packages: list[dict], root: Path) -> list[Component]:
                   "(in the sherpa-onnx static libraries)", "Apache-2.0", ["Apache-2.0"], [apache]),
         Component("ONNX Runtime", "1.28.2 (in the sherpa-onnx static libraries)", "MIT", ["MIT"],
                   [text(here / "onnxruntime-LICENSE.txt")]),
+        # What ONNX Runtime's static library links in (checked against the
+        # symbols of libonnxruntime.a 1.28.2); their licence texts and
+        # copyright notices are ORT_NOTICES, shipped next to this file.
+        Component("abseil, protobuf (with utf8_range), Eigen, re2, flatbuffers, ONNX, nlohmann/json, SafeInt, "
+                  "date (H. Hinnant), Microsoft GSL, cpuinfo, Boost.Mp11, KleidiAI (arm64)",
+                  "(as linked into ONNX Runtime 1.28.2)",
+                  "Apache-2.0 AND BSD-3-Clause AND MPL-2.0 AND MIT AND BSD-2-Clause AND BSL-1.0",
+                  ["MIT", "Apache-2.0", "BSD-3-Clause", "BSL-1.0", "MPL-2.0", "BSD-2-Clause"], [],
+                  "ONNX Runtime's third-party libraries: their licence texts and copyright notices are in "
+                  f"{ORT_NOTICES} (ONNX Runtime's ThirdPartyNotices.txt, verbatim). Eigen is MPL-2.0: its "
+                  "unmodified source is the one ONNX Runtime 1.28.2 builds with (docker/tts-licenses/SOURCE.md)."),
         Component("kissfft", "(in the sherpa-onnx static libraries)", "BSD-3-Clause", ["BSD-3-Clause"],
                   [text(here / "kissfft-LICENSE.txt")]),
         Component("utf8proc", "2.12.0 (in the sherpa-onnx static libraries)", "MIT AND Unicode-3.0",
@@ -507,6 +522,8 @@ def main(argv: list[str] | None = None) -> int:
             if dockerfile.is_file() and (problem := label_problem(dockerfile.read_text(), expression,
                                                                   image.dockerfile)):
                 problems.append(problem)
+            if image.name == "tts" and dockerfile.is_file() and ORT_NOTICES not in dockerfile.read_text():
+                problems.append(f"{image.dockerfile}: does not ship {ORT_NOTICES}, which the notices refer to")
             print(f"licenses ({image.name}): combined licence {expression}")
             continue
         target.write_text(text, encoding="utf-8")

@@ -130,7 +130,11 @@ voices, US `af_heart` and UK `bf_emma`). It needs no setup:
   the stack): no published port, no Traefik router, no route to the LAN or
   the internet; only the app can reach it, as `http://vocabulary-tts:8090`
   (`VOCAB_TTS_URL` in the app's `environment:`). The app also joins
-  `vocab-internal` (and stays on `proxy-net` for Traefik).
+  `vocab-internal` (and stays on `proxy-net` for Traefik). The service has
+  no password or token: the internal network is its protection, so the app
+  accepts only an internal `VOCAB_TTS_URL` — a host name without dots (the
+  compose service name), `localhost`, or a loopback, private or link-local
+  IP address — and refuses to start with anything else.
 - Limits: 1280 MB memory without swap, 2 CPUs, 64 PIDs (measured peak about
   0.9 GB for the longest text, 5 threads). `docker ps` shows it `healthy`
   about 10 s after the start (model load and a self-test of both voices).
@@ -142,12 +146,16 @@ voices, US `af_heart` and UK `bf_emma`). It needs no setup:
   uses the browser's speech (R-41); the service may be stopped at any time.
   Settings → Audio shows clips ready / being made / failed, how many have an
   approximate pronunciation (a word in no dictionary), and *Retry failed
-  clips*.
+  clips*. A text that makes the service crash three times is marked failed
+  ("crashed the audio service") and never blocks the other clips.
 - Clips live in `/data/cache/audio` (regenerable, R-85: a restore without
   the cache only means the clips are made again). Disk: about 35 MB per
   1 000 sentences of 15–20 words per voice (≈ 7.5 KB a second of speech;
   a headword ≈ 5 KB); a voice switch keeps the other voice's clips while
-  their text exists.
+  their text exists. The cache is capped at 2 GiB, and the app stops making
+  clips while less than about 257 MiB is free on the dataset (the database
+  needs room too); in both cases its log says so once and Settings → Audio
+  shows why no new clips are made.
 - Time: about 1–2 s per sentence on two cores (measured real-time factor
   0.36 on an arm64 laptop core; NAS cores are slower), so 1 000 sentences
   take roughly half an hour.

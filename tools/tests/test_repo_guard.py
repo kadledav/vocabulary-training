@@ -334,5 +334,24 @@ class RustImages(GuardCase):
         self.assertFlags(bad, "docker/Dockerfile.tts:2: rust:1.98.0 does not match")
 
 
+class SherpaLibraries(GuardCase):
+    LOCK = '[[package]]\nname = "sherpa-onnx"\nversion = "2.0.1"\nsource = "registry"\n'
+
+    @staticmethod
+    def add(tag: str, file: str) -> str:
+        return (f"ADD --checksum=sha256:{'a' * 64} https://github.com/k2-fsa/sherpa-onnx/releases/download/"
+                f"v{tag}/sherpa-onnx-v{file}-linux-x64-static-lib.tar.bz2 /archives/\n")
+
+    def test_r90_static_libraries_match_the_crate_in_the_lock_file(self):
+        ok = self.problems({"Cargo.lock": self.LOCK, "docker/Dockerfile.tts": "# x\n" + self.add("2.0.1", "2.0.1")})
+        self.assertEqual(ok, [])
+        for tag, file in [("2.0.2", "2.0.2"), ("2.0.1", "2.0.2"), ("2.1.0", "2.0.1")]:
+            with self.subTest(tag=tag, file=file):
+                bad = self.problems({"Cargo.lock": self.LOCK, "docker/Dockerfile.tts": "# x\n" + self.add(tag, file)})
+                self.assertFlags(bad, "docker/Dockerfile.tts:2: sherpa-onnx libraries")
+        no_crate = self.problems({"docker/Dockerfile.tts": self.add("2.0.1", "2.0.1")})
+        self.assertFlags(no_crate, "docker/Dockerfile.tts:1: sherpa-onnx libraries v2.0.1 do not match")
+
+
 if __name__ == "__main__":
     unittest.main()

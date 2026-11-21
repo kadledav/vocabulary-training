@@ -87,22 +87,30 @@ design's choice works; three findings change details of §10 (below).
 ## Other differences to §10.2 (from the M6 phase 1 brief)
 
 - API `POST /v1/speak` (not `/v1/synthesize`), **no token**: the container is
-  only on the `internal: true` network shared with the app; every input is
-  validated anyway (text ≤ 600 characters, no control/invisible formatting
-  characters, no `<`/`>` — no SSML; voice from the list; speed 0.5–1.5;
-  JSON object with exactly those fields; body ≤ 4 KiB). Responses carry
-  `X-Duration-Ms`, `X-Loudness-Lufs` and `X-Voice`; `422 nothing_to_say` when
-  nothing in the text is speakable, `503 busy` (with `Retry-After`) when one
-  synthesis runs and four wait. `GET /v1/voices`, `GET /healthz`.
+  only on the `internal: true` network shared with the app (reasoning in
+  design §10.2 and §13); every input is validated anyway. Text:
+  invisible formatting characters are removed (a soft hyphen joins its
+  word), every whitespace character (tab, CR, line breaks) becomes a
+  space; then ≤ 600 characters, no control characters, no `<`/`>` — no
+  SSML (400 `invalid_text`); no run of more than 64 non-space characters
+  (422 `token_too_long`) or 15 digits (422 `number_too_long`); at most 900
+  phoneme symbols, about 60 s of speech (422 `too_long_to_speak`). Voice
+  from the list; speed 0.5–1.5; JSON object with exactly those fields;
+  body ≤ 4 KiB. Responses carry `X-Duration-Ms`, `X-Loudness-Lufs`,
+  `X-Voice` and `X-Approximate`; `422 nothing_to_say` when nothing in the
+  text is speakable, `503 busy` (with `Retry-After`) when one synthesis runs
+  and four wait, `503 timeout` after 60 s — the abandoned work is cancelled
+  (skipped before the engine, stopped between chunks inside it). Chunks
+  never exceed 300 phoneme symbols, even for one long word (Kokoro's
+  context is 510). `GET /v1/voices`, `GET /healthz`.
 - Configuration `VOCAB_TTS_LISTEN` (default `0.0.0.0:8090`),
   `VOCAB_TTS_MODEL_DIR` (`/model`), `VOCAB_TTS_THREADS` (2),
   `VOCAB_TTS_LOG_LEVEL` (info); unknown `VOCAB_TTS_*` = startup error. At
   start the service speaks "Hello." with both voices (self-test) before it
   listens.
-- The phoneme symbols the engine receives and the clip identity in the app
-  (design §10.3 step 2: `v1|kokoro-multi-lang-v1_0|voice|1.0|text`) are
-  unaffected; phase 2 may add the front-end version to the hash input so
-  that a front-end change regenerates clips.
+- The clip identity in the app includes the front-end and engine versions
+  (design §10.3 step 2), so a front-end change regenerates the clips (the
+  old ones play until their replacement is ready).
 
 ## Building
 

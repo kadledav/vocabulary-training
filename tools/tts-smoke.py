@@ -25,8 +25,11 @@ Checks:
   layer III frames, 24 kHz mono, duration from the frames matching
   `X-Duration-Ms` and plausible for the text, loudness reported at about
   −16 LUFS, a bitrate that is speech, not silence), the UK voice works, the
-  longest allowed text (the engine's memory peak) works,
-  oversize/invalid/markup/non-JSON input is refused with 4xx, the process
+  longest allowed text (the engine's memory peak) works, the worst texts
+  the API accepts (long hyphenated compounds, long numbers, long unknown
+  words spelled out, each up to its limit) are spoken or refused with 422
+  and never kill the service, overlong words and numbers are refused with
+  422, oversize/invalid/markup/non-JSON input is refused with 4xx, the process
   runs as UID 65532, the container's memory stays under the limit (not
   OOM-killed) and the log never contains the spoken text.
 
@@ -68,6 +71,25 @@ SENTENCE = "The purple lighthouse hums quietly above the sleeping harbour."
 SECRET_WORD = "lighthouse"
 WORD = "Wonderful"
 LONG_TEXT = ("The quiet river wandered past the old mill, and the miller watched it from his window every evening. " * 6)[:600].strip()
+
+
+def up_to_600(token: str) -> str:
+    """`token` repeated, separated by spaces, as often as fits 600 characters."""
+    return " ".join([token] * ((600 + 1) // (len(token) + 1)))
+
+
+# The worst texts the API accepts: every token at its limit (64 characters,
+# 15 digits), as many as fit. They must come back as audio or as 422
+# `too_long_to_speak`, never as a dead service.
+COMPOUND = "-".join(["internationalization"] * 3)  # 62 characters
+SPELLED = "zxqvbnmkjhgfdcwplrtsxqvbnmkjhgfdcwplrtszxqvbnmkjhgfdcwplrtszxqvb"  # 64, spelled out
+WORST_TEXTS = [
+    ("hyphenated compounds up to the token limit", up_to_600(COMPOUND)),
+    ("one 15-digit number", "999999999999999"),
+    ("15-digit numbers up to 600 characters", up_to_600("999999999999999")),
+    ("one 64-letter unknown word", SPELLED),
+    ("64-letter unknown words up to 600 characters", up_to_600(SPELLED)),
+]
 FORBIDDEN_PATHS = frozenset([
     "bin/sh", "bin/bash", "bin/dash", "bin/ash", "bin/busybox", "usr/bin/busybox",
     "bin/dpkg", "usr/bin/dpkg", "usr/bin/apt", "usr/bin/apt-get", "sbin/apk", "usr/bin/apk",
@@ -80,7 +102,8 @@ ALLOWED_EXECUTABLE = "vocab-tts"
 SHARED_LIBRARY = re.compile(r"^(?:usr/)?lib(?:64)?/(?:[^/]+/)*(?:[^/]*\.so(?:\.[0-9.]+)?|ld-linux[^/]*)$")
 ELF_MAGIC = b"\x7fELF"
 MODEL_FILES = ["model.onnx", "voices.bin", "tokens.txt", "lexicon-us-en.txt", "lexicon-gb-en.txt", "cmudict.dict"]
-LICENSE_FILES = ["LICENSE.txt", "THIRD-PARTY-NOTICES.txt", "SOURCE.md", "cmudict-LICENSE.txt"]
+LICENSE_FILES = ["LICENSE.txt", "THIRD-PARTY-NOTICES.txt", "SOURCE.md", "cmudict-LICENSE.txt",
+                 "onnxruntime-ThirdPartyNotices.txt"]
 
 RESULTS: list[tuple[str, bool | None, str]] = []
 
@@ -377,8 +400,26 @@ def api_checks(image: str, name: str) -> None:
             kbps = len(body) * 8 / max(stated, 1)
             check(16 <= kbps <= 128, f"{label}: bitrate of speech, not silence", f"{kbps:.1f} kbit/s")
 
+        for label, text in WORST_TEXTS:
+            started = time.monotonic()
+            status, headers, body = speak(base, {"text": text})
+            took = time.monotonic() - started
+            code = ""
+            if status == 422:
+                code = json.loads(body).get("error", {}).get("code", "")
+            check(status == 200 and headers.get("content-type") == "audio/mpeg" or code == "too_long_to_speak",
+                  f"worst case: {label} -> audio or 422 too_long_to_speak",
+                  f"{status} {code} {body[:200] if status != 200 else ''!r}")
+            print(f"worst case: {label}: {status} {code} {headers.get('x-duration-ms', '-')} ms of audio "
+                  f"in {took:.1f} s")
+            status, _, _ = http("GET", f"{base}/healthz")
+            check(status == 200, f"worst case: {label}: the service is still up", f"/healthz {status}")
+
         refused = [
             ("oversize body", speak(base, {"text": "a" * 5000}), 413),
+            ("a 590-digit number (token)", speak(base, {"text": "9" * 590}), 422),
+            ("20 hyphenated words (token)", speak(base, {"text": "-".join(["internationalization"] * 20)}), 422),
+            ("a 16-digit number", speak(base, {"text": "call 1234567890123456"}), 422),
             ("text over 600 characters", speak(base, {"text": "word " * 130}), 400),
             ("control character", speak(base, {"text": "bell\u0007"}), 400),
             ("markup (SSML)", speak(base, {"text": "<speak>hi</speak>"}), 400),

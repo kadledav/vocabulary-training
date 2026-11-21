@@ -17,6 +17,13 @@ exactly, use:
    - https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.1/sherpa-onnx-v2.0.1-linux-aarch64-static-lib.tar.bz2
      sha256 `b6c6090e40fd18d6812f04fe21260602cd1223d7b5e83ad39dab87ad7c1c031d`
    - their source: https://github.com/k2-fsa/sherpa-onnx/tree/v2.0.1
+   - ONNX Runtime 1.28.2 inside them (https://github.com/microsoft/onnxruntime/tree/v1.28.2)
+     links third-party libraries; their notices are in
+     `onnxruntime-ThirdPartyNotices.txt` here (taken from the ONNX Runtime
+     1.28.0 wheel https://files.pythonhosted.org/packages/f3/17/4e5ecd8764f87573c495d834ce79e61ecca47f7a01d1e444a606e570edcb/onnxruntime-1.28.0-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl,
+     sha256 `a166b78ee04f3a37fa1ef82034b6a3ce96d9684e582d4d30b296de83e9998bb5`). The exact source of each, Eigen (MPL-2.0)
+     included, unmodified, is listed with its URL and hash in
+     `cmake/deps.txt` of the ONNX Runtime tag.
 3. **Kokoro-82M v1.0** as packaged by sherpa-onnx (weights, voices,
    lexicons; Apache-2.0):
    - https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-multi-lang-v1_0.tar.bz2

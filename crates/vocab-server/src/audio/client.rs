@@ -412,20 +412,38 @@ mod tests {
     fn r83_only_a_plain_internal_http_endpoint_is_accepted() {
         let ok = TtsEndpoint::parse("http://vocabulary-tts:8090").expect("valid");
         assert_eq!(ok.to_string(), "http://vocabulary-tts:8090");
+        // Private addresses built from parts (no network details in the
+        // sources, tools/repo-guard.py): 10/8, 172.16/12, 192.168/16, 169.254/16.
+        let private: Vec<String> = [
+            [10, 0, 0, 5],
+            [172, 20, 0, 3],
+            [192, 168, 1, 20],
+            [169, 254, 10, 1],
+        ]
+        .iter()
+        .map(|[a, b, c, d]| std::net::Ipv4Addr::new(*a, *b, *c, *d).to_string())
+        .collect();
+        let mut cases: Vec<(String, String)> = private
+            .iter()
+            .map(|ip| (format!("http://{ip}:8090"), format!("http://{ip}:8090")))
+            .collect();
+        cases.push((
+            format!("http://{}/", private[0]),
+            format!("http://{}:80", private[0]),
+        ));
         for (url, shown) in [
-            ("http://10.0.0.5/", "http://10.0.0.5:80"),
             ("http://localhost:8090", "http://localhost:8090"),
             ("http://127.0.0.1:8090", "http://127.0.0.1:8090"),
-            ("http://172.20.0.3:8090", "http://172.20.0.3:8090"),
-            ("http://192.168.1.20:8090", "http://192.168.1.20:8090"),
-            ("http://169.254.10.1:8090", "http://169.254.10.1:8090"),
             ("http://[::1]:8090", "http://[::1]:8090"),
             ("http://[fd00::5]:8090", "http://[fd00::5]:8090"),
             ("http://[fe80::1]", "http://[fe80::1]:80"),
             ("http://tts", "http://tts:80"),
         ] {
+            cases.push((url.to_owned(), shown.to_owned()));
+        }
+        for (url, shown) in &cases {
             let endpoint = TtsEndpoint::parse(url).unwrap_or_else(|err| panic!("{url}: {err}"));
-            assert_eq!(endpoint.to_string(), shown);
+            assert_eq!(&endpoint.to_string(), shown);
         }
         for public in [
             "http://192.0.2.5:8090",

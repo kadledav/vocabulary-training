@@ -609,8 +609,9 @@ All JSON. Session-authenticated unless noted. State-changing methods (POST/PUT/P
 | `GET /api/settings` / `PATCH /api/settings` | Settings | settings |
 | `GET /api/export/feedback` | R-57 feedback JSON (download) | exports |
 | `GET /api/export/full` | R-86 full JSON (download) | exports |
-| `GET /api/audio/status` / `POST /api/audio/retry-failed` | Audio queue status | audio |
-| `GET /audio/{hash}.mp3` | Clip (immutable, `Cache-Control: private, max-age=31536000, immutable`) | audio |
+| `GET /api/audio/status` / `POST /api/audio/retry` | Audio state for Settings (connected, voice, ready/pending/failed/approximate counts, `storage` ∈ `ok`, `cache_full`, `disk_low`, cache bytes and limit) / failed clips queued again | audio |
+| `GET /api/audio/words/{id}` | The clips of a word and its visible sentences: `{url, ready, other_voice, approximate}` each | audio |
+| `GET /api/audio/clips/{hash}.mp3` | Clip (immutable, `Cache-Control: private, max-age=31536000, immutable`, byte ranges) | audio |
 | `POST /api/connector/v1/packs` `{pack, dry_run?}` | **Import token only** | importer |
 | `GET /api/connector/v1/sources` | **Import token only**: id, type, title, reading position, word count | catalog |
 | `GET /`, `GET /assets/{build}/…` | SPA shell and assets | web_assets |
@@ -680,23 +681,24 @@ Three kinds of secret checks are kept apart on purpose, so that nobody without a
 
 ### 10.2 Container and API
 
-*As built in M6 (v0.2.0) the details differ — API `POST /v1/speak` without a token on the internal network, own grapheme-to-phoneme with the US/UK lexicons and CMUdict (sherpa-onnx 2.x has no espeak-ng), a peak limiter, `X-Approximate`, clip identity including the front-end/engine versions: see [`tts-spike.md`](tts-spike.md).*
+*As built in M6 (v0.2.0); measurements and the front-end in [`tts-spike.md`](tts-spike.md).*
 
-- `vocab-tts` binary (Rust): loads the model once (`OfflineTts` with `OfflineTtsKokoroModelConfig`: `model.onnx`, `voices.bin`, `tokens.txt`, `espeak-ng-data`, `lexicon-us-en.txt,lexicon-gb-en.txt`; `num_threads = TTS_THREADS` (default 2); provider `cpu`).
-- `POST /v1/synthesize` `{ "text": "...", "voice": "af_heart", "speed": 1.0 }`, header `Authorization: Bearer $VOCAB_TTS_TOKEN` → `200 audio/mpeg` + `X-Duration-Ms`. 400 for empty/too long text (> 600 chars), unknown voice, speed outside 0.5–1.5; 401 bad token. Requests are serialised (one synthesis at a time). `GET /v1/voices`, `GET /healthz`.
-- Only on the `vocab-internal` network (`internal: true`): no route to the internet or the LAN; the only peer is `vocab-server`. No volumes; model files baked into the image (read-only rootfs).
+- `vocab-tts` binary (Rust): loads Kokoro-82M once through sherpa-onnx 2.0.1 (`model.onnx`, `voices.bin`, `tokens.txt`; `VOCAB_TTS_THREADS`, default 2; provider `cpu`). sherpa-onnx 2.x has no espeak-ng, so the service has its own grapheme-to-phoneme front-end: the US/UK misaki lexicons, CMUdict as the fallback, numbers, compounds, letter spelling (`X-Approximate` counts guessed, spelled and dropped words).
+- `POST /v1/speak` `{ "text": "...", "voice": "af_heart", "speed": 1.0 }` → `200 audio/mpeg` + `X-Duration-Ms`, `X-Approximate`, `X-Frontend`, `X-Engine`. Text: invisible formatting characters are removed (the set the pack keys ignore; a soft hyphen joins its word) and every whitespace character (tab, CR, line breaks) becomes a space; then 400 `invalid_text` for empty, > 600 characters, control characters or `<`/`>` (no SSML); 422 `token_too_long` (a run of > 64 non-space characters), `number_too_long` (> 15 digits), `too_long_to_speak` (> 900 phoneme symbols, about 60 s), `nothing_to_say`; 400 for an unknown voice or a speed outside 0.5–1.5. One synthesis at a time, four may wait; beyond that `503 busy` at once. Request timeout 60 s (`503 timeout`); a request that is abandoned (timeout, client gone) is cancelled — skipped if it has not reached the engine, stopped after the current chunk if it has. No chunk the engine sees exceeds 300 symbols (inside Kokoro's 510). `GET /v1/voices` (with the front-end and engine versions), `GET /healthz`.
+- **No credentials.** The service is only on the `vocab-internal` network (`internal: true`): no published port, no route to the internet or the LAN; its only peer is `vocab-server`. A shared token would have to live in the environment of both containers (against the rule of §12.1: no secrets in the environment) and would protect against nothing the network does not already exclude — anything that can reach the service can already read the app's environment. What it could do with access is bounded: speak ≤ 600 validated characters at a time, one at a time. The app accepts only an internal `VOCAB_TTS_URL` (a host name without dots, `localhost`, or a loopback/private/link-local IP; anything else stops the app at start), so a configuration mistake cannot send book text to the internet. No volumes; model files baked into the image (read-only rootfs).
 
 ### 10.3 Generation pipeline (`audio` module in vocab-server)
 
-1. **What is spoken:** per word `speak ?? headword`; per sentence the English text with markers removed and a leading/trailing `…`/`...` trimmed. Czech is never spoken (Kokoro has no Czech voice; the app is EN→CS).
-2. **Clip identity:** `hash = hex(sha256("v1|kokoro-multi-lang-v1_0|" + voice + "|1.0|" + text))[0..32]`. Identical text → one clip shared across words. Changing the text (owner edit, pack conflict applied) yields a new hash; the old clip becomes garbage.
+1. **What is spoken:** per word `speak ?? headword`; per sentence the English text with markers removed and a leading/trailing `…`/`...` trimmed; invisible formatting characters removed and whitespace collapsed (the same normalisation the service does). Czech is never spoken (Kokoro has no Czech voice; the app is EN→CS).
+2. **Clip identity:** `hash = hex(sha256("v1|" + frontend + "|" + engine + "|" + voice + "|1.0|" + text))[0..32]` with the versions from `GET /v1/voices`. Identical text → one clip shared across words. Changing the text (owner edit, pack conflict applied) yields a new hash; the old clip becomes garbage. A new front-end or engine version makes every clip again; until a text's new clip is ready the old one is played, and it is deleted as soon as its replacement is ready (one by one).
 3. **Queue:** `audio::request` inserts `pending` rows (ignore if the hash exists). Triggers: import commit, word/sentence edits, voice change in settings (enqueues the whole set for the new voice in the background; until a clip exists the client falls back to the other voice's clip, then to browser speech).
-4. **Worker:** one tokio task; wakes on a `Notify` (new work) or every 30 s; picks the oldest due `pending` clip (`kind = 'word'` first); calls the TTS service (timeout 60 s); writes `<cache dir>/audio/<h0h1>/<hash>.mp3.tmp`, `fsync`, renames to `.mp3`; marks `ready` with size and duration.
-5. **Retries:** transport errors/5xx → `attempts + 1`, `next_attempt_at` = now + 30 s, 2 min, 10 min, 1 h, 6 h, 24 h; after 6 attempts `failed`. 4xx → `failed` immediately with the error code. Settings shows pending/failed counts and *Retry failed*. While the TTS service is unreachable the worker backs off instead of spinning.
+4. **Worker:** one tokio task; wakes on a `Notify` (new work) or every 30 s; picks the next due `pending` clip (`kind = 'word'` first, then clips never tried, then by when they became due); calls the TTS service (timeout 75 s, longer than the service's own 60 s, so a slow synthesis ends with the service's `503 timeout` and its cancellation); writes `<cache dir>/audio/<h0h1>/<hash>.tmp`, `fsync`, renames to `.mp3`; marks `ready` with size and duration.
+5. **Retries:** unreachable service (connection refused, `/v1/voices` failing) → the worker waits (30 s doubling to 10 min) and no clip loses an attempt. With the service up: 5xx, a timeout, an answer that is not `audio/mpeg`/not an MP3 stream, or larger than 1 MiB → `attempts + 1`, `next_attempt_at` = now + 30 s, 2 min, 10 min, 1 h, 6 h, 24 h; after 6 attempts `failed` with the reason. 4xx → `failed` immediately with the error code; a clip longer than 60 s → `failed` ("clip longer than 60 s"). A connection that dies after the request was sent counts as an attempt **and a crash** (the service may have died on that text and be restarting); after 3 crashes the clip is `failed` ("crashed the audio service"). A clip that failed waits behind the other due clips, so one bad text never blocks the queue. Settings shows pending/failed counts and *Retry failed*.
 6. **Post-processing (in vocab-tts):** trim leading/trailing silence below −50 dBFS → EBU R128 integrated loudness (`ebur128`; for clips < 400 ms where integrated loudness is undefined, use maximum momentary loudness) → gain to **−16 LUFS** (clamped to ±20 dB) → true-peak limit to −1.5 dBTP by scaling → pad 60 ms silence before, 150 ms after (avoids clipped onsets on mobile browsers) → **MP3**, mono, 24 kHz, LAME VBR quality 5 (≈ 48–64 kbit/s; ~10 KB per word, ~30–40 KB per sentence). MP3 plays everywhere incl. iOS Safari; Opus is still only partially supported by desktop Safari.
-7. **Reconciliation & GC:** at start, `ready` rows whose file is missing go back to `pending` (the cache volume is regenerable, R-85). Weekly maintenance deletes clips not in the keep-set (current speak texts × voices in use) and orphan files.
-8. **Serving:** `GET /audio/<32-hex>.mp3` (session required), `Content-Type: audio/mpeg`, immutable caching, `ETag` = hash, range requests supported (iOS Safari requires them for `<audio>`).
-9. **Fallback (R-41):** the practice payload carries `{url, ready}` per clip; if `ready` is false or loading fails, the ▶ button uses `speechSynthesis` (tap-triggered only).
+7. **Reconciliation & GC:** at start, `ready` rows whose file is missing go back to `pending` (the cache volume is regenerable, R-85) and files without a row are deleted. Every sync (start, import, voice change, every 10 min) deletes clips not in the keep-set (current speak texts × both voices, plus older-version clips still standing in for one not ready yet).
+8. **Serving:** `GET /api/audio/clips/<32-hex>.mp3` (session required), `Content-Type: audio/mpeg`, immutable caching, `ETag` = hash, range requests supported (iOS Safari requires them for `<audio>`). `GET /api/audio/words/{id}` tells the client which clips of a word are ready.
+9. **Fallback (R-41):** `GET /api/audio/words/{id}` carries `{url, ready}` per clip; if `ready` is false or loading fails, the ▶ button uses `speechSynthesis` (tap-triggered only). Never two sounds at once: a clip stops before the browser speaks and speech stops before a clip plays.
+10. **Storage:** at most 2 GiB of clips, and the disk keeps 256 MiB + one clip free (the database shares it, so SQLite never meets a full disk): beyond either the worker makes no new clips, logs one warning, and Settings says why (`storage`). Single clips are capped at 60 s / 1 MiB.
 
 Expected load: a 15-word pack ≈ 15 word clips + ~60 sentence clips; migrating ~500 old words (~3 000 clips) is a background job of the order of an hour; practice works meanwhile with the fallback.
 
@@ -728,7 +730,7 @@ Expected load: a 15-word pack ≈ 15 word clips + ~60 sentence clips; migrating 
 
 Configuration is environment only (no config file): `VOCAB_PUBLIC_ORIGIN` (required, e.g. `https://vocab.example.home`), `VOCAB_TIMEZONE` (default `Europe/Prague`), `VOCAB_DAY_ROLLOVER_HOUR` (default 4), `VOCAB_LOG_LEVEL` (default `info`); unknown `VOCAB_*` variables or invalid values stop the app with a message naming the variable.
 
-There is no `.env`: the password is set on first start with the logged setup code, the connector token in Settings (§9.1, §9.2). How the TTS service (M6) authenticates the app is decided in M6 under the same rule.
+There is no `.env`: the password is set on first start with the logged setup code, the connector token in Settings (§9.1, §9.2). The TTS service (M6) has no credentials at all: it is reachable only on the internal network (§10.2, §13).
 
 ### 12.2 Compose draft (`home/docker/vocabulary/docker-compose.yml` — to be added to the home repo by the owner/guarantor, not by this design)
 
@@ -856,6 +858,7 @@ Notes:
 | Host / NAS | Container breakout, resource exhaustion | Distroless, non-root, read-only rootfs, `cap_drop: ALL`, `no-new-privileges`, no socket, limits (R-83) |
 | Supply chain | Malicious/compromised new releases | 14-day age gate on every locked dependency (CI-enforced), exact pins, image digests, Action SHAs, checksum-verified downloads, few dependencies, `cargo-deny` advisories/licences |
 | Availability | Huge pack, request floods | Body/size limits, per-endpoint rate limits, request timeouts, bounded concurrency |
+| TTS service (no credentials) | Another container or device using it, a text that crashes it, a cache that fills the disk | Only on the `internal: true` network, app refuses a non-internal `VOCAB_TTS_URL`; text validated and bounded (words, numbers, phoneme symbols, chunks), abandoned work cancelled, bounded queue; crash quarantine after 3 dropped connections; cache cap and free-space reserve (§10.2, §10.3) |
 
 ### 13.2 R-83 / R-84 control mapping
 
@@ -868,7 +871,7 @@ Notes:
 | R-83 memory, CPU, PID limits | App 256 MB / 1 CPU / 128 PIDs; TTS 1.5 GB / 2 CPU / 64 PIDs; swap disabled via `memswap_limit`. |
 | R-83 body size limits and rate limiting on login and import | §9.4. |
 | R-83 base images pinned by digest | Dockerfiles use `image:tag@sha256:…`; Compose uses `tag@sha256:…`; Renovate `docker:pinDigests`; dep-age gate checks digest age. |
-| R-83 TTS in separate container with same hardening and no outbound network; model baked in or mounted read-only | `vocabulary-tts` on `internal: true` network only; same flags; model baked into the read-only image; no volumes. |
+| R-83 TTS in separate container with same hardening and no outbound network; model baked in or mounted read-only | `vocabulary-tts` on `internal: true` network only; same flags; model baked into the read-only image; no volumes. No token between app and service (it would be a secret in two environments and add nothing the network does not give, §10.2); the app only talks to an internal `VOCAB_TTS_URL`. |
 | R-84 schema validation | `vocab-pack::validate` (§5.2) + schema conformance tests. |
 | R-84 size limits | Paste ≤ 2 MiB, pack ≤ 1 MiB, ≤ 100 words/pack, per-field maxima; control characters rejected. |
 | R-84 everything rendered escaped | DOM via `h()`/`textContent` only; marked spans arrive pre-split (`pre/target/post`) so the client never parses or injects markup; CSP without `unsafe-inline`; CI forbids HTML-injection APIs in `web/`. |

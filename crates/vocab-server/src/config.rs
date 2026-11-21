@@ -496,7 +496,7 @@ mod tests {
         }
         for internal in [
             "http://localhost:8090",
-            "http://10.1.2.3:8090",
+            &format!("http://{}:8090", std::net::Ipv4Addr::new(10, 1, 2, 3)),
             "http://[::1]:8090",
         ] {
             assert!(

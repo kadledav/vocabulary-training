@@ -20,17 +20,18 @@
 FROM rust:1.99.0-slim-trixie@sha256:2752b332db73fdbb7dc576f06c82ed1f312005784ef913d7e04a28f5f55dc581 AS tools
 
 # bzip2 unpacks the archives; make builds LAME (mp3lame-sys runs its
-# autotools build); libstdc++-14-dev links the C++ sherpa-onnx libraries.
+# autotools build); libstdc++-14-dev links the C++ sherpa-onnx libraries;
+# unzip takes ONNX Runtime's notices out of its wheel.
 # From a fixed snapshot of the Debian archive, so the pins stay installable;
-# the dry run proves that apt installs exactly these three packages.
+# the dry run proves that apt installs exactly these four packages.
 # To update: pick a snapshot timestamp at least 14 days old, take the
-# versions of the three packages from its dists/trixie/main/binary-amd64 and
-# binary-arm64 Packages files, change timestamp and all six pins together.
+# versions of the four packages from its dists/trixie/main/binary-amd64 and
+# binary-arm64 Packages files, change timestamp and all eight pins together.
 RUN echo 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/20261101T000000Z trixie main' > /etc/apt/sources.list \
  && rm -f /etc/apt/sources.list.d/debian.sources \
  && apt-get update \
- && test "$(apt-get install -s --no-install-recommends bzip2=1.0.8-6 libstdc++-14-dev=14.2.0-19 make=4.4.1-2 | grep -c '^Inst ')" = 3 \
- && apt-get install -y --no-install-recommends bzip2=1.0.8-6 libstdc++-14-dev=14.2.0-19 make=4.4.1-2 \
+ && test "$(apt-get install -s --no-install-recommends bzip2=1.0.8-6 libstdc++-14-dev=14.2.0-19 make=4.4.1-2 unzip=6.0-29+deb13u1 | grep -c '^Inst ')" = 4 \
+ && apt-get install -y --no-install-recommends bzip2=1.0.8-6 libstdc++-14-dev=14.2.0-19 make=4.4.1-2 unzip=6.0-29+deb13u1 \
  && rm -rf /var/lib/apt/lists/*
 
 # ── build: the vocab-tts binary ─────────────────────────────────────────────
@@ -62,8 +63,13 @@ RUN cargo build --release --locked -p vocab-tts \
  && install -D -m 0755 target/release/vocab-tts /out/vocab-tts
 
 # ── test: `--target test` only; not part of the image ───────────────────────
+# The crate's tests linked against the real libraries, then the real engine
+# with the real model on the worst inputs the API accepts (long compounds,
+# long numbers, the longest text; crates/vocab-tts/tests/engine_limits.rs).
 FROM build AS test
-RUN cargo test --release --locked -p vocab-tts
+COPY --from=model /out/model /model
+RUN cargo test --release --locked -p vocab-tts \
+ && VOCAB_TTS_MODEL_DIR=/model cargo test --release --locked -p vocab-tts --test engine_limits -- --ignored
 
 # ── model: the Kokoro files the service reads ───────────────────────────────
 FROM tools AS model
@@ -75,6 +81,16 @@ ADD --checksum=sha256:81917843c7f44ce2b094ac63873c2c7a4cf802040792c455ba3ca40689
 # voices, symbol table, the US and UK lexicons. Not copied: espeak-ng-data
 # (GPL; unused since sherpa-onnx 2.0), Chinese/other files. The licences are
 # in docker/tts-licenses/THIRD-PARTY-NOTICES.txt (tools/licenses.py).
+# ONNX Runtime's third-party notices (protobuf, abseil, Eigen, re2, …: what
+# its static library in sherpa-onnx links in). The C/C++ library archives
+# ship no notices; the file is the same in every wheel of a release, and
+# 1.28.0 is the newest release on PyPI for the 1.28.2 the libraries contain
+# (no third-party changes in between).
+ADD --checksum=sha256:a166b78ee04f3a37fa1ef82034b6a3ce96d9684e582d4d30b296de83e9998bb5 https://files.pythonhosted.org/packages/f3/17/4e5ecd8764f87573c495d834ce79e61ecca47f7a01d1e444a606e570edcb/onnxruntime-1.28.0-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl /archives/
+RUN mkdir -p /out/notices \
+ && unzip -p /archives/onnxruntime-1.28.0-*.whl onnxruntime/ThirdPartyNotices.txt > /out/notices/onnxruntime-ThirdPartyNotices.txt \
+ && grep -q 'Eigen' /out/notices/onnxruntime-ThirdPartyNotices.txt \
+ && chmod 0444 /out/notices/onnxruntime-ThirdPartyNotices.txt
 RUN mkdir -p /unpacked /out/model \
  && tar -xjf /archives/kokoro-multi-lang-v1_0.tar.bz2 -C /unpacked \
       kokoro-multi-lang-v1_0/model.onnx kokoro-multi-lang-v1_0/voices.bin kokoro-multi-lang-v1_0/tokens.txt \
@@ -91,7 +107,7 @@ FROM gcr.io/distroless/cc-debian13:nonroot@sha256:08476c244888bfb425bae1ae4dd7c1
 LABEL org.opencontainers.image.title="vocabulary-training-tts" \
       org.opencontainers.image.description="Neural TTS service of the vocabulary training app (vocab-tts, Kokoro-82M via sherpa-onnx)" \
       org.opencontainers.image.source="https://github.com/kadledav/vocabulary-training" \
-      org.opencontainers.image.licenses="MIT AND Apache-2.0 AND BSD-3-Clause AND Unicode-3.0 AND BSD-2-Clause AND LGPL-2.0-or-later AND LGPL-3.0-only"
+      org.opencontainers.image.licenses="MIT AND Apache-2.0 AND BSD-3-Clause AND Unicode-3.0 AND BSL-1.0 AND MPL-2.0 AND BSD-2-Clause AND LGPL-2.0-or-later AND LGPL-3.0-only"
 
 COPY --from=build /out/vocab-tts /vocab-tts
 # Owned by root, read-only for everyone: the service only reads them.
@@ -100,6 +116,7 @@ COPY LICENSE /licenses/LICENSE.txt
 # The notices of everything in the image (generated by tools/licenses.py),
 # the licence texts they are made from, and SOURCE.md.
 COPY docker/tts-licenses/ /licenses/
+COPY --from=model /out/notices/onnxruntime-ThirdPartyNotices.txt /licenses/onnxruntime-ThirdPartyNotices.txt
 # The exact crate versions in the binary, for the SBOM generator (syft).
 COPY Cargo.lock /usr/share/doc/vocab-tts/Cargo.lock
 

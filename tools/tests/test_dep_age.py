@@ -112,6 +112,7 @@ class FakeRegistries:
             for name in (
                 "crate_published", "npm_published", "rust_published", "node_published", "action_published",
                 "image_published", "debian_published", "release_asset_published", "commit_published",
+                "pypi_file_published",
             )
         }
         dep_age.crate_published = lambda n, v: self._date(n, v)
@@ -123,6 +124,7 @@ class FakeRegistries:
         dep_age.debian_published = lambda pkg, version: self._date(pkg, version)
         dep_age.release_asset_published = lambda repo, tag, asset, sha256: self._date(asset, tag, sha256)
         dep_age.commit_published = lambda repo, sha: self._date(repo, sha)
+        dep_age.pypi_file_published = lambda project, version, file, sha256: self._date(project, version, file)
         return self
 
     def __exit__(self, *exc):
@@ -586,6 +588,37 @@ class ReleaseAssetDates(unittest.TestCase):
                 self.run_with(release)
 
 
+class PypiFileDates(unittest.TestCase):
+    """pypi_file_published: PyPI's sha256 must be the pinned checksum; the
+    age is the file's upload."""
+
+    FILE = "tool-1.2.0-py3-none-any.whl"
+
+    def run_with(self, release):
+        saved, saved_cache = dep_age.fetch_json, dep_age.cache_enabled
+        dep_age.cache_enabled = False
+        dep_age.fetch_json = lambda url, **kw: release if url == "https://pypi.org/pypi/tool/1.2.0/json" else {}
+        try:
+            return dep_age.pypi_file_published("tool", "1.2.0", self.FILE, DIGEST)
+        finally:
+            dep_age.fetch_json, dep_age.cache_enabled = saved, saved_cache
+
+    def file(self, **override):
+        base = {"filename": self.FILE, "digests": {"sha256": DIGEST}, "yanked": False,
+                "upload_time_iso_8601": "2026-07-25T01:21:59.123456Z"}
+        base.update(override)
+        return {"urls": [{"filename": "other.whl"}, base]}
+
+    def test_r90_upload_time_of_the_file_is_its_date(self):
+        self.assertEqual(self.run_with(self.file()).isoformat(), "2026-07-25T01:21:59.123456+00:00")
+
+    def test_r90_digest_must_match_and_the_file_exist(self):
+        for release in [self.file(digests={"sha256": DIGEST2}), self.file(digests={}), self.file(yanked=True),
+                        {"urls": [{"filename": "other.whl"}]}, {}]:
+            with self.subTest(release), self.assertRaises(dep_age.LookupFailed):
+                self.run_with(release)
+
+
 DIGEST = "a" * 64
 DIGEST2 = "b" * 64
 
@@ -763,6 +796,24 @@ class Dockerfiles(RepoCase):
                                  "ADD from a URL must be")
         no_checksum = self.dockerfile(CLEAN_DOCKERFILE + f"ADD {url} /x\n")
         self.assertError(no_checksum, "ADD from a URL must be")
+
+    def test_r90_add_of_a_checksum_pinned_pypi_file_is_dated(self):
+        url = ("https://files.pythonhosted.org/packages/f3/17/" + "4e" * 30
+               + "/onnxruntime-1.28.0-cp311-cp311-manylinux_2_28_x86_64.whl")
+        result = self.dockerfile(CLEAN_DOCKERFILE + f"ADD --checksum=sha256:{DIGEST} {url} /archives/\n")
+        self.assertEqual(result.errors, [])
+        found = [(f.kind, f.name, f.version) for f in result.findings if f.kind == "pypi"]
+        self.assertEqual(found, [("pypi", "onnxruntime/onnxruntime-1.28.0-cp311-cp311-manylinux_2_28_x86_64.whl", "1.28.0")])
+        young = self.dockerfile(CLEAN_DOCKERFILE + f"ADD --checksum=sha256:{DIGEST} {url} /archives/\n",
+                                young={"onnxruntime"})
+        self.assertIn(YOUNG, {f.published for f in young.findings if f.kind == "pypi"})
+        for bad in ["https://files.pythonhosted.org/packages/f3/17/abc/onnxruntime-1.28.0-cp311-none-any.whl",
+                    "https://files.pythonhosted.org/packages/f3/17/" + "4e" * 30 + "/../x.whl",
+                    "https://pypi.example.invalid/packages/f3/17/" + "4e" * 30 + "/onnxruntime-1.28.0-py3-none-any.whl"]:
+            with self.subTest(bad):
+                self.assertError(self.dockerfile(CLEAN_DOCKERFILE + f"ADD --checksum=sha256:{DIGEST} {bad} /x\n"),
+                                 "ADD from a URL must be")
+        self.assertError(self.dockerfile(CLEAN_DOCKERFILE + f"ADD {url} /x\n"), "ADD from a URL must be")
 
     def test_r90_add_from_a_url_without_checksum_or_from_elsewhere_is_rejected(self):
         url = "https://github.com/o/r/releases/download/v1/a.tar.gz"
