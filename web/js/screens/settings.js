@@ -14,7 +14,9 @@
 import { changePassword, connectorTokenStatus, createConnectorToken, logout, logoutEverywhere, newPasswordProblem } from '../auth.js';
 import { getJson, postJson } from '../api.js';
 import { forgetClips } from '../clips.js';
+import { typedCardsName } from '../day-plan.js';
 import { h, keepFocus, mount } from '../dom.js';
+import { fetchToday } from '../session.js';
 import { loadSettings, saveSettings } from '../settings.js';
 
 /**
@@ -360,8 +362,10 @@ export function renderSettings(root, isCurrent) {
       ),
       numberField(
         'new-typed-per-day',
-        'New Produce/Spelling cards per day',
-        'A word you understand well gets a Produce card (you type the English word for a sentence), and a word with a tricky spelling a Spelling card (you type the word you hear). This many of them come for the first time each day; the others wait for a later day.',
+        `New ${typedName} cards per day`,
+        typedName === 'Produce'
+          ? 'A word you understand well gets a Produce card (you type the English word for a sentence). This many of them come for the first time each day; the others wait for a later day.'
+          : 'A word you understand well gets a Produce card (you type the English word for a sentence), and a word with a tricky spelling a Spelling card (you type the word you hear). This many of them come for the first time each day; the others wait for a later day.',
         s.new_typed_per_day,
         0,
         100,
@@ -425,8 +429,12 @@ export function renderSettings(root, isCurrent) {
     );
   };
 
+  /** What the typed cards are called (Today knows whether Spelling exists). */
+  let typedName = typedCardsName(null);
+
   void (async () => {
-    const settings = await loadSettings();
+    const [settings, today] = await Promise.all([loadSettings(), fetchToday(null)]);
+    if (today.ok) typedName = typedCardsName(today.data);
     if (isCurrent()) draw(settings);
     await loadAudio();
   })();

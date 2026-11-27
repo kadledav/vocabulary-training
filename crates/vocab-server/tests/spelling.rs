@@ -305,6 +305,18 @@ async fn r58_a_regular_block_counts_the_cap_on_the_cards_it_serves_too() {
     assert_eq!(words.len(), items(&block).len(), "one card per word");
 }
 
+#[tokio::test]
+async fn r58_today_says_whether_any_word_has_spelling_practice() {
+    let env = env();
+    env.import("test-novel", vec![word("plain01", 8, 1)]).await;
+    assert_eq!(today(&env).await["spelling_practice"], false);
+    env.import("test-novel-2", spelling_words("sw", 1)).await;
+    assert_eq!(today(&env).await["spelling_practice"], true);
+    // A suspended word is not practised.
+    env.exec("UPDATE word SET suspended = 1 WHERE spelling = 1");
+    assert_eq!(today(&env).await["spelling_practice"], false);
+}
+
 // ── the item (design §7.1 screen 3b) ────────────────────────────────────────
 
 #[tokio::test]

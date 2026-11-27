@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { busyAnswer, busyWaitMs } from '../js/api.js';
-import { blockLabel, blockPreview, dayDone, dueTomorrow, moreNewCount, newWaiting, nextBlock, pausedForBacklog, typedLine } from '../js/day-plan.js';
+import { blockLabel, blockPreview, dayDone, dueTomorrow, moreNewCount, newWaiting, nextBlock, pausedForBacklog, typedCardsName, typedLine } from '../js/day-plan.js';
 import { describePointer } from '../js/import-issues.js';
 import { RATING_GUARD_MS, ratingGuardOpen, sameSpotTap } from '../js/rating.js';
 
@@ -121,6 +121,18 @@ test('R-52 Today says how many Produce/Spelling cards wait for their first time 
   );
   assert.equal(line(5, { paused: true, quota: 0 }), '5 Produce/Spelling cards wait for the first time — held back until you catch up on reviews.');
   assert.equal(typedLine(today()), null, 'an older server without the counts');
+});
+
+test('R-58 without spelling words Today just says Produce cards', () => {
+  const t = today({
+    typed_waiting: 4,
+    spelling_practice: false,
+    new_typed: { per_day: 0, introduced_today: 0, left_today: 0, quota: 0, paused: false },
+  });
+  assert.equal(typedLine(t), '4 Produce cards wait for the first time — new Produce cards are switched off (New Produce cards per day in Settings).');
+  assert.equal(typedCardsName(t), 'Produce');
+  assert.equal(typedCardsName({ ...t, spelling_practice: true }), 'Produce/Spelling');
+  assert.equal(typedCardsName(null), 'Produce/Spelling', 'unknown: both');
 });
 
 test('R-52 cap 0 says first-time Produce/Spelling cards are switched off and where to change it', () => {
