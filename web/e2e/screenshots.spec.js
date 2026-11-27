@@ -115,8 +115,8 @@ for (const theme of /** @type {const} */ (['dark', 'light'])) {
     await page.getByTestId('dont-know').click();
     await shot('7-answer-dont-know');
     await page.goto(`${app.url}/#/settings`);
-    await expect(page.getByLabel('New Produce cards per day')).toBeVisible();
-    await page.getByLabel('New Produce cards per day').scrollIntoViewIfNeeded();
+    await expect(page.getByLabel('New Produce/Spelling cards per day')).toBeVisible();
+    await page.getByLabel('New Produce/Spelling cards per day').scrollIntoViewIfNeeded();
     await shot('8-settings');
   });
 }

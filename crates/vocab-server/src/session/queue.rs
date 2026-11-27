@@ -3,7 +3,7 @@
 
 use rusqlite::{Transaction, params};
 
-use super::build::{sentence_for, shown_format};
+use super::build::{item_sentence, shown_format};
 use super::view::{self, BlockSummary, ItemRow, RateResult, SessionRow, UndoResult};
 use super::{ItemOrigin, RateInput, SessionError, SessionId, SessionStatus};
 use crate::catalog;
@@ -175,7 +175,7 @@ fn queue_repeat(
         .collect();
     let ord = repeat_ord(item.ord, &upcoming, gap);
     let card = scheduler::card(tx, item.card_id)?.ok_or(SessionError::ItemNotFound)?;
-    let sentence = sentence_for(tx, card.word_id, now.day, item.sentence_id, session.scope)?;
+    let sentence = item_sentence(tx, &card, now.day, item.sentence_id, session.scope)?;
     // The card's format is fixed now (it was just reviewed).
     let format = shown_format(tx, &card)?;
     let repeat = view::insert_item(

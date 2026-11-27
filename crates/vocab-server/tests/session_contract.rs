@@ -566,23 +566,26 @@ async fn r60_a_three_is_a_pass_and_four_five_are_repeated() {
     assert!(!r["repeat_item_id"].is_null());
 }
 
-// ── Today and served kinds (accepted deviation) ─────────────────────────────
+// ── Today and served kinds ──────────────────────────────────────────────────
 
 #[tokio::test]
-async fn r52_today_and_blocks_leave_out_card_kinds_that_are_not_served_yet() {
+async fn r58_spelling_cards_are_served_from_m10_without_a_sentence() {
     let env = env();
     env.import("test-novel", vec![word("alpha", 9, 3)]).await;
     make_due(&env, "alpha", "2026-11-25");
-    // Spelling is served from M10 on.
     env.exec(
         "INSERT INTO card (word_id, kind, format, state, stability, difficulty, due_day, \
          last_review_day, introduced_day, reps, created_at) \
          SELECT id, 'spelling', 'spelling', 'review', 5.0, 5.0, '2026-11-19', '2026-11-10', \
          '2026-11-01', 2, '2026-11-01T00:00:00Z' FROM word",
     );
-    assert_eq!(today(&env, None).await["due_now"], 0);
-    let result = start(&env, json!({ "kind": "start" })).await;
-    assert!(result["session"].is_null(), "{result}");
+    assert_eq!(today(&env, None).await["due_now"], 1);
+    let block = start_block(&env).await;
+    let item = next_item(&block);
+    assert_eq!(item["card"]["kind"], "spelling");
+    assert_eq!(item["card"]["format"], "spelling");
+    // The question is the word's audio: no sentence shows the word written.
+    assert!(item["sentence"].is_null(), "{item}");
 }
 
 #[tokio::test]

@@ -247,7 +247,7 @@ pub fn in_scope(
 
 /// The sentence for an item of `word` in a block of `scope` (`None` when
 /// the word has no visible sentence).
-pub fn sentence_for(
+fn sentence_for(
     conn: &Connection,
     word: WordId,
     day: StudyDay,
@@ -263,6 +263,23 @@ pub fn sentence_for(
         .collect();
     let last_shown = scheduler::sentence_last_shown(conn, word)?;
     Ok(choose_sentence(&sentences, &last_shown, day, previous))
+}
+
+/// The sentence an item of `card` shows: none for a Spelling card (its
+/// question is the word's audio; a sentence would show the word written,
+/// and its audio would say it — design §7.1 screen 3b, §7.4), else the
+/// rotation's choice ([`sentence_for`]).
+pub fn item_sentence(
+    conn: &Connection,
+    card: &Card,
+    day: StudyDay,
+    previous: Option<i64>,
+    scope: Option<SourceId>,
+) -> rusqlite::Result<Option<i64>> {
+    if card.kind == CardKind::Spelling {
+        return Ok(None);
+    }
+    sentence_for(conn, card.word_id, day, previous, scope)
 }
 
 /// One planned item.
@@ -366,7 +383,26 @@ fn due_cards(
         .collect())
 }
 
-/// Steps 1–3: [`due_cards`] with the Spelling cap of one block.
+/// At most [`SPELLING_CAP`] Spelling cards of `cards` (in their order):
+/// the rest wait for a later block (R-58, design §6.7 step 3).
+fn spelling_capped(cards: Vec<Card>) -> Vec<Card> {
+    let mut spelling = 0;
+    cards
+        .into_iter()
+        .filter(|card| {
+            if card.kind != CardKind::Spelling {
+                return true;
+            }
+            spelling += 1;
+            spelling <= SPELLING_CAP
+        })
+        .collect()
+}
+
+/// Steps 1–3: [`due_cards`] with the Spelling cap of one block. A due
+/// review the cap holds back still goes ahead of every first-time card: a
+/// block that holds one back takes no first-time card, so they come in a
+/// later block of the day, after it.
 fn plan_due(
     conn: &Connection,
     day: StudyDay,
@@ -375,22 +411,20 @@ fn plan_due(
     reviewed_today: &HashMap<WordId, HashSet<CardId>>,
     typed_quota: u32,
 ) -> rusqlite::Result<Vec<Planned>> {
-    let mut spelling = 0;
-    let mut planned = Vec::new();
-    for card in due_cards(conn, day, kinds, words, reviewed_today, typed_quota)? {
-        if card.kind == CardKind::Spelling {
-            if spelling == SPELLING_CAP {
-                continue;
-            }
-            spelling += 1;
-        }
-        planned.push(Planned {
+    let due = due_cards(conn, day, kinds, words, reviewed_today, typed_quota)?;
+    let capped = spelling_capped(due.clone());
+    let review_held_back = due
+        .iter()
+        .any(|card| !card.awaits_first_review() && !capped.iter().any(|c| c.id == card.id));
+    Ok(capped
+        .into_iter()
+        .filter(|card| !(review_held_back && card.awaits_first_review()))
+        .map(|card| Planned {
             card: card.id,
             word: card.word_id,
             origin: ItemOrigin::Due,
-        });
-    }
-    Ok(planned)
+        })
+        .collect())
 }
 
 /// Step 4: new Understand cards within the quota, by usefulness, source
@@ -608,7 +642,7 @@ fn anything_due(
 /// Produce/Spelling cards count as due while today's blocks still serve
 /// them):
 /// cards already seen (at least one review) of the served kinds in
-/// `scope`, one per word.
+/// `scope`, one per word, at most three of them Spelling cards.
 /// Cards whose latest rating today was 1–2 are left out (just shown, known);
 /// cards rated 3–5 today come first, then the lowest current FSRS
 /// retrievability. Not limited to a block yet.
@@ -644,16 +678,20 @@ fn plan_extra(
             .then(a.1.total_cmp(&b.1))
             .then(a.2.id.cmp(&b.2.id))
     });
+    // An extra block keeps the Spelling cap of a block too (R-58); a word
+    // whose Spelling card waits may come with another card.
     let mut seen_words = HashSet::new();
-    Ok(cards
-        .into_iter()
-        .filter(|(_, _, card)| seen_words.insert(card.word_id))
-        .map(|(_, _, card)| Planned {
-            card: card.id,
-            word: card.word_id,
-            origin: ItemOrigin::Due,
-        })
-        .collect())
+    Ok(
+        spelling_capped(cards.into_iter().map(|(_, _, card)| card).collect())
+            .into_iter()
+            .filter(|card| seen_words.insert(card.word_id))
+            .map(|card| Planned {
+                card: card.id,
+                word: card.word_id,
+                origin: ItemOrigin::Due,
+            })
+            .collect(),
+    )
 }
 
 /// How many cards an extra-practice block (R-63) in `scope` would serve now
@@ -819,7 +857,7 @@ pub fn start_block(
         let Some(card) = scheduler::card(tx, item.card)? else {
             continue;
         };
-        let sentence = sentence_for(tx, item.word, day, None, request.scope)?;
+        let sentence = item_sentence(tx, &card, day, None, request.scope)?;
         let format = shown_format(tx, &card)?;
         view::insert_item(
             tx,
@@ -983,9 +1021,52 @@ mod tests {
         let (_dir, db) = db_with(&["s1", "s2", "s3", "s4", "s5"]).await;
         let plan = plan_with_due(&db, CardKind::Spelling, &[CardKind::Spelling], false).await;
         assert_eq!(plan.len(), 3);
-        // Understand-only plans (M3 serves Understand) never contain them.
+        // M10 serves Spelling, with the same cap.
+        assert!(SERVED_KINDS.contains(&CardKind::Spelling));
         let served = plan_with_due(&db, CardKind::Spelling, SERVED_KINDS, false).await;
-        assert!(served.is_empty());
+        assert_eq!(served.len(), 3, "{served:?}");
+    }
+
+    fn card(id: i64, kind: CardKind, first_time: bool) -> Card {
+        Card {
+            id: CardId::new(id),
+            word_id: WordId::new(id),
+            kind,
+            format: None,
+            state: if first_time {
+                CardState::New
+            } else {
+                CardState::Review
+            },
+            stability: None,
+            difficulty: None,
+            due_day: Some(day("2026-11-20")),
+            last_review_day: None,
+            last_review_at: None,
+            introduced_day: None,
+            reps: 0,
+            lapses: 0,
+            consecutive_fives: 0,
+            leech: crate::scheduler::LeechState::None,
+            leech_lapses_at_ack: 0,
+            suspended: false,
+        }
+    }
+
+    #[test]
+    fn r58_the_spelling_cap_keeps_the_first_three_in_order_and_every_other_card() {
+        let cards = vec![
+            card(1, CardKind::Spelling, false),
+            card(2, CardKind::Understand, false),
+            card(3, CardKind::Spelling, false),
+            card(4, CardKind::Spelling, false),
+            card(5, CardKind::Produce, false),
+            card(6, CardKind::Spelling, false),
+            card(7, CardKind::Spelling, true),
+        ];
+        let ids: Vec<i64> = spelling_capped(cards).iter().map(|c| c.id.get()).collect();
+        assert_eq!(ids, [1, 2, 3, 4, 5]);
+        assert!(spelling_capped(Vec::new()).is_empty());
     }
 
     fn item(n: i64, origin: ItemOrigin) -> Planned {

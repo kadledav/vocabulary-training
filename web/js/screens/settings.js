@@ -360,8 +360,8 @@ export function renderSettings(root, isCurrent) {
       ),
       numberField(
         'new-typed-per-day',
-        'New Produce cards per day',
-        'A word you understand well gets a Produce card: you type the English word. This many come for the first time each day; the others wait for a later day.',
+        'New Produce/Spelling cards per day',
+        'A word you understand well gets a Produce card (you type the English word for a sentence), and a word with a tricky spelling a Spelling card (you type the word you hear). This many of them come for the first time each day; the others wait for a later day.',
         s.new_typed_per_day,
         0,
         100,

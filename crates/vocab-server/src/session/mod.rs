@@ -8,10 +8,9 @@
 //! A built block keeps its items: lowering `new_per_day` later does not
 //! remove new items already queued (guarantor decision G4).
 //!
-//! The block builder serves only the card kinds whose practice UI exists
-//! ([`SERVED_KINDS`]: Understand and Produce; Spelling from M10). Spelling
-//! cards are still created and unlocked by the scheduler; they wait (stay
-//! due) until their kind is served. Produce/Spelling cards that wait for
+//! The block builder serves the card kinds whose practice UI exists
+//! ([`SERVED_KINDS`]: Understand, Produce and, since M10, Spelling — at
+//! most three Spelling cards a block). Produce/Spelling cards that wait for
 //! their first review come in only up to a daily cap, with a neutral
 //! priority ([`TypedAllowance`], design §17 M8).
 
@@ -37,8 +36,9 @@ pub use view::{
 use crate::catalog::SourceId;
 use crate::scheduler::{AnswerMatch, CardKind, RawGrade, SchedulerError};
 
-/// Card kinds the session builder serves (M8: Understand and Produce).
-pub const SERVED_KINDS: &[CardKind] = &[CardKind::Understand, CardKind::Produce];
+/// Card kinds the session builder serves (M10: all three).
+pub const SERVED_KINDS: &[CardKind] =
+    &[CardKind::Understand, CardKind::Produce, CardKind::Spelling];
 
 /// Id of a practice block: 128 random bits as 32 hex digits.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
@@ -150,18 +150,20 @@ pub struct RateInput {
 /// Longest accepted typed answer.
 const TYPED_ANSWER_MAX: usize = 300;
 
-/// The suggested grades that agree with how a typed answer compared
-/// (design §6.8): the target span of the sentence → 2 (3 after the hint);
-/// the right word in another form or an accepted answer that is not the
-/// sentence's own (also stored as `exact`) → 3; no match → 4; "I don't
-/// know" → 5; "I'll just rate myself" → none.
-fn suggestions_for(answer: AnswerMatch, hint_used: bool) -> &'static [u8] {
-    match answer {
-        AnswerMatch::Exact if hint_used => &[3],
-        AnswerMatch::Exact => &[2, 3],
-        AnswerMatch::None => &[4],
-        AnswerMatch::DontKnow => &[5],
-        AnswerMatch::Skipped => &[],
+/// The suggested grades that agree with how a typed answer of a `kind`
+/// card compared (design §6.8). Produce: the target span of the sentence
+/// → 2 (3 after the hint); the right word in another form or an accepted
+/// answer that is not the sentence's own (also stored as `exact`) → 3.
+/// Spelling (strict, no hint): the exact spelling → 2. Both: no match → 4;
+/// "I don't know" → 5; "I'll just rate myself" → none.
+fn suggestions_for(kind: CardKind, answer: AnswerMatch, hint_used: bool) -> &'static [u8] {
+    match (kind, answer) {
+        (CardKind::Spelling, AnswerMatch::Exact) => &[2],
+        (_, AnswerMatch::Exact) if hint_used => &[3],
+        (_, AnswerMatch::Exact) => &[2, 3],
+        (_, AnswerMatch::None) => &[4],
+        (_, AnswerMatch::DontKnow) => &[5],
+        (_, AnswerMatch::Skipped) => &[],
     }
 }
 
@@ -225,14 +227,6 @@ impl RateInput {
             }
             _ => {}
         }
-        if let (Some(answer), Some(suggested)) = (self.answer_match, self.suggested_grade)
-            && !suggestions_for(answer, self.hint_used).contains(&suggested.get())
-        {
-            return Err(SessionError::Invalid(
-                "suggested_grade does not agree with answer_match and hint_used (design §6.8)"
-                    .to_owned(),
-            ));
-        }
         if let Some(ts) = &self.client_ts
             && ts.parse::<crate::clock::Timestamp>().is_err()
         {
@@ -244,25 +238,46 @@ impl RateInput {
     }
 
     /// Check the answer details against the kind of card rated: only typed
-    /// cards (Produce, later Spelling) have a typed answer, a match, a hint
-    /// or a suggested grade, and a typed card always says how it was
-    /// answered (`answer_match`).
+    /// cards (Produce, Spelling) have a typed answer, a match, a hint or a
+    /// suggested grade; a typed card always says how it was answered
+    /// (`answer_match`), with a suggestion that agrees with it; Spelling
+    /// has no hint (it would show the spelling).
     fn check_for(&self, kind: CardKind) -> Result<(), SessionError> {
         let details = self.typed_answer.is_some()
             || self.answer_match.is_some()
             || self.hint_used
             || self.suggested_grade.is_some();
         match kind {
-            CardKind::Understand if details => Err(SessionError::Invalid(
-                "typed_answer, answer_match, hint_used and suggested_grade are only for typed \
-                 cards"
-                    .to_owned(),
-            )),
-            CardKind::Produce | CardKind::Spelling if self.answer_match.is_none() => Err(
-                SessionError::Invalid("a typed card needs answer_match".to_owned()),
-            ),
-            _ => Ok(()),
+            CardKind::Understand if details => {
+                return Err(SessionError::Invalid(
+                    "typed_answer, answer_match, hint_used and suggested_grade are only for typed \
+                     cards"
+                        .to_owned(),
+                ));
+            }
+            CardKind::Understand => return Ok(()),
+            CardKind::Spelling if self.hint_used => {
+                return Err(SessionError::Invalid(
+                    "a Spelling card has no hint (hint_used must be false)".to_owned(),
+                ));
+            }
+            CardKind::Produce | CardKind::Spelling => {}
         }
+        let Some(answer) = self.answer_match else {
+            return Err(SessionError::Invalid(
+                "a typed card needs answer_match".to_owned(),
+            ));
+        };
+        if let Some(suggested) = self.suggested_grade
+            && !suggestions_for(kind, answer, self.hint_used).contains(&suggested.get())
+        {
+            return Err(SessionError::Invalid(
+                "suggested_grade does not agree with the card, answer_match and hint_used \
+                 (design §6.8)"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
     }
 }
 

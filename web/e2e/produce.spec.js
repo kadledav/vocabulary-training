@@ -343,7 +343,7 @@ test('R-52 Today counts the Produce cards waiting and the daily limit is a setti
   void pageErrors;
   await waitingProduce(app, ['glimmerous', 'brontle', 'quabble', 'snorkish']);
   await page.goto(`${app.url}/#/settings`);
-  const limit = page.getByLabel('New Produce cards per day');
+  const limit = page.getByLabel('New Produce/Spelling cards per day');
   await expect(limit).toHaveValue('10');
   await limit.fill('3');
   await limit.press('Tab');
@@ -352,7 +352,7 @@ test('R-52 Today counts the Produce cards waiting and the daily limit is a setti
 
   await page.goto(`${app.url}/#/`);
   await expect(page.getByTestId('typed-waiting')).toHaveText(
-    '4 Produce cards wait for the first time — 3 today (limit 3 a day), the rest on later days.',
+    '4 Produce/Spelling cards wait for the first time — 3 today (limit 3 a day), the rest on later days.',
   );
   await expect(page.getByTestId('due-now')).toContainText('3 due now');
   await page.getByTestId('start').click();
