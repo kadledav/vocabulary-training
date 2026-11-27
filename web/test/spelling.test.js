@@ -4,7 +4,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { checkSpelling, diffSummary, spellingDiff, spellingText } from '../js/grading.js';
+import { readFileSync } from 'node:fs';
+
+import { DIFF_SUMMARY_MAX, INVISIBLE_RANGES, checkSpelling, diffSummary, normalise, spellingDiff, spellingText, typedText } from '../js/grading.js';
 import { storedCheck } from '../js/practice/draft.js';
 
 /**
@@ -139,4 +141,57 @@ test('R-58 the diff in words for a screen reader', () => {
   assert.equal(diffSummary(spellingDiff('zibberrate', 'zibberate')), 'extra “r” after letter 5');
   assert.equal(diffSummary(spellingDiff('ab', 'ba')), 'extra “a” at the start; letter 2 missing: “a”');
   assert.equal(diffSummary(spellingDiff('poreover', 'pore over')), 'letter 5 missing: a space');
+});
+
+test('R-58 invisible characters do not make a right spelling wrong', () => {
+  for (const typed of [
+    'zibberate\u200b',
+    'zib\u200bberate',
+    '\u200ezibberate',
+    'zibber\u200fate',
+    'zib\u00adberate',
+    '\ufeffzibberate',
+    '\u202ezibberate\u202c',
+    'zibb\u2066er\u2069ate',
+    'zibberate\u2060',
+  ]) {
+    assert.equal(checkSpelling(typed, 'zibberate').match, 'exact', JSON.stringify(typed));
+    assert.equal(typedText(typed), 'zibberate', JSON.stringify(typed));
+  }
+  // Only invisible characters: nothing typed.
+  assert.equal(spellingText('\u200b\u202e'), '');
+  assert.equal(checkSpelling('\u200b', 'zibberate').match, 'none');
+  // A wrong answer's diff never has a column for an invisible character.
+  const diff = spellingDiff('zib\u200bbrate', 'zibberate');
+  assert.ok(diff.every((c) => c.typed !== '\u200b'));
+  assert.equal(diffSummary(diff), 'letter 5 missing: “e”');
+});
+
+test('R-58 the invisible characters are the server’s set (vocab_pack::keys::is_invisible)', () => {
+  const source = readFileSync(new URL('../../crates/vocab-pack/src/keys.rs', import.meta.url), 'utf8');
+  const body = source.slice(source.indexOf('pub fn is_invisible'), source.indexOf('pub fn strip_invisible'));
+  const code = (/** @type {string} */ hex) => parseInt(hex, 16);
+  const server = [...body.matchAll(/'\\u\{([0-9A-Fa-f]+)\}'(?:\.\.='\\u\{([0-9A-Fa-f]+)\}')?/g)].map((m) => [code(m[1]), code(m[2] ?? m[1])]);
+  const sort = (/** @type {ReadonlyArray<readonly number[]>} */ ranges) => [...ranges].map((r) => [...r]).sort((a, b) => a[0] - b[0]);
+  assert.ok(server.length >= 5, 'the function was found');
+  assert.deepEqual(sort(INVISIBLE_RANGES), sort(server));
+  // Produce compares without them too.
+  assert.equal(normalise('pot\u200bluck'), normalise('potluck'));
+});
+
+test('R-58 a long wrong answer is summed up briefly', () => {
+  assert.equal(diffSummary(spellingDiff('zibberate' + 'q'.repeat(12), 'zibberate')), '12 extra letters after letter 9');
+  assert.equal(diffSummary(spellingDiff('q'.repeat(12) + 'zibberate', 'zibberate')), '12 extra letters at the start');
+  assert.equal(diffSummary(spellingDiff('zibberateqq', 'zibberate')), '2 extra letters “qq” after letter 9');
+  assert.equal(diffSummary(spellingDiff('zirate', 'zibberate')), 'letters 3 to 5 missing: “bbe”');
+  assert.equal(diffSummary(spellingDiff('zixxxrate', 'zibberate')), 'letters 3 to 5: you typed “xxx”, the word has “bbe”');
+  // Hopeless: fewer than half the letters right.
+  assert.equal(diffSummary(spellingDiff('q'.repeat(300), 'quabb')), 'very different from the word, which is spelled “quabb”: q, u, a, b, b');
+  assert.equal(diffSummary(spellingDiff('x'.repeat(300), 'y'.repeat(300))).length <= DIFF_SUMMARY_MAX, true);
+  // Many scattered slips: capped.
+  const word = 'zibberatequabblingglimmerousbrontle';
+  const typed = [...word].map((c, i) => (i % 3 === 2 ? 'x' : c)).join('');
+  const summary = diffSummary(spellingDiff(typed, word));
+  assert.ok(summary.length <= DIFF_SUMMARY_MAX, summary);
+  assert.match(summary, /…and \d+ more differences$/);
 });

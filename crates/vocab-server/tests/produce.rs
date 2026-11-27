@@ -596,6 +596,29 @@ async fn r56_typed_answer_hint_and_suggestion_are_stored_with_the_review() {
 }
 
 #[tokio::test]
+async fn r58_invisible_characters_are_not_stored_with_a_typed_answer() {
+    let env = env();
+    env.import("test-novel", words("ta", 1)).await;
+    waiting_produce(&env, "2026-12-30", "2026-11-20");
+    let block = start_block(&env).await;
+    // A right-to-left override would show the stored answer reversed; a
+    // zero-width space and a soft hyphen hide in it.
+    let (status, r) = review(
+        &env,
+        &block,
+        2,
+        json!({ "typed_answer": "\u{202E}ta\u{200B}0\u{00AD}1", "answer_match": "exact", "suggested_grade": 2 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{r}");
+    let stored: String = env
+        .sql()
+        .query_row("SELECT typed_answer FROM review_log", [], |r| r.get(0))
+        .expect("stored");
+    assert_eq!(stored, "ta01");
+}
+
+#[tokio::test]
 async fn r56_typed_review_details_are_validated() {
     let env = env();
     env.import("test-novel", words("tv", 1)).await;

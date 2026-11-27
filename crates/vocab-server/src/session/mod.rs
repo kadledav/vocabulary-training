@@ -237,6 +237,16 @@ impl RateInput {
         Ok(self.client_review_id.to_ascii_lowercase())
     }
 
+    /// The typed answer as it is stored: without invisible formatting
+    /// characters (a zero-width space, a bidi override; the pack's own
+    /// notion of them, as the client compares it), which would make a
+    /// stored answer look like something else than what was compared.
+    fn stored_typed_answer(&self) -> Option<String> {
+        self.typed_answer
+            .as_deref()
+            .map(vocab_pack::keys::strip_invisible)
+    }
+
     /// Check the answer details against the kind of card rated: only typed
     /// cards (Produce, Spelling) have a typed answer, a match, a hint or a
     /// suggested grade; a typed card always says how it was answered

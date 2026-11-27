@@ -117,6 +117,7 @@ pub fn rate(
     let card = scheduler::card(tx, item.card_id)?.ok_or(SessionError::ItemNotFound)?;
     input.check_for(card.kind)?;
     let word = catalog::word_traits(tx, card.word_id)?.ok_or(SessionError::ItemNotFound)?;
+    let typed_answer = input.stored_typed_answer();
     let review = scheduler::record_review(
         tx,
         &ReviewInput {
@@ -125,7 +126,7 @@ pub fn rate(
             session_id: Some(id.as_str()),
             raw_grade: input.raw_grade,
             suggested_grade: input.suggested_grade,
-            typed_answer: input.typed_answer.as_deref(),
+            typed_answer: typed_answer.as_deref(),
             answer_match: input.answer_match,
             hint_used: input.hint_used,
             duration_ms: input.duration_ms,
