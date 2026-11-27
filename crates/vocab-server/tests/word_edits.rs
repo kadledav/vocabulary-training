@@ -856,3 +856,67 @@ async fn r04_ids_of_a_deleted_word_are_never_reused() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(detail(&env, new).await["usefulness"], 5);
 }
+
+/// Finding: the owner's accepted answers and the pack's are one list. One
+/// the owner added and removed is not brought back by a pack; one a pack
+/// also brings is listed once; removing it removes it for good.
+#[tokio::test]
+async fn r04_owner_accepted_answers_and_the_packs_are_one_list() {
+    let env = env();
+    env.import(BOOK, vec![lull()]).await;
+    let id = id_of(&env, "lull").await;
+    let add = |value: &'static str| {
+        let env = &env;
+        async move {
+            let (status, view) = env
+                .post(
+                    &format!("/api/words/{id}/items"),
+                    &json!({ "kind": "accepted", "value": value }),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{view}");
+        }
+    };
+    add("lulled").await;
+    add("lulling").await;
+    let (status, _) = env
+        .request(
+            "DELETE",
+            &format!("/api/words/{id}/items/accepted/lulled"),
+            Some(&json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let mut pack = lull();
+    pack["accepted"] = json!(["lulls", "lulled", "Lulling"]);
+    env.import(BOOK, vec![pack.clone()]).await;
+    let view = detail(&env, id).await;
+    assert_eq!(values(&view["items"]["accepted"]), ["lulls", "lulling"]);
+    assert_eq!(
+        env.int("SELECT COUNT(*) FROM word_item WHERE kind = 'accepted' AND value_key IN ('lulled', 'lulling')"),
+        0,
+        "no pack row for what the owner has or removed"
+    );
+    // Rows of both kinds (from before this fix) are listed once and
+    // removed together.
+    env.exec(&format!(
+        "INSERT INTO word_item (word_id, kind, value, value_key, position, origin) \
+         VALUES ({id}, 'accepted', 'Lulling', 'lulling', 9, 'pack')"
+    ));
+    let view = detail(&env, id).await;
+    assert_eq!(values(&view["items"]["accepted"]), ["lulls", "Lulling"]);
+    let (status, view) = env
+        .request(
+            "DELETE",
+            &format!("/api/words/{id}/items/accepted/lulling"),
+            Some(&json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(values(&view["items"]["accepted"]), ["lulls"]);
+    env.import(BOOK, vec![pack]).await;
+    assert_eq!(
+        values(&detail(&env, id).await["items"]["accepted"]),
+        ["lulls"]
+    );
+}

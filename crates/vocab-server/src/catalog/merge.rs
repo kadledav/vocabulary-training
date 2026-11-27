@@ -265,8 +265,14 @@ fn plan(conn: &Connection, source: SourceId, word: &PackWord) -> rusqlite::Resul
     }
 
     // Lists: union by key; any existing row (also removed ones) blocks re-adding.
+    // The owner's accepted answers (`owner_accepted`, design §6.8) are part
+    // of the accepted list: one the owner added (or added and removed again)
+    // is not brought in once more as the pack's.
     let known_items: HashSet<(String, String)> = {
-        let mut stmt = conn.prepare("SELECT kind, value_key FROM word_item WHERE word_id = ?1")?;
+        let mut stmt = conn.prepare(
+            "SELECT CASE kind WHEN 'owner_accepted' THEN 'accepted' ELSE kind END, value_key \
+             FROM word_item WHERE word_id = ?1",
+        )?;
         stmt.query_map([id.0], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<Result<_, _>>()?
     };

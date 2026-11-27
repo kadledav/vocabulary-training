@@ -454,10 +454,15 @@ fn item_lists(conn: &Connection, id: WordId) -> rusqlite::Result<ItemLists> {
     })?;
     for row in rows {
         let (kind, item) = row?;
-        match kind.as_str() {
-            "czech" => lists.czech.push(item),
-            "confusable" => lists.confusables.push(item),
-            _ => lists.accepted.push(item),
+        let list = match kind.as_str() {
+            "czech" => &mut lists.czech,
+            "confusable" => &mut lists.confusables,
+            _ => &mut lists.accepted,
+        };
+        // One entry per key: the pack's and the owner's accepted answers
+        // are one list (a pack row comes first).
+        if !list.iter().any(|known| known.key == item.key) {
+            list.push(item);
         }
     }
     let mut stmt = conn.prepare(
