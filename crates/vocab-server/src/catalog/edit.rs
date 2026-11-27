@@ -11,8 +11,10 @@
 //!   pack that disagrees later only adds a suggestion (`field_conflict`),
 //!   it never overwrites the owner's value (rule 4). An open suggestion of
 //!   exactly the value the owner now chose is settled (`applied`).
-//! * A changed headword keeps its former key as an alias (`word_alias`), so
-//!   the pack's spelling still finds this word.
+//! * A changed headword needs nothing more: every spelling a pack used for
+//!   the word is kept (`word_pack_spelling`, `identity`), so the pack still
+//!   finds it. The owner's own spellings are never kept; he can remove a
+//!   pack spelling ([`remove_pack_spelling`]).
 //! * A removed list item or form stays as a `removed` row: a pack never adds
 //!   it again. Adding it back revives that row.
 //! * An edited or hidden sentence is never changed by a pack (`edited`,
@@ -30,7 +32,7 @@ use vocab_pack::validate::{
     MAX_LIST_ITEMS, owner_form, owner_list_item, owner_sentence, owner_word_edit,
 };
 
-use super::identity::find_word;
+use super::identity::{KeyHolder, holder};
 use super::{WordId, scalar};
 
 /// Why an owner change was not made. The messages are for the owner.
@@ -49,6 +51,12 @@ pub enum EditError {
     Invalid(String),
     #[error("Another word already has the headword \"{0}\".")]
     HeadwordTaken(String),
+    /// The key is how a pack spelled another word (shown as `headword`).
+    #[error(
+        "\"{spelling}\" is how a pack spelled the word \"{headword}\"; a pack with it finds that word. \
+         Remove that spelling there first, or choose another headword."
+    )]
+    SpellingTaken { spelling: String, headword: String },
     #[error("This word already has the same sentence.")]
     DuplicateSentence,
     #[error("This suggestion was already answered.")]
@@ -153,47 +161,59 @@ pub fn update_word(
     Ok(changed)
 }
 
-/// Store a new spelling of the headword. A different key keeps the old one
-/// as an alias (a pack with the old spelling still finds the word); a key
-/// that belongs to another word is refused.
+/// Store a new spelling of the headword. A key that belongs to another
+/// word (its headword, or how a pack spelled it) is refused, naming what
+/// collides. The former spelling is not kept: only packs leave spellings
+/// behind (`identity`).
 fn change_headword(
     tx: &Transaction<'_>,
     id: WordId,
     headword: &str,
     now: &str,
 ) -> Result<bool, EditError> {
-    let (old, old_key): (String, String) = tx.query_row(
-        "SELECT headword, headword_key FROM word WHERE id = ?1",
+    let old: String = tx.query_row(
+        "SELECT headword FROM word WHERE id = ?1",
         [id.get()],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| row.get(0),
     )?;
     if old == headword {
         return Ok(false);
     }
     let key = headword_key(headword);
-    if key != old_key {
-        if let Some(other) = find_word(tx, &key)?
-            && other != id
-        {
-            let taken: String = tx.query_row(
-                "SELECT headword FROM word WHERE id = ?1",
-                [other.get()],
-                |row| row.get(0),
-            )?;
-            return Err(EditError::HeadwordTaken(taken));
+    match holder(tx, &key)? {
+        Some(other) if other.word() != id => {
+            return Err(match other {
+                KeyHolder::Headword { headword, .. } => EditError::HeadwordTaken(headword),
+                KeyHolder::PackSpelling {
+                    spelling, headword, ..
+                } => EditError::SpellingTaken { spelling, headword },
+            });
         }
-        // Back to a former spelling: that key is the word's own again.
-        tx.execute("DELETE FROM word_alias WHERE key = ?1", [&key])?;
-        tx.execute(
-            "INSERT OR IGNORE INTO word_alias (key, word_id) VALUES (?1, ?2)",
-            params![old_key, id.get()],
-        )?;
+        _ => {}
     }
     tx.execute(
         "UPDATE word SET headword = ?2, headword_key = ?3, updated_at = ?4 WHERE id = ?1",
         params![id.get(), headword, key, now],
     )?;
     Ok(true)
+}
+
+/// Forget a spelling a pack used for the word (not its current headword):
+/// a later pack with that spelling adds a new word.
+pub fn remove_pack_spelling(
+    tx: &Transaction<'_>,
+    id: WordId,
+    key: &str,
+    now: &str,
+) -> Result<(), EditError> {
+    if !word_exists(tx, id)? {
+        return Err(EditError::WordNotFound);
+    }
+    if !super::identity::remove_pack_spelling(tx, id, key)? {
+        return Err(EditError::ItemNotFound);
+    }
+    touch(tx, id, now)?;
+    Ok(())
 }
 
 // ── list items and forms ────────────────────────────────────────────────────
@@ -556,7 +576,7 @@ fn set_flag(
 }
 
 /// Delete a word with everything the catalog holds about it (sources
-/// links, lists, forms, sentences, overrides, suggestions, aliases). The
+/// links, lists, forms, sentences, overrides, suggestions, pack spellings). The
 /// caller removes the word's cards first (`scheduler`).
 pub fn delete_word(tx: &Transaction<'_>, id: WordId) -> Result<(), EditError> {
     if tx.execute("DELETE FROM word WHERE id = ?1", [id.get()])? == 0 {

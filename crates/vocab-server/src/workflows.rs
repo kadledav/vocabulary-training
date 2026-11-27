@@ -25,6 +25,8 @@
 //! does the same for every stored word at startup, so databases imported
 //! before cards existed are backfilled.
 
+use std::collections::HashMap;
+
 use rusqlite::Transaction;
 use vocab_pack::paste::PasteError;
 use vocab_pack::types::WordResult;
@@ -256,9 +258,30 @@ fn import_pack(
         pack_import_id: import_id,
         now: &ctx.now,
     };
+    // Pack entries that turn out to be one word in the app (a pack spelling
+    // and the owner's new headword of the same word): both are merged, and
+    // the report says so (nothing is lost, but the owner should know).
+    let mut merged_into: HashMap<WordId, (usize, &str)> = HashMap::new();
     for word in &validation.words {
         if let WordResult::Valid(word) = word {
             let merge = catalog::merge_word(tx, &link, word)?;
+            if let Some(id) = merge.word_id {
+                match merged_into.get(&id) {
+                    Some((index, earlier)) => report.add_warning(
+                        &format!("/words/{}/headword", word.index),
+                        format!(
+                            "\"{earlier}\" (word {}) and \"{}\" (word {}) are the same word in the app; \
+                             both were merged into it. Check the word for doubled values.",
+                            index + 1,
+                            word.headword,
+                            word.index + 1,
+                        ),
+                    ),
+                    None => {
+                        merged_into.insert(id, (word.index, word.headword.as_str()));
+                    }
+                }
+            }
             // Cards for the merged word, in the same transaction (design
             // §5.1 step 4); M6 adds `audio::request` here.
             if let Some(id) = merge.word_id
@@ -392,6 +415,17 @@ pub fn remove_word_item(
 ) -> Result<(), WorkflowError> {
     catalog::remove_item(tx, id, kind, key, &now.stamp())?;
     refresh_cards(tx, id, now)
+}
+
+/// Forget a pack spelling of a word (`DELETE /api/words/{id}/spellings`).
+pub fn remove_pack_spelling(
+    tx: &Transaction<'_>,
+    id: WordId,
+    key: &str,
+    now: &Moment,
+) -> Result<(), WorkflowError> {
+    catalog::remove_pack_spelling(tx, id, key, &now.stamp())?;
+    Ok(())
 }
 
 /// Correct a sentence (`PATCH /api/sentences/{id}`). Returns its word.

@@ -1,6 +1,7 @@
 //! Merging a pack word into the catalog (design §5.4, R-03, R-22).
 //!
-//! A pack word is matched to an existing word by `headword_key`. The merge
+//! A pack word is matched to an existing word by `headword_key` or by a
+//! spelling an earlier pack used for it (`identity`). The merge
 //! never touches learning state and never deletes anything:
 //!
 //! | Fields | Rule |
@@ -26,7 +27,7 @@ use serde_json::Value;
 use vocab_pack::keys::{item_key, span_key};
 use vocab_pack::types::{PackSentence, PackWord, TagKind};
 
-use super::identity::find_word;
+use super::identity::{find_word, record_pack_spelling};
 use super::ids::{IdTable, next_id};
 use super::{SourceId, WordId, scalar};
 
@@ -422,6 +423,9 @@ pub fn merge_word(
         }
         None => insert_word(tx, link, word)?,
     };
+    // How this pack spelled the word: a later pack with that spelling finds
+    // it, whatever the owner calls it by then.
+    record_pack_spelling(tx, id, &word.key, &word.headword)?;
     apply_lists(tx, id, word, &plan)?;
     apply_sentences(tx, id, link, word, &plan)?;
     apply_link(tx, id, link, word)?;

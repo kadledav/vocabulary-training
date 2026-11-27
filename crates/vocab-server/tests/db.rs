@@ -29,10 +29,10 @@ const TABLES: &[&str] = &[
     "setting",
     "source",
     "word",
-    "word_alias",
     "word_form",
     "word_item",
     "word_override",
+    "word_pack_spelling",
     "word_source",
 ];
 
@@ -107,7 +107,7 @@ fn r85_synthetic_fixture_satisfies_every_constraint() {
         tx.execute_batch(
             "INSERT INTO audio_engine (id, frontend, engine, checked_at) \
              VALUES (1, 'g2p-2', 'kokoro-test', '2026-11-17T10:00:00Z'); \
-             INSERT INTO word_alias (key, word_id) VALUES ('test-former-key', 1);",
+             INSERT INTO word_pack_spelling (key, word_id, headword) VALUES ('test-former-key', 1, 'Test-former-key');",
         )
         .map_err(DbError::from)
     }))
@@ -821,8 +821,8 @@ fn form_rows(conn: &Connection, condition: &str) -> Vec<String> {
 }
 
 /// Migration 0007 (M7, R-04) on a database at version 6 holding the
-/// synthetic fixture: the alias table exists and is empty, every stored
-/// form is kept and not removed, the constraints hold. (The version-6
+/// synthetic fixture: every word's key is its first pack spelling, every
+/// stored form is kept and not removed, the constraints hold. (The version-6
 /// database is built from the migrations' SQL; the Rust data step of 0005
 /// only re-keys sentences and plays no part here.)
 #[test]
@@ -848,10 +848,23 @@ fn r04_v6_database_with_data_migrates_to_v7() {
         .expect("user_version");
     assert_eq!(version, 7);
     assert_eq!(form_rows(&conn, "removed = 0"), forms_before);
-    let aliases: i64 = conn
-        .query_row("SELECT COUNT(*) FROM word_alias", [], |r| r.get(0))
-        .expect("alias table");
-    assert_eq!(aliases, 0);
+    let unmatched: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM word w LEFT JOIN word_pack_spelling p \
+             ON p.key = w.headword_key AND p.word_id = w.id AND p.headword = w.headword \
+             WHERE p.key IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .expect("spellings");
+    assert_eq!(unmatched, 0, "every word's own spelling");
+    let spellings: i64 = conn
+        .query_row("SELECT COUNT(*) FROM word_pack_spelling", [], |r| r.get(0))
+        .expect("count");
+    let words: i64 = conn
+        .query_row("SELECT COUNT(*) FROM word", [], |r| r.get(0))
+        .expect("count");
+    assert_eq!(spellings, words);
     conn.pragma_update(None, "foreign_keys", "ON").expect("fk");
     assert!(
         conn.execute("UPDATE word_form SET removed = 2", [])
@@ -860,20 +873,20 @@ fn r04_v6_database_with_data_migrates_to_v7() {
     );
     assert!(
         conn.execute(
-            "INSERT INTO word_alias (key, word_id) VALUES ('test-old', 999)",
+            "INSERT INTO word_pack_spelling (key, word_id, headword) VALUES ('test-old', 999, 'x')",
             []
         )
         .is_err(),
-        "an alias belongs to an existing word"
+        "a spelling belongs to an existing word"
     );
     let word: i64 = conn
         .query_row("SELECT MIN(id) FROM word", [], |r| r.get(0))
         .expect("word");
     conn.execute(
-        "INSERT INTO word_alias (key, word_id) VALUES ('test-old', ?1)",
+        "INSERT INTO word_pack_spelling (key, word_id, headword) VALUES ('test-old', ?1, 'Test-old')",
         [word],
     )
-    .expect("alias");
+    .expect("spelling");
     // Ids are never reused: the floors start at the highest stored ids and
     // follow every delete, also one by a cascade.
     let floor = |name: &str| -> i64 {

@@ -224,6 +224,11 @@ async fn r04_a_changed_headword_is_still_found_by_the_pack() {
     let id = id_of(&env, "lull").await;
     let view = patch_ok(&env, id, json!({ "headword": "lull (sb) to sleep" })).await;
     assert_eq!(view["headword"], "lull (sb) to sleep");
+    assert_eq!(
+        view["pack_spellings"],
+        json!([{ "headword": "lull", "key": "lull" }]),
+        "the word still answers to the pack's spelling"
+    );
 
     env.import(BOOK, vec![lull()]).await;
     assert_eq!(env.int("SELECT COUNT(*) FROM word"), 2, "no second lull");
@@ -231,24 +236,125 @@ async fn r04_a_changed_headword_is_still_found_by_the_pack() {
     assert_eq!(view["headword"], "lull (sb) to sleep");
     assert_eq!(view["sentences"].as_array().expect("s").len(), 3);
 
-    // Another word's headword (or one of its former ones) is refused.
+    // Another word's headword (or a pack's spelling of another word) is
+    // refused, naming what collides.
     let (status, body) = patch(&env, id, json!({ "headword": "Sift" })).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["error"]["code"], "headword_taken");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .expect("m")
+            .contains("\"sift\"")
+    );
     let sift = id_of(&env, "sift").await;
-    let (status, _) = patch(&env, sift, json!({ "headword": "lull" })).await;
-    assert_eq!(
-        status,
-        StatusCode::CONFLICT,
-        "lull is the first word's alias"
+    let (status, body) = patch(&env, sift, json!({ "headword": "Lull" })).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("\"lull\"") && message.contains("\"lull (sb) to sleep\""),
+        "names the pack spelling and the word as shown: {message}"
     );
 
-    // Back to the pack's spelling (in another case): its own key again.
-    patch_ok(&env, id, json!({ "headword": "Lull" })).await;
-    assert_eq!(env.int("SELECT COUNT(*) FROM word_alias"), 1);
+    // Back to the pack's spelling (in another case): nothing else is kept.
+    let view = patch_ok(&env, id, json!({ "headword": "Lull" })).await;
+    assert_eq!(view["pack_spellings"], json!([]));
+    assert_eq!(
+        env.int("SELECT COUNT(*) FROM word_pack_spelling WHERE key = 'lull (sb) to sleep'"),
+        0
+    );
     env.import(BOOK, vec![lull()]).await;
     assert_eq!(env.int("SELECT COUNT(*) FROM word"), 2);
     assert_eq!(detail(&env, id).await["headword"], "Lull");
+}
+
+/// Finding: an owner's intermediate spelling (a typo, or a change he took
+/// back) never stays attached to the word, so a later, genuinely
+/// different pack word with that spelling is a word of its own.
+#[tokio::test]
+async fn r04_the_owners_own_spellings_leave_nothing_behind() {
+    let env = env();
+    env.import(BOOK, vec![lull()]).await;
+    let id = id_of(&env, "lull").await;
+    patch_ok(&env, id, json!({ "headword": "brontlex" })).await;
+    patch_ok(&env, id, json!({ "headword": "lul" })).await;
+    let view = patch_ok(&env, id, json!({ "headword": "lull" })).await;
+    assert_eq!(view["pack_spellings"], json!([]));
+    assert_eq!(env.int("SELECT COUNT(*) FROM word_pack_spelling"), 1);
+
+    env.import(BOOK, vec![word("brontlex", 4, 3)]).await;
+    assert_eq!(env.int("SELECT COUNT(*) FROM word"), 2, "a word of its own");
+    assert_eq!(detail(&env, id).await["headword"], "lull");
+    assert_eq!(
+        detail(&env, id).await["sentences"]
+            .as_array()
+            .expect("s")
+            .len(),
+        3
+    );
+    // Another word may take a spelling the owner gave up.
+    let other = id_of(&env, "brontlex").await;
+    patch_ok(&env, other, json!({ "headword": "lul" })).await;
+}
+
+/// The owner sees the pack spellings a renamed word answers to and can
+/// remove one; a pack with it then brings a new word.
+#[tokio::test]
+async fn r04_a_pack_spelling_can_be_removed() {
+    let env = env();
+    env.import(BOOK, vec![lull()]).await;
+    let id = id_of(&env, "lull").await;
+    patch_ok(&env, id, json!({ "headword": "lull to sleep" })).await;
+    let uri = format!("/api/words/{id}/spellings");
+    // The current headword is not a removable spelling; unknown keys 404.
+    for key in ["lull to sleep", "nothing"] {
+        let (status, _) = env
+            .request("DELETE", &uri, Some(&json!({ "key": key })))
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{key}");
+    }
+    let (status, view) = env
+        .request("DELETE", &uri, Some(&json!({ "key": "lull" })))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["pack_spellings"], json!([]));
+    env.import(BOOK, vec![lull()]).await;
+    assert_eq!(env.int("SELECT COUNT(*) FROM word"), 2);
+    assert_eq!(detail(&env, id).await["headword"], "lull to sleep");
+}
+
+/// One pack with both the old (pack) spelling and the new headword of a
+/// renamed word: both entries are merged into it and the report says so.
+#[tokio::test]
+async fn r04_a_pack_with_both_spellings_of_a_word_is_reported() {
+    let env = env();
+    env.import(BOOK, vec![lull()]).await;
+    let id = id_of(&env, "lull").await;
+    patch_ok(&env, id, json!({ "headword": "lull to sleep" })).await;
+    let mut renamed = word("lull to sleep", 7, 0);
+    renamed["czech"] = json!(["uspat"]);
+    renamed["sentences"] = json!([{
+        "en": "They [[lull to sleep]] the test baby.",
+        "cs": "[[Uspávají]] testovací miminko.",
+        "origin": "example",
+    }]);
+    let report = env.import(BOOK, vec![lull(), renamed]).await;
+    assert_eq!(env.int("SELECT COUNT(*) FROM word"), 1);
+    let pack = &report["packs"][0];
+    let warnings = pack["warnings"].as_array().expect("warnings");
+    let warning = warnings
+        .iter()
+        .find(|w| w["pointer"] == "/words/1/headword")
+        .unwrap_or_else(|| panic!("a warning for the second entry: {pack}"));
+    let message = warning["message"].as_str().expect("message");
+    assert!(
+        message.contains("\"lull\"") && message.contains("\"lull to sleep\""),
+        "{message}"
+    );
+    // Nothing of either entry is lost.
+    let view = detail(&env, id).await;
+    assert!(values(&view["items"]["czech"]).contains(&"uspat".to_owned()));
+    assert_eq!(view["sentences"].as_array().expect("s").len(), 4);
 }
 
 #[tokio::test]

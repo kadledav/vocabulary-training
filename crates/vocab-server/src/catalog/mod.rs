@@ -6,7 +6,8 @@
 //! catalog tables (design §3.2).
 //!
 //! Owned tables: `source`, `word`, `word_source`, `word_item`, `word_form`,
-//! `sentence`, `word_override`, `field_conflict`, `id_floor`. The `audio` module reads
+//! `sentence`, `word_override`, `field_conflict`, `word_pack_spelling`,
+//! `id_floor`. The `audio` module reads
 //! what can be spoken through [`speak_sources`]. All SQL touching them is in
 //! this module (R-92). Other modules use the functions re-exported here.
 //!
@@ -27,9 +28,11 @@ mod speak;
 use serde::Serialize;
 
 pub use edit::{
-    EditError, ListKind, add_item, delete_word, remove_item, resolve_conflict, set_included,
-    set_sentence_hidden, set_suspended, update_sentence, update_word,
+    EditError, ListKind, add_item, delete_word, remove_item, remove_pack_spelling,
+    resolve_conflict, set_included, set_sentence_hidden, set_suspended, update_sentence,
+    update_word,
 };
+pub use identity::PackSpelling;
 pub use merge::{ConflictReport, ImportLink, ItemsAdded, MergeOutcome, WordMerge, merge_word};
 pub use practice::{
     PracticeWord, WordTraits, all_traits, practice_words, source_exists, traits, word_traits,

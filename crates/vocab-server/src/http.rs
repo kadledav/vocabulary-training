@@ -394,6 +394,13 @@ fn endpoints() -> Vec<Endpoint> {
         endpoint(
             Standard,
             Session,
+            Delete,
+            "/api/words/{id}/spellings",
+            remove_spelling,
+        ),
+        endpoint(
+            Standard,
+            Session,
             Post,
             "/api/conflicts/{id}",
             resolve_conflict,
@@ -1259,7 +1266,9 @@ fn edit_error(err: &WorkflowError) -> Response {
             EditError::Invalid(_) => answer(StatusCode::UNPROCESSABLE_ENTITY, "invalid"),
             EditError::LastCzech => answer(StatusCode::UNPROCESSABLE_ENTITY, "last_czech"),
             EditError::TooManyItems => answer(StatusCode::UNPROCESSABLE_ENTITY, "too_many_items"),
-            EditError::HeadwordTaken(_) => answer(StatusCode::CONFLICT, "headword_taken"),
+            EditError::HeadwordTaken(_) | EditError::SpellingTaken { .. } => {
+                answer(StatusCode::CONFLICT, "headword_taken")
+            }
             EditError::DuplicateSentence => answer(StatusCode::CONFLICT, "duplicate_sentence"),
             EditError::ConflictClosed => answer(StatusCode::CONFLICT, "conflict_closed"),
             EditError::Sqlite(_) => internal_error(err),
@@ -1447,6 +1456,38 @@ async fn remove_item(
     let id = WordId::new(id);
     edit_then_show(&state, false, move |tx, now| {
         workflows::remove_word_item(tx, id, kind, &key, now)?;
+        Ok((id, false))
+    })
+    .await
+}
+
+/// Body of `DELETE /api/words/{id}/spellings`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpellingBody {
+    /// The spelling's `key` from the word detail's `pack_spellings`.
+    key: String,
+}
+
+/// `DELETE /api/words/{id}/spellings` `{key}`: forget a spelling a pack
+/// used for the word; a later pack with it adds a new word.
+async fn remove_spelling(
+    State(state): State<AppState>,
+    id: Result<Path<i64>, PathRejection>,
+    body: Result<Json<SpellingBody>, JsonRejection>,
+) -> Response {
+    let Ok(Path(id)) = id else {
+        return not_found().await;
+    };
+    let key = match body {
+        Ok(Json(body)) => body.key,
+        Err(rejection) => {
+            return rejected_body(&rejection, "The body must be {\"key\": \"…\"}.");
+        }
+    };
+    let id = WordId::new(id);
+    edit_then_show(&state, false, move |tx, now| {
+        workflows::remove_pack_spelling(tx, id, &key, now)?;
         Ok((id, false))
     })
     .await
