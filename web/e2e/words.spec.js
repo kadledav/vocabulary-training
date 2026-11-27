@@ -179,7 +179,11 @@ test('R-04 edits survive a re-import of the same pack; the pack only suggests (R
   await expect(page.getByTestId('toast')).toContainText('Took the pack’s meaning.');
   await page.getByTestId('toast').getByRole('button', { name: 'Undo' }).click();
   await expect(page.getByTestId('field-meaning')).toContainText('Glowing on and off (my words).');
-  expect((await app.api('GET', `/api/words/${id}`)).conflicts).toEqual([]);
+  // Exactly as before: the owner's meaning, and the suggestion open again.
+  await expect(page.getByTestId('conflict-meaning')).toContainText('Shining faintly and unsteadily.');
+  const word = await app.api('GET', `/api/words/${id}`);
+  expect(word.conflicts.map((/** @type {{ field: string }} */ c) => c.field)).toEqual(['meaning']);
+  expect(word.overridden).toContain('meaning');
 });
 
 test('R-52 the goal switch and usefulness are saved at once', async ({ page, app, pageErrors }) => {
@@ -355,4 +359,107 @@ test('R-74 a long word and its long texts wrap on the phone', async ({ page, app
   await expectNoSidewaysScroll(page);
   await page.getByRole('button', { name: 'Edit meaning' }).click();
   await expectNoSidewaysScroll(page);
+});
+
+test('R-04 Undo puts back exactly what was there; a save never loses what is typed elsewhere', async ({ page, app, pageErrors }) => {
+  const id = await openWord(page, app, 'quabble');
+  const first = (await app.api('GET', `/api/words/${id}`)).sentences[0];
+  // An open editor and an "add" field with unsaved text.
+  await page.getByRole('button', { name: 'Edit grammar' }).click();
+  await page.getByLabel('Grammar', { exact: true }).fill('noun, half typed');
+  await page.getByLabel('Add Czech equivalent').fill('rozepře');
+  const item = page.getByTestId(`sentence-${first.id}`);
+  await item.getByRole('button', { name: 'Edit' }).click();
+  await page.getByLabel('Czech', { exact: true }).fill('Pohádali se kvůli mapě, byla to [[šarvátka]].');
+  await item.getByRole('button', { name: 'Save' }).click();
+  await expect(page.getByTestId('toast')).toContainText('Sentence saved.');
+  await expect(item).toContainText('edited by you');
+  await expect(page.getByLabel('Grammar', { exact: true })).toHaveValue('noun, half typed');
+  await expect(page.getByLabel('Add Czech equivalent')).toHaveValue('rozepře');
+
+  // Undo: the sentence is the pack's again (not "edited"), on the server too.
+  await page.getByTestId('toast').getByRole('button', { name: 'Undo' }).click();
+  await expect(page.getByTestId('toast')).toContainText('Undone.');
+  await expect(item).not.toContainText('edited by you');
+  expect((await app.api('GET', `/api/words/${id}`)).sentences[0].edited).toBe(false);
+  await expect(page.getByLabel('Grammar', { exact: true })).toHaveValue('noun, half typed');
+  await expect(page.getByLabel('Add Czech equivalent')).toHaveValue('rozepře');
+
+  // A switch keeps them too; a suspended word's card is paused, not due.
+  await page.getByLabel('Suspended (not practised)').check();
+  await expect(page.getByTestId('toast')).toContainText('Suspended.');
+  await expect(page.getByTestId('card-understand')).toContainText('paused');
+  await expect(page.getByLabel('Grammar', { exact: true })).toHaveValue('noun, half typed');
+  // The word changes elsewhere (another tab): the Undo is refused in words.
+  await app.api('PATCH', `/api/words/${id}`, { usefulness: 3 });
+  await page.getByTestId('toast').getByRole('button', { name: 'Undo' }).click();
+  await expect(page.getByTestId('toast')).toContainText('Could not undo: This change can no longer be undone');
+  allowStatus(pageErrors, 409);
+  expect((await app.api('GET', `/api/words/${id}`)).suspended).toBe(true);
+
+  // Undo of a usefulness step: back to the value before it.
+  await page.reload();
+  await page.getByRole('button', { name: 'Raise usefulness' }).click();
+  await expect(page.getByTestId('usefulness')).toHaveText('4');
+  await page.getByTestId('toast').getByRole('button', { name: 'Undo' }).click();
+  await expect(page.getByTestId('usefulness')).toHaveText('3');
+  const word = await app.api('GET', `/api/words/${id}`);
+  expect(word.overridden).toEqual(['usefulness']);
+});
+
+test('R-04 an item already listed is said so, any item can be removed, Esc closes a confirmation', async ({ page, app, pageErrors }) => {
+  const id = await openWord(page, app, 'glimmerous');
+  const czech = page.getByTestId('list-czech');
+  await page.getByLabel('Add Czech equivalent').fill('TŘPYTIVÝ');
+  await czech.getByRole('button', { name: 'Add' }).click();
+  await expect(page.getByTestId('list-czech-problem')).toHaveText('"třpytivý" is already in the list.');
+  await expect(page.getByLabel('Add Czech equivalent')).toHaveValue('TŘPYTIVÝ');
+  await expect(czech.locator('.chip')).toHaveCount(2);
+  allowStatus(pageErrors, 409);
+
+  // Keys that URL normalisation would change are removed like any other.
+  for (const odd of ['.', '..']) {
+    await page.getByLabel('Add Czech equivalent').fill(odd);
+    await czech.getByRole('button', { name: 'Add' }).click();
+    await expect(czech.locator('.chip')).toHaveCount(3);
+    await czech.getByRole('button', { name: `Remove ${odd}`, exact: true }).click();
+    await expect(page.getByTestId('toast')).toContainText(`Removed “${odd}”.`);
+    await expect(czech.locator('.chip')).toHaveCount(2);
+  }
+
+  // A listed form ticked "rare": its mark changes, said so, with Undo.
+  const forms = page.getByTestId('list-form');
+  await page.getByLabel('Add form').fill('Glimmerous');
+  await forms.getByLabel('rare').check();
+  await forms.getByRole('button', { name: 'Add' }).click();
+  await expect(page.getByTestId('toast')).toContainText('Marked “Glimmerous” as rare.');
+  await expect(forms.locator('.chip').first()).toContainText('(rare)');
+  await page.getByTestId('toast').getByRole('button', { name: 'Undo' }).click();
+  await expect(forms.locator('.chip').first()).not.toContainText('(rare)');
+  expect((await app.api('GET', `/api/words/${id}`)).items.forms[0].common).toBe(true);
+
+  // Esc closes the Delete and Reset confirmations.
+  await page.getByTestId('delete-word').click();
+  await expect(page.getByRole('group', { name: 'Delete word' })).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('group', { name: 'Delete word' })).toHaveCount(0);
+  await expect(page.getByTestId('delete-word')).toBeFocused();
+});
+
+test('R-04 a renamed word shows the pack spellings it answers to; one can be removed', async ({ page, app, pageErrors }) => {
+  void pageErrors;
+  const id = await openWord(page, app, 'brontle');
+  await page.getByRole('button', { name: 'Edit headword' }).click();
+  await page.getByLabel('Headword', { exact: true }).fill('brontle on');
+  await page.getByRole('button', { name: 'Save' }).click();
+  await expect(page.getByTestId('word-headword')).toContainText('brontle on');
+  const spellings = page.getByTestId('pack-spellings');
+  await expect(spellings).toContainText('brontle');
+  await spellings.getByRole('button', { name: 'Remove the pack spelling brontle' }).click();
+  await expect(page.getByTestId('toast')).toContainText('“brontle” no longer finds this word.');
+  await expect(spellings).toHaveCount(0);
+  expect((await app.api('GET', `/api/words/${id}`)).pack_spellings).toEqual([]);
+  // Undo gives it back.
+  await page.getByTestId('toast').getByRole('button', { name: 'Undo' }).click();
+  await expect(page.getByTestId('pack-spellings')).toContainText('brontle');
 });

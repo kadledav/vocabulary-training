@@ -74,6 +74,7 @@ use crate::scheduler::{AnswerMatch, CardKind, RawGrade};
 use crate::session::{self, RateInput, SessionError, SessionId, StartKind, StartRequest};
 use crate::settings::{self, SettingsError, SettingsPatch};
 use crate::stats::{self, StatsError, WordListQuery};
+use crate::undo::UndoToken;
 use crate::web_assets;
 use crate::workflows::{self, WordAction, WorkflowError};
 
@@ -383,13 +384,27 @@ fn endpoints() -> Vec<Endpoint> {
             "/api/words/{id}/actions",
             word_action,
         ),
+        endpoint(
+            Standard,
+            Session,
+            Post,
+            "/api/words/{id}/undo",
+            undo_word_change,
+        ),
         endpoint(Standard, Session, Post, "/api/words/{id}/items", add_item),
         endpoint(
             Standard,
             Session,
             Delete,
-            "/api/words/{id}/items/{kind}/{key}",
+            "/api/words/{id}/items",
             remove_item,
+        ),
+        endpoint(
+            Standard,
+            Session,
+            Delete,
+            "/api/words/{id}/spellings",
+            remove_spelling,
         ),
         endpoint(
             Standard,
@@ -1222,15 +1237,25 @@ async fn list_words(
     )
 }
 
-/// The word's detail (design §7.1 screen 7), or 404.
-async fn word_detail(state: &AppState, id: WordId) -> Response {
+/// The word's detail (design §7.1 screen 7), or 404. After an owner
+/// change, `undo` is the token of its Undo (`null`: nothing changed).
+async fn word_detail(state: &AppState, id: WordId, undo: Option<Option<UndoToken>>) -> Response {
     let day = state.moment().day;
     match state
         .db
         .read(move |conn| Ok::<_, ApiError>(stats::word_detail(conn, day, id)?))
         .await
     {
-        Ok(Some(detail)) => Json(detail).into_response(),
+        Ok(Some(detail)) => match undo {
+            None => Json(detail).into_response(),
+            Some(token) => match serde_json::to_value(&detail) {
+                Ok(mut value) => {
+                    value["undo"] = serde_json::json!(token);
+                    Json(value).into_response()
+                }
+                Err(err) => internal_error(&err),
+            },
+        },
         Ok(None) => not_found().await,
         Err(err) => api_error(&err),
     }
@@ -1244,7 +1269,7 @@ async fn show_word(
     let Ok(Path(id)) = id else {
         return not_found().await;
     };
-    word_detail(&state, WordId::new(id)).await
+    word_detail(&state, WordId::new(id), None).await
 }
 
 /// Answer for an owner edit that was refused.
@@ -1259,13 +1284,39 @@ fn edit_error(err: &WorkflowError) -> Response {
             EditError::Invalid(_) => answer(StatusCode::UNPROCESSABLE_ENTITY, "invalid"),
             EditError::LastCzech => answer(StatusCode::UNPROCESSABLE_ENTITY, "last_czech"),
             EditError::TooManyItems => answer(StatusCode::UNPROCESSABLE_ENTITY, "too_many_items"),
-            EditError::HeadwordTaken(_) => answer(StatusCode::CONFLICT, "headword_taken"),
+            EditError::ItemExists(_) => answer(StatusCode::CONFLICT, "item_exists"),
+            EditError::HeadwordTaken(_) | EditError::SpellingTaken { .. } => {
+                answer(StatusCode::CONFLICT, "headword_taken")
+            }
             EditError::DuplicateSentence => answer(StatusCode::CONFLICT, "duplicate_sentence"),
             EditError::ConflictClosed => answer(StatusCode::CONFLICT, "conflict_closed"),
             EditError::Sqlite(_) => internal_error(err),
         },
         WorkflowError::NoSuchCard(_) => answer(StatusCode::UNPROCESSABLE_ENTITY, "no_such_card"),
+        WorkflowError::Undo(_) | WorkflowError::ChangedSince => {
+            answer(StatusCode::CONFLICT, "undo_unavailable")
+        }
         other => internal_error(other),
+    }
+}
+
+/// What an owner edit did.
+struct Edited {
+    word: WordId,
+    /// Spoken text may have changed (the headword or `speak`).
+    spoken: bool,
+    /// `Some`: the change offers an Undo (`Some(None)`: nothing changed).
+    undo: Option<Option<UndoToken>>,
+}
+
+impl Edited {
+    /// A change with an Undo (see [`workflows::with_undo`]).
+    fn undoable(word: WordId, spoken: bool, undo: Option<UndoToken>) -> Self {
+        Self {
+            word,
+            spoken,
+            undo: Some(undo),
+        }
     }
 }
 
@@ -1275,19 +1326,19 @@ fn edit_error(err: &WorkflowError) -> Response {
 /// is named by its text, so an old one is never played for a new text).
 async fn edit_then_show<F>(state: &AppState, speech: bool, edit: F) -> Response
 where
-    F: FnOnce(&rusqlite::Transaction<'_>, &Moment) -> Result<(WordId, bool), WorkflowError>
+    F: FnOnce(&rusqlite::Transaction<'_>, &Moment) -> Result<Edited, WorkflowError>
         + Send
         + 'static,
 {
     let now = state.moment();
     match state.db.write(move |tx| edit(tx, &now)).await {
-        Ok((id, spoken_changed)) => {
-            if (speech || spoken_changed)
+        Ok(edited) => {
+            if (speech || edited.spoken)
                 && let Some(audio) = &state.audio
             {
                 audio.wake();
             }
-            word_detail(state, id).await
+            word_detail(state, edited.word, edited.undo).await
         }
         Err(err) => edit_error(&err),
     }
@@ -1311,9 +1362,10 @@ async fn patch_word(
     };
     let id = WordId::new(id);
     edit_then_show(&state, false, move |tx, now| {
-        let changed = workflows::edit_word(tx, id, &edit, now)?;
+        let (changed, undo) =
+            workflows::with_undo(tx, id, now, |tx| workflows::edit_word(tx, id, &edit, now))?;
         let spoken = changed.iter().any(|f| *f == "headword" || *f == "speak");
-        Ok((id, spoken))
+        Ok(Edited::undoable(id, spoken, undo))
     })
     .await
 }
@@ -1340,6 +1392,45 @@ async fn delete_word(
         }
         Err(err) => edit_error(&err),
     }
+}
+
+/// Body of `POST /api/words/{id}/undo`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UndoBody {
+    /// The `undo` token of the change's answer.
+    token: String,
+}
+
+/// `POST /api/words/{id}/undo` `{token}`: undo the owner's latest change
+/// of the word, exactly (`409 undo_unavailable` when it is gone, too old,
+/// or the word changed since) → detail.
+async fn undo_word_change(
+    State(state): State<AppState>,
+    id: Result<Path<i64>, PathRejection>,
+    body: Result<Json<UndoBody>, JsonRejection>,
+) -> Response {
+    const SHAPE: &str = "The body must be {\"token\": \"…\"} with the undo token of the change.";
+    let Ok(Path(id)) = id else {
+        return not_found().await;
+    };
+    let token = match body {
+        Ok(Json(body)) => body.token,
+        Err(rejection) => return rejected_body(&rejection, SHAPE),
+    };
+    let Some(token) = UndoToken::parse(&token) else {
+        return error_response(StatusCode::UNPROCESSABLE_ENTITY, "invalid", SHAPE);
+    };
+    let id = WordId::new(id);
+    edit_then_show(&state, true, move |tx, now| {
+        workflows::undo_change(tx, id, &token, now)?;
+        Ok(Edited {
+            word: id,
+            spoken: true,
+            undo: None,
+        })
+    })
+    .await
 }
 
 /// Body of `POST /api/words/{id}/actions`.
@@ -1388,8 +1479,19 @@ async fn word_action(
     };
     let id = WordId::new(id);
     edit_then_show(&state, false, move |tx, now| {
-        workflows::word_action(tx, id, action, now)?;
-        Ok((id, false))
+        // "Reset card" asks first and has no Undo.
+        if let WordAction::ResetCard(_) = action {
+            workflows::word_action(tx, id, action, now)?;
+            return Ok(Edited {
+                word: id,
+                spoken: false,
+                undo: None,
+            });
+        }
+        let ((), undo) = workflows::with_undo(tx, id, now, |tx| {
+            workflows::word_action(tx, id, action, now)
+        })?;
+        Ok(Edited::undoable(id, false, undo))
     })
     .await
 }
@@ -1426,28 +1528,84 @@ async fn add_item(
     };
     let id = WordId::new(id);
     edit_then_show(&state, false, move |tx, now| {
-        workflows::add_word_item(tx, id, kind, &body.value, body.common, now)?;
-        Ok((id, false))
+        let ((), undo) = workflows::with_undo(tx, id, now, |tx| {
+            workflows::add_word_item(tx, id, kind, &body.value, body.common, now)
+        })?;
+        Ok(Edited::undoable(id, false, undo))
     })
     .await
 }
 
-/// `DELETE /api/words/{id}/items/{kind}/{key}`: remove a list item (by its
+/// Body of `DELETE /api/words/{id}/items`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoveItemBody {
+    /// `czech`, `accepted`, `confusable`, `form`.
+    kind: String,
+    /// The item's `key` from the word detail. Sent in the body, never in
+    /// the path: a key may be `.` or `..`, which URL normalisation removes.
+    key: String,
+}
+
+/// `DELETE /api/words/{id}/items` `{kind, key}`: remove a list item (by its
 /// key) for good: no later pack adds it again.
 async fn remove_item(
     State(state): State<AppState>,
-    path: Result<Path<(i64, String, String)>, PathRejection>,
+    id: Result<Path<i64>, PathRejection>,
+    body: Result<Json<RemoveItemBody>, JsonRejection>,
 ) -> Response {
-    let Ok(Path((id, kind, key))) = path else {
+    const SHAPE: &str = "The body must be {\"kind\": \"czech\"|\"accepted\"|\"confusable\"|\"form\", \
+                         \"key\": \"…\"}.";
+    let Ok(Path(id)) = id else {
         return not_found().await;
     };
-    let Some(kind) = ListKind::parse(&kind) else {
-        return not_found().await;
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => return rejected_body(&rejection, SHAPE),
+    };
+    let Some(kind) = ListKind::parse(&body.kind) else {
+        return error_response(StatusCode::UNPROCESSABLE_ENTITY, "invalid", SHAPE);
     };
     let id = WordId::new(id);
     edit_then_show(&state, false, move |tx, now| {
-        workflows::remove_word_item(tx, id, kind, &key, now)?;
-        Ok((id, false))
+        let ((), undo) = workflows::with_undo(tx, id, now, |tx| {
+            workflows::remove_word_item(tx, id, kind, &body.key, now)
+        })?;
+        Ok(Edited::undoable(id, false, undo))
+    })
+    .await
+}
+
+/// Body of `DELETE /api/words/{id}/spellings`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpellingBody {
+    /// The spelling's `key` from the word detail's `pack_spellings`.
+    key: String,
+}
+
+/// `DELETE /api/words/{id}/spellings` `{key}`: forget a spelling a pack
+/// used for the word; a later pack with it adds a new word.
+async fn remove_spelling(
+    State(state): State<AppState>,
+    id: Result<Path<i64>, PathRejection>,
+    body: Result<Json<SpellingBody>, JsonRejection>,
+) -> Response {
+    let Ok(Path(id)) = id else {
+        return not_found().await;
+    };
+    let key = match body {
+        Ok(Json(body)) => body.key,
+        Err(rejection) => {
+            return rejected_body(&rejection, "The body must be {\"key\": \"…\"}.");
+        }
+    };
+    let id = WordId::new(id);
+    edit_then_show(&state, false, move |tx, now| {
+        let ((), undo) = workflows::with_undo(tx, id, now, |tx| {
+            workflows::remove_pack_spelling(tx, id, &key, now)
+        })?;
+        Ok(Edited::undoable(id, false, undo))
     })
     .await
 }
@@ -1488,8 +1646,11 @@ async fn resolve_conflict(
         }
     };
     edit_then_show(&state, true, move |tx, now| {
-        let word = workflows::resolve_conflict(tx, id, choice == ConflictChoice::Incoming, now)?;
-        Ok((word, false))
+        let word = workflows::conflict_word(tx, id)?;
+        let (_, undo) = workflows::with_undo(tx, word, now, |tx| {
+            workflows::resolve_conflict(tx, id, choice == ConflictChoice::Incoming, now)
+        })?;
+        Ok(Edited::undoable(word, false, undo))
     })
     .await
 }
@@ -1522,8 +1683,11 @@ async fn patch_sentence(
         }
     };
     edit_then_show(&state, true, move |tx, now| {
-        let word = workflows::edit_sentence(tx, id, &body.en, &body.cs, now)?;
-        Ok((word, false))
+        let word = workflows::sentence_word(tx, id)?;
+        let (_, undo) = workflows::with_undo(tx, word, now, |tx| {
+            workflows::edit_sentence(tx, id, &body.en, &body.cs, now)
+        })?;
+        Ok(Edited::undoable(word, false, undo))
     })
     .await
 }
@@ -1552,8 +1716,11 @@ async fn hide_sentence(
         }
     };
     edit_then_show(&state, true, move |tx, now| {
-        let word = workflows::hide_sentence(tx, id, hidden, now)?;
-        Ok((word, false))
+        let word = workflows::sentence_word(tx, id)?;
+        let (_, undo) = workflows::with_undo(tx, word, now, |tx| {
+            workflows::hide_sentence(tx, id, hidden, now)
+        })?;
+        Ok(Edited::undoable(word, false, undo))
     })
     .await
 }
@@ -1620,6 +1787,7 @@ fn api_error(err: &ApiError) -> Response {
             SessionError::ReviewIdReused => conflict("review_id_reused"),
             SessionError::ReviewUndone => conflict("review_undone"),
             SessionError::NothingToUndo => conflict("nothing_to_undo"),
+            SessionError::CardChangedSince => conflict("card_changed"),
             SessionError::Random(_) | SessionError::Scheduler(_) | SessionError::Sqlite(_) => {
                 internal_error(err)
             }

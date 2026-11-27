@@ -7,6 +7,7 @@ use serde_json::Value;
 use vocab_pack::keys::item_key;
 use vocab_pack::marked;
 
+use super::identity::{PackSpelling, pack_spellings};
 use super::{SourceId, WordId, scalar};
 
 /// Most rows returned by [`words`]: the whole catalog.
@@ -231,7 +232,7 @@ pub struct ConflictView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ItemView {
     pub value: String,
-    /// `item_key`: names the item in `DELETE …/items/{kind}/{key}`.
+    /// `item_key`: names the item in `DELETE /api/words/{id}/items` `{kind, key}`.
     pub key: String,
     /// Added by the owner (for `accepted`: the owner's own answers).
     pub mine: bool,
@@ -285,6 +286,9 @@ pub struct WordView {
     pub sources: Vec<SourceLinkView>,
     pub sentences: Vec<SentenceView>,
     pub conflicts: Vec<ConflictView>,
+    /// Other spellings packs used for this word (its headword was changed
+    /// since): a pack with one of them still finds the word.
+    pub pack_spellings: Vec<PackSpelling>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -327,6 +331,7 @@ pub fn word_view(conn: &Connection, id: WordId) -> rusqlite::Result<Option<WordV
                     sources: Vec::new(),
                     sentences: Vec::new(),
                     conflicts: Vec::new(),
+                    pack_spellings: Vec::new(),
                 })
             },
         )
@@ -345,6 +350,7 @@ pub fn word_view(conn: &Connection, id: WordId) -> rusqlite::Result<Option<WordV
     view.accepted = items("accepted")?;
     view.confusables = items("confusable")?;
     view.items = item_lists(conn, id)?;
+    view.pack_spellings = pack_spellings(conn, id)?;
     let mut stmt =
         conn.prepare("SELECT field FROM word_override WHERE word_id = ?1 ORDER BY field")?;
     view.overridden = stmt
@@ -448,10 +454,15 @@ fn item_lists(conn: &Connection, id: WordId) -> rusqlite::Result<ItemLists> {
     })?;
     for row in rows {
         let (kind, item) = row?;
-        match kind.as_str() {
-            "czech" => lists.czech.push(item),
-            "confusable" => lists.confusables.push(item),
-            _ => lists.accepted.push(item),
+        let list = match kind.as_str() {
+            "czech" => &mut lists.czech,
+            "confusable" => &mut lists.confusables,
+            _ => &mut lists.accepted,
+        };
+        // One entry per key: the pack's and the owner's accepted answers
+        // are one list (a pack row comes first).
+        if !list.iter().any(|known| known.key == item.key) {
+            list.push(item);
         }
     }
     let mut stmt = conn.prepare(

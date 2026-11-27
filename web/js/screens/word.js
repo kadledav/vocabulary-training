@@ -13,11 +13,15 @@
  * - per card: state, next due day, recall chance, "Reset card"; the review
  *   history; "Delete word".
  *
- * Every change is saved at once and confirmed by a toast with Undo (which
- * sends the opposite change); a text being edited can be cancelled. A
- * failed save says why in plain words next to the control and keeps what
- * was typed. Resetting a card and deleting the word ask first and say what
- * is lost. Pack text is rendered as text only (R-84).
+ * Every change is saved at once and confirmed by a toast with Undo: the
+ * server keeps the word's state before the change and puts it back exactly
+ * (`POST /api/words/{id}/undo` with the change's token), or says why it
+ * cannot. A text being edited can be cancelled. A failed save says why in
+ * plain words next to the control and keeps what was typed. A save, an
+ * Undo or a switch never loses what is typed in another open editor or
+ * "add" field, and keeps the place on the page and the focus. Resetting a
+ * card and deleting the word ask first and say what is lost (Esc cancels).
+ * Pack text is rendered as text only (R-84).
  */
 
 import { deleteJson, getJson, patchJson, postJson } from '../api.js';
@@ -61,8 +65,10 @@ import {
  *             note: string, icon: string | null, low_priority: boolean, included: boolean, suspended: boolean,
  *             overridden: string[], status: string,
  *             items: { czech: Item[], accepted: Item[], confusables: Item[], forms: FormItem[] },
+ *             pack_spellings: { headword: string, key: string }[],
  *             sources: { source_id: number, title: string, seq: number, tag_kind: string | null }[],
- *             sentences: Sentence[], conflicts: Conflict[], cards: CardView[], history: HistoryRow[] }} WordDetail
+ *             sentences: Sentence[], conflicts: Conflict[], cards: CardView[], history: HistoryRow[],
+ *             undo?: string | null }} WordDetail
  * @typedef {import('../api.js').ApiResult<WordDetail>} DetailAnswer
  */
 
@@ -91,6 +97,13 @@ function confirmed({ label, testid, message, confirm, onConfirm }) {
     mount(slot, open);
     open.focus();
   };
+  // Esc cancels, as the Cancel button does.
+  slot.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && slot.firstElementChild !== open) {
+      event.preventDefault();
+      closed();
+    }
+  });
   open.addEventListener('click', () => {
     const problem = h('p', { class: 'field-error', role: 'alert' });
     const yes = h('button', { type: 'button', class: 'danger primary', 'data-testid': `${testid}-confirm` }, confirm);
@@ -128,29 +141,60 @@ export async function renderWord(root, id, isCurrent) {
   mount(root, body, toastSlot);
   /** One change at a time: a second tap while saving is not sent. */
   let saving = false;
+  /**
+   * What is typed in open editors and "add" fields, kept across redraws:
+   * a field's text, a sentence's two texts, an add field's text and its
+   * "rare" box.
+   */
+  const drafts = {
+    /** @type {Map<string, string>} */
+    fields: new Map(),
+    /** @type {Map<number, { en: string, cs: string }>} */
+    sentences: new Map(),
+    /** @type {Map<string, { value: string, rare: boolean }>} */
+    adds: new Map(),
+  };
 
   /**
-   * Redraw everything from `word`; then focus the element with `focusId`
-   * (the control that was used), keeping the place on the page.
+   * Redraw everything from `word` and the drafts, keeping the scroll
+   * position. Focus: a text field the owner is typing in keeps it (with
+   * its selection); otherwise the element with `focusId` (the control that
+   * was used) gets it.
    *
    * @param {string} [focusId]
    */
   const draw = (focusId) => {
+    const active = document.activeElement;
+    const typing =
+      (active instanceof HTMLTextAreaElement || (active instanceof HTMLInputElement && active.type === 'text')) &&
+      body.contains(active) &&
+      active.id !== ''
+        ? { id: active.id, start: active.selectionStart, end: active.selectionEnd }
+        : null;
+    const y = window.scrollY;
     mount(body, ...view());
-    if (focusId) document.getElementById(focusId)?.focus({ preventScroll: true });
+    window.scrollTo(window.scrollX, y);
+    const again = typing ? document.getElementById(typing.id) : null;
+    if (typing && (again instanceof HTMLTextAreaElement || again instanceof HTMLInputElement)) {
+      again.focus({ preventScroll: true });
+      again.setSelectionRange(typing.start, typing.end);
+    } else if (focusId) {
+      document.getElementById(focusId)?.focus({ preventScroll: true });
+    }
   };
 
   /**
-   * Send one change. On success the word is redrawn from the answer and a
-   * toast confirms it (with Undo when `undo` is given); on failure the
-   * reason is returned (and nothing on the page is touched).
+   * Send one change. On success `saved` runs (closes the editor that was
+   * saved), the word is redrawn from the answer and a toast confirms it,
+   * with Undo when the server offers one; on failure the reason is
+   * returned (and nothing on the page is touched).
    *
    * @param {() => Promise<DetailAnswer>} request
-   * @param {{ done: string, focusId?: string, spoken?: boolean,
-   *           undo?: ((before: WordDetail, after: WordDetail) => (() => Promise<DetailAnswer>) | null) }} options
+   * @param {{ done: string | ((before: WordDetail, after: WordDetail) => string), focusId?: string,
+   *           spoken?: boolean, saved?: () => void }} options
    * @returns {Promise<string | null>}
    */
-  const change = async (request, { done, focusId, spoken = false, undo }) => {
+  const change = async (request, { done, focusId, spoken = false, saved }) => {
     if (saving) return 'Another change is being saved. Try again in a moment.';
     saving = true;
     let answer;
@@ -165,19 +209,31 @@ export async function renderWord(root, id, isCurrent) {
     word = answer.data;
     // New text, new clips: never the old clip for the new text (M6).
     if (spoken) forgetClips(word.id);
+    saved?.();
     draw(focusId);
-    const reverse = undo ? undo(before, word) : null;
+    const token = word.undo;
     toast.show({
-      text: done,
+      text: typeof done === 'function' ? done(before, word) : done,
       ms: TOAST_MS,
-      onUndo: reverse
-        ? async () => {
-            const problem = await change(reverse, { done: 'Undone.', focusId, spoken });
-            if (problem) toast.show({ text: `Could not undo: ${problem}`, ms: TOAST_MS });
-          }
-        : undefined,
+      onUndo: typeof token === 'string' ? () => void undoChange(token, focusId) : undefined,
     });
     return null;
+  };
+
+  /**
+   * Undo a change: the server restores the word as it was, or says why it
+   * cannot (changed since, too late, already undone).
+   *
+   * @param {string} token
+   * @param {string} [focusId]
+   */
+  const undoChange = async (token, focusId) => {
+    const problem = await change(() => /** @type {Promise<DetailAnswer>} */ (postJson(`${url}/undo`, { token })), {
+      done: 'Undone.',
+      focusId,
+      spoken: true,
+    });
+    if (problem) toast.show({ text: `Could not undo: ${problem}`, ms: TOAST_MS });
   };
 
   const url = `/api/words/${word.id}`;
@@ -187,18 +243,19 @@ export async function renderWord(root, id, isCurrent) {
   const action = (body) => () => /** @type {Promise<DetailAnswer>} */ (postJson(`${url}/actions`, body));
 
   /**
-   * Save one field; Undo puts the old value back.
+   * Save one field.
    *
    * @param {string} field
    * @param {unknown} value
    * @param {string} focusId
+   * @param {() => void} [saved]
    */
-  const saveField = (field, value, focusId) =>
+  const saveField = (field, value, focusId, saved) =>
     change(patch({ [field]: value }), {
       done: `Saved: ${fieldLabel(field)}.`,
       focusId,
       spoken: field === 'headword' || field === 'speak',
-      undo: (before) => patch({ [field]: /** @type {Record<string, unknown>} */ (before)[field] ?? null }),
+      saved,
     });
 
   // ── header and suggestions ──────────────────────────────────────────────
@@ -239,7 +296,6 @@ export async function renderWord(root, id, isCurrent) {
             const failed = await change(() => /** @type {Promise<DetailAnswer>} */ (postJson(`/api/conflicts/${c.id}`, { use })), {
               done: use === 'incoming' ? `Took the pack’s ${fieldLabel(c.field).toLowerCase()}.` : `Kept your ${fieldLabel(c.field).toLowerCase()}.`,
               spoken: use === 'incoming' && c.field === 'speak',
-              undo: use === 'incoming' ? () => patch({ [c.field]: c.now ?? null }) : undefined,
             });
             if (failed) problem.textContent = failed;
           };
@@ -292,7 +348,6 @@ export async function renderWord(root, id, isCurrent) {
           onclick: () => run(patch({ usefulness: next }), {
             done: `Usefulness ${next}.`,
             focusId: delta < 0 ? 'usefulness-down' : 'usefulness-up',
-            undo: (before) => patch({ usefulness: before.usefulness }),
           }),
         },
         delta < 0 ? '−' : '+',
@@ -306,13 +361,10 @@ export async function renderWord(root, id, isCurrent) {
      * @param {boolean} checked
      * @param {(on: boolean) => () => Promise<DetailAnswer>} request
      * @param {(on: boolean) => string} done
-     * @param {(on: boolean) => () => Promise<DetailAnswer>} reverse
      */
-    const toggle = (idName, label, checked, request, done, reverse) => {
+    const toggle = (idName, label, checked, request, done) => {
       const input = h('input', { type: 'checkbox', id: idName, checked });
-      input.addEventListener('change', () =>
-        run(request(input.checked), { done: done(input.checked), focusId: idName, undo: () => reverse(input.checked) }, input),
-      );
+      input.addEventListener('change', () => run(request(input.checked), { done: done(input.checked), focusId: idName }, input));
       return h('label', { class: 'setting check' }, input, ' ', label);
     };
     const goal = word.goal ?? 'auto';
@@ -347,7 +399,6 @@ export async function renderWord(root, id, isCurrent) {
                 run(patch({ goal: goalValue(value) }), {
                   done: 'Goal saved.',
                   focusId: `goal-${value}`,
-                  undo: (before) => patch({ goal: before.goal }),
                 }),
             }),
             ' ',
@@ -362,7 +413,6 @@ export async function renderWord(root, id, isCurrent) {
             word.included,
             (on) => action({ action: on ? 'include' : 'exclude' }),
             (on) => (on ? 'Included in practice.' : 'Not practised any more.'),
-            (on) => action({ action: on ? 'exclude' : 'include' }),
           )
         : null,
       toggle(
@@ -371,7 +421,6 @@ export async function renderWord(root, id, isCurrent) {
         word.suspended,
         (on) => action({ action: on ? 'suspend' : 'unsuspend' }),
         (on) => (on ? 'Suspended.' : 'Practised again.'),
-        (on) => action({ action: on ? 'unsuspend' : 'suspend' }),
       ),
       toggle(
         'spelling',
@@ -379,7 +428,6 @@ export async function renderWord(root, id, isCurrent) {
         word.spelling,
         (on) => patch({ spelling: on }),
         (on) => (on ? 'Spelling practice on.' : 'Spelling practice off.'),
-        (on) => patch({ spelling: !on }),
       ),
       problem,
     );
@@ -401,20 +449,32 @@ export async function renderWord(root, id, isCurrent) {
           'dd',
           {},
           h('span', { class: 'value-text', lang: field === 'note' || field === 'meaning' ? 'en' : null }, showValue(value)),
-          h('button', { type: 'button', class: 'link-button', id: editId, 'aria-label': `Edit ${spec.label.toLowerCase()}`, onclick: editor }, 'Edit'),
+          h('button', { type: 'button', class: 'link-button', id: editId, 'aria-label': `Edit ${spec.label.toLowerCase()}`, onclick: open }, 'Edit'),
         ),
       );
     };
+    const open = () => {
+      drafts.fields.set(field, typeof value === 'string' ? value : '');
+      editor();
+      document.getElementById(`input-${field}`)?.focus();
+    };
+    const close = () => {
+      drafts.fields.delete(field);
+      shown();
+      document.getElementById(editId)?.focus();
+    };
+    /** The editor, with the text typed so far (it survives a redraw). */
     const editor = () => {
       const inputId = `input-${field}`;
       const input =
         spec.input === 'text'
           ? h('textarea', { id: inputId, rows: field === 'note' ? 8 : 3, maxlength: String(spec.max) })
           : h('input', { type: 'text', id: inputId, maxlength: String(spec.max), autocomplete: 'off', spellcheck: field === 'pronunciation' ? 'false' : null });
-      input.value = typeof value === 'string' ? value : '';
+      input.value = drafts.fields.get(field) ?? '';
+      input.addEventListener('input', () => drafts.fields.set(field, input.value));
       const problem = h('p', { class: 'field-error', role: 'alert', 'data-testid': `field-${field}-problem` });
       const save = h('button', { type: 'submit', class: 'primary' }, 'Save');
-      const cancel = h('button', { type: 'button', onclick: () => { shown(); document.getElementById(editId)?.focus(); } }, 'Cancel');
+      const cancel = h('button', { type: 'button', onclick: close }, 'Cancel');
       const form = h(
         'form',
         { class: 'field-editor' },
@@ -434,7 +494,7 @@ export async function renderWord(root, id, isCurrent) {
         }
         save.disabled = true;
         problem.textContent = '';
-        const failed = await saveField(field, text === '' ? null : text, editId);
+        const failed = await saveField(field, text === '' ? null : text, editId, () => drafts.fields.delete(field));
         save.disabled = false;
         if (failed) {
           problem.textContent = failed;
@@ -444,14 +504,55 @@ export async function renderWord(root, id, isCurrent) {
       form.addEventListener('keydown', (event) => {
         if (event.key === 'Escape') {
           event.preventDefault();
-          cancel.click();
+          close();
         }
       });
       mount(row, h('dd', { class: 'editing' }, form));
-      input.focus();
     };
-    shown();
+    if (drafts.fields.has(field)) editor();
+    else shown();
     return row;
+  };
+
+  /** The other spellings packs used for the word (after a headword change). */
+  const spellings = () => {
+    if (word.pack_spellings.length === 0) return null;
+    const problem = h('p', { class: 'field-error', role: 'alert', 'data-testid': 'pack-spellings-problem' });
+    return h(
+      'div',
+      { class: 'list-field', 'data-testid': 'pack-spellings' },
+      h('h3', {}, 'Also found as'),
+      h('p', { class: 'muted small' }, 'A pack with one of these spellings adds to this word. Remove one to make it a word of its own.'),
+      h(
+        'ul',
+        { class: 'chips' },
+        word.pack_spellings.map((spelling) =>
+          h(
+            'li',
+            { class: 'chip' },
+            h('span', { lang: 'en' }, spelling.headword),
+            h(
+              'button',
+              {
+                type: 'button',
+                class: 'chip-remove',
+                'aria-label': `Remove the pack spelling ${spelling.headword}`,
+                onclick: async () => {
+                  problem.textContent = '';
+                  const failed = await change(
+                    () => /** @type {Promise<DetailAnswer>} */ (deleteJson(`${url}/spellings`, { key: spelling.key })),
+                    { done: `“${spelling.headword}” no longer finds this word.`, focusId: 'edit-headword' },
+                  );
+                  if (failed) problem.textContent = failed;
+                },
+              },
+              '×',
+            ),
+          ),
+        ),
+      ),
+      problem,
+    );
   };
 
   const fields = () =>
@@ -461,6 +562,7 @@ export async function renderWord(root, id, isCurrent) {
       h('h2', {}, 'Details'),
       h('p', { class: 'muted small' }, 'What you change here stays yours: a later pack only suggests other values.'),
       h('dl', { class: 'fields edit-fields' }, Object.keys(FIELDS).map(fieldRow)),
+      spellings(),
     );
 
   // ── list fields ──────────────────────────────────────────────────────────
@@ -472,23 +574,26 @@ export async function renderWord(root, id, isCurrent) {
     const items = /** @type {(Item | FormItem)[]} */ (word.items[prop]);
     const problem = h('p', { class: 'field-error', role: 'alert', 'data-testid': `list-${kind}-problem` });
     const inputId = `add-${kind}`;
+    const draft = drafts.adds.get(kind);
     const input = h('input', { type: 'text', id: inputId, maxlength: kind === 'form' ? '100' : '200', autocomplete: 'off', 'aria-label': `Add ${noun}` });
+    input.value = draft?.value ?? '';
     const rare = kind === 'form' ? h('input', { type: 'checkbox', id: 'add-form-rare' }) : null;
+    if (rare) rare.checked = draft?.rare ?? false;
+    // What is typed here survives a save elsewhere on the page.
+    const keep = () => {
+      if (input.value === '' && !rare?.checked) drafts.adds.delete(kind);
+      else drafts.adds.set(kind, { value: input.value, rare: rare?.checked ?? false });
+    };
+    input.addEventListener('input', keep);
+    rare?.addEventListener('change', keep);
     /** @param {Item | FormItem} item */
     const text = (item) => ('form' in item ? item.form : item.value);
     /** @param {Item | FormItem} item */
     const remove = async (item) => {
       problem.textContent = '';
       const failed = await change(
-        () => /** @type {Promise<DetailAnswer>} */ (deleteJson(`${url}/items/${kind}/${encodeURIComponent(item.key)}`)),
-        {
-          done: `Removed “${text(item)}”.`,
-          focusId: inputId,
-          undo: () => () =>
-            /** @type {Promise<DetailAnswer>} */ (
-              postJson(`${url}/items`, { kind, value: text(item), ...('common' in item ? { common: item.common } : {}) })
-            ),
-        },
+        () => /** @type {Promise<DetailAnswer>} */ (deleteJson(`${url}/items`, { kind, key: item.key })),
+        { done: `Removed “${text(item)}”.`, focusId: inputId },
       );
       if (failed) problem.textContent = failed;
     };
@@ -500,16 +605,18 @@ export async function renderWord(root, id, isCurrent) {
         return;
       }
       problem.textContent = '';
+      const common = rare ? !rare.checked : undefined;
+      const same = (/** @type {string} */ a) => a.normalize('NFC').trim().replace(/\s+/g, ' ').toLowerCase();
       const failed = await change(
-        () => /** @type {Promise<DetailAnswer>} */ (postJson(`${url}/items`, { kind, value, ...(rare ? { common: !rare.checked } : {}) })),
+        () => /** @type {Promise<DetailAnswer>} */ (postJson(`${url}/items`, { kind, value, ...(rare ? { common } : {}) })),
         {
-          done: `Added “${value}”.`,
+          // A form that was there already only changed its "rare" mark.
+          done: (before) =>
+            kind === 'form' && before.items.forms.some((f) => same(f.form) === same(value))
+              ? `Marked “${value}” as ${common ? 'common' : 'rare'}.`
+              : `Added “${value}”.`,
           focusId: inputId,
-          undo: (before, after) => {
-            const old = new Set(/** @type {(Item | FormItem)[]} */ (before.items[prop]).map((i) => i.key));
-            const added = /** @type {(Item | FormItem)[]} */ (after.items[prop]).find((i) => !old.has(i.key));
-            return added ? () => /** @type {Promise<DetailAnswer>} */ (deleteJson(`${url}/items/${kind}/${encodeURIComponent(added.key)}`)) : null;
-          },
+          saved: () => drafts.adds.delete(kind),
         },
       );
       if (failed) problem.textContent = failed;
@@ -561,7 +668,6 @@ export async function renderWord(root, id, isCurrent) {
           done: s.hidden ? 'The sentence is shown in practice again.' : 'The sentence is hidden from practice.',
           focusId: `hide-sentence-${s.id}`,
           spoken: true,
-          undo: () => () => /** @type {Promise<DetailAnswer>} */ (postJson(`/api/sentences/${s.id}/hidden`, { hidden: s.hidden })),
         },
       );
       if (failed) problem.textContent = failed;
@@ -576,22 +682,37 @@ export async function renderWord(root, id, isCurrent) {
         h(
           'div',
           { class: 'actions' },
-          h('button', { type: 'button', class: 'link-button', id: editId, onclick: editor }, 'Edit'),
+          h('button', { type: 'button', class: 'link-button', id: editId, onclick: open }, 'Edit'),
           h('button', { type: 'button', class: 'link-button', id: `hide-sentence-${s.id}`, onclick: hide }, s.hidden ? 'Show in practice' : 'Hide from practice'),
         ),
         problem,
       );
     };
+    const open = () => {
+      drafts.sentences.set(s.id, { en: markedSource(s.en), cs: markedSource(s.cs) });
+      editor();
+      document.getElementById(`sentence-${s.id}-en`)?.focus();
+    };
+    const close = () => {
+      drafts.sentences.delete(s.id);
+      shown();
+      document.getElementById(editId)?.focus();
+    };
+    /** The editor, with the texts typed so far (they survive a redraw). */
     const editor = () => {
       const enId = `sentence-${s.id}-en`;
       const csId = `sentence-${s.id}-cs`;
       const en = h('textarea', { id: enId, rows: 3, maxlength: '600', lang: 'en' });
       const cs = h('textarea', { id: csId, rows: 3, maxlength: '600', lang: 'cs' });
-      en.value = markedSource(s.en);
-      cs.value = markedSource(s.cs);
+      const draft = drafts.sentences.get(s.id);
+      en.value = draft?.en ?? markedSource(s.en);
+      cs.value = draft?.cs ?? markedSource(s.cs);
+      const keep = () => drafts.sentences.set(s.id, { en: en.value, cs: cs.value });
+      en.addEventListener('input', keep);
+      cs.addEventListener('input', keep);
       const editProblem = h('p', { class: 'field-error', role: 'alert', 'data-testid': 'sentence-problem' });
       const save = h('button', { type: 'submit', class: 'primary' }, 'Save');
-      const cancel = h('button', { type: 'button', onclick: () => { shown(); document.getElementById(editId)?.focus(); } }, 'Cancel');
+      const cancel = h('button', { type: 'button', onclick: close }, 'Cancel');
       const form = h(
         'form',
         { class: 'field-editor' },
@@ -612,15 +733,9 @@ export async function renderWord(root, id, isCurrent) {
         }
         save.disabled = true;
         editProblem.textContent = '';
-        const before = { en: markedSource(s.en), cs: markedSource(s.cs) };
         const failed = await change(
           () => /** @type {Promise<DetailAnswer>} */ (patchJson(`/api/sentences/${s.id}`, { en: en.value, cs: cs.value })),
-          {
-            done: 'Sentence saved.',
-            focusId: editId,
-            spoken: true,
-            undo: () => () => /** @type {Promise<DetailAnswer>} */ (patchJson(`/api/sentences/${s.id}`, before)),
-          },
+          { done: 'Sentence saved.', focusId: editId, spoken: true, saved: () => drafts.sentences.delete(s.id) },
         );
         save.disabled = false;
         if (failed) editProblem.textContent = failed;
@@ -628,13 +743,13 @@ export async function renderWord(root, id, isCurrent) {
       form.addEventListener('keydown', (event) => {
         if (event.key === 'Escape') {
           event.preventDefault();
-          cancel.click();
+          close();
         }
       });
       mount(li, form);
-      en.focus();
     };
-    shown();
+    if (drafts.sentences.has(s.id)) editor();
+    else shown();
     return li;
   };
 
@@ -653,11 +768,13 @@ export async function renderWord(root, id, isCurrent) {
   const cardItem = (card) => {
     const kind = cardKindLabel(card.kind);
     const facts = [cardStateLabel(card.state)];
-    if (card.due_day) facts.push(`next due ${card.due_day}`);
+    // A suspended word's cards are not practised (design §6.4).
+    const paused = card.suspended || word.suspended;
+    if (card.due_day && !paused) facts.push(`next due ${card.due_day}`);
     if (card.recall !== null) facts.push(`recall chance now ${percent(card.recall)} (aim ${percent(card.desired_retention)})`);
     facts.push(plural(card.reps, 'review'), plural(card.lapses, 'lapse'));
     if (card.leech !== 'none') facts.push('problem card');
-    if (card.suspended) facts.push('paused');
+    if (paused) facts.push(word.suspended ? 'paused: the word is suspended' : 'paused');
     return h(
       'li',
       { 'data-testid': `card-${card.kind}` },

@@ -208,6 +208,9 @@ pub fn undo_last(
         .map(|(review, item)| (review, item.clone()))
         .ok_or(SessionError::NothingToUndo)?;
     let (review, item) = last;
+    if !scheduler::card_as_rated(tx, review)? {
+        return Err(SessionError::CardChangedSince);
+    }
     let card = scheduler::card(tx, item.card_id)?.ok_or(SessionError::ItemNotFound)?;
     let word = catalog::word_traits(tx, card.word_id)?.ok_or(SessionError::ItemNotFound)?;
     let outcome = scheduler::undo_review(tx, review, &word)?;

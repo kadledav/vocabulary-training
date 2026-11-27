@@ -11,8 +11,10 @@
 //!   pack that disagrees later only adds a suggestion (`field_conflict`),
 //!   it never overwrites the owner's value (rule 4). An open suggestion of
 //!   exactly the value the owner now chose is settled (`applied`).
-//! * A changed headword keeps its former key as an alias (`word_alias`), so
-//!   the pack's spelling still finds this word.
+//! * A changed headword needs nothing more: every spelling a pack used for
+//!   the word is kept (`word_pack_spelling`, `identity`), so the pack still
+//!   finds it. The owner's own spellings are never kept; he can remove a
+//!   pack spelling ([`remove_pack_spelling`]).
 //! * A removed list item or form stays as a `removed` row: a pack never adds
 //!   it again. Adding it back revives that row.
 //! * An edited or hidden sentence is never changed by a pack (`edited`,
@@ -30,7 +32,7 @@ use vocab_pack::validate::{
     MAX_LIST_ITEMS, owner_form, owner_list_item, owner_sentence, owner_word_edit,
 };
 
-use super::identity::find_word;
+use super::identity::{KeyHolder, holder};
 use super::{WordId, scalar};
 
 /// Why an owner change was not made. The messages are for the owner.
@@ -49,6 +51,12 @@ pub enum EditError {
     Invalid(String),
     #[error("Another word already has the headword \"{0}\".")]
     HeadwordTaken(String),
+    /// The key is how a pack spelled another word (shown as `headword`).
+    #[error(
+        "\"{spelling}\" is how a pack spelled the word \"{headword}\"; a pack with it finds that word. \
+         Remove that spelling there first, or choose another headword."
+    )]
+    SpellingTaken { spelling: String, headword: String },
     #[error("This word already has the same sentence.")]
     DuplicateSentence,
     #[error("This suggestion was already answered.")]
@@ -57,6 +65,9 @@ pub enum EditError {
     LastCzech,
     #[error("A list holds at most {MAX_LIST_ITEMS} items.")]
     TooManyItems,
+    /// The list already has an item with the same key (`stored`: as shown).
+    #[error("\"{0}\" is already in the list.")]
+    ItemExists(String),
     #[error("database: {0}")]
     Sqlite(#[from] rusqlite::Error),
 }
@@ -106,6 +117,19 @@ pub fn update_word(
     if !word_exists(tx, id)? {
         return Err(EditError::WordNotFound);
     }
+    // As the import: a spelling note is only stored with spelling practice.
+    let spelling_after = match edits.iter().find(|(name, _)| *name == "spelling") {
+        Some((_, value)) => value.clone(),
+        None => scalar::current(tx, id, "spelling")?,
+    };
+    let note_given = edits
+        .iter()
+        .any(|(name, value)| *name == "spelling_note" && !value.is_null());
+    if note_given && spelling_after != Value::Bool(true) {
+        return Err(EditError::Invalid(
+            "A spelling note needs spelling practice; turn spelling on first.".to_owned(),
+        ));
+    }
     let mut changed = Vec::new();
     for (name, value) in edits {
         if name == "headword" {
@@ -140,47 +164,59 @@ pub fn update_word(
     Ok(changed)
 }
 
-/// Store a new spelling of the headword. A different key keeps the old one
-/// as an alias (a pack with the old spelling still finds the word); a key
-/// that belongs to another word is refused.
+/// Store a new spelling of the headword. A key that belongs to another
+/// word (its headword, or how a pack spelled it) is refused, naming what
+/// collides. The former spelling is not kept: only packs leave spellings
+/// behind (`identity`).
 fn change_headword(
     tx: &Transaction<'_>,
     id: WordId,
     headword: &str,
     now: &str,
 ) -> Result<bool, EditError> {
-    let (old, old_key): (String, String) = tx.query_row(
-        "SELECT headword, headword_key FROM word WHERE id = ?1",
+    let old: String = tx.query_row(
+        "SELECT headword FROM word WHERE id = ?1",
         [id.get()],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| row.get(0),
     )?;
     if old == headword {
         return Ok(false);
     }
     let key = headword_key(headword);
-    if key != old_key {
-        if let Some(other) = find_word(tx, &key)?
-            && other != id
-        {
-            let taken: String = tx.query_row(
-                "SELECT headword FROM word WHERE id = ?1",
-                [other.get()],
-                |row| row.get(0),
-            )?;
-            return Err(EditError::HeadwordTaken(taken));
+    match holder(tx, &key)? {
+        Some(other) if other.word() != id => {
+            return Err(match other {
+                KeyHolder::Headword { headword, .. } => EditError::HeadwordTaken(headword),
+                KeyHolder::PackSpelling {
+                    spelling, headword, ..
+                } => EditError::SpellingTaken { spelling, headword },
+            });
         }
-        // Back to a former spelling: that key is the word's own again.
-        tx.execute("DELETE FROM word_alias WHERE key = ?1", [&key])?;
-        tx.execute(
-            "INSERT OR IGNORE INTO word_alias (key, word_id) VALUES (?1, ?2)",
-            params![old_key, id.get()],
-        )?;
+        _ => {}
     }
     tx.execute(
         "UPDATE word SET headword = ?2, headword_key = ?3, updated_at = ?4 WHERE id = ?1",
         params![id.get(), headword, key, now],
     )?;
     Ok(true)
+}
+
+/// Forget a spelling a pack used for the word (not its current headword):
+/// a later pack with that spelling adds a new word.
+pub fn remove_pack_spelling(
+    tx: &Transaction<'_>,
+    id: WordId,
+    key: &str,
+    now: &str,
+) -> Result<(), EditError> {
+    if !word_exists(tx, id)? {
+        return Err(EditError::WordNotFound);
+    }
+    if !super::identity::remove_pack_spelling(tx, id, key)? {
+        return Err(EditError::ItemNotFound);
+    }
+    touch(tx, id, now)?;
+    Ok(())
 }
 
 // ── list items and forms ────────────────────────────────────────────────────
@@ -230,8 +266,10 @@ impl ListKind {
 }
 
 /// Add an item to a list (`common` only for forms, default true). An item
-/// that is already there is left as it is; one the owner removed earlier
-/// comes back.
+/// that is already there (same key: case and spacing do not count) is
+/// refused with [`EditError::ItemExists`]; one the owner removed earlier
+/// comes back. For a form that is there with the other `common` flag, the
+/// flag is changed.
 pub fn add_item(
     tx: &Transaction<'_>,
     id: WordId,
@@ -250,19 +288,21 @@ pub fn add_item(
     let key = item_key(&value);
     let kinds = kind.item_kinds();
     let mut stmt = tx.prepare(
-        "SELECT kind, removed FROM word_item WHERE word_id = ?1 AND value_key = ?2 \
+        "SELECT kind, removed, value FROM word_item WHERE word_id = ?1 AND value_key = ?2 \
          ORDER BY removed, kind",
     )?;
-    let rows: Vec<(String, bool)> = stmt
-        .query_map(params![id.get(), key], |row| Ok((row.get(0)?, row.get(1)?)))?
+    let rows: Vec<(String, bool, String)> = stmt
+        .query_map(params![id.get(), key], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
         .collect::<Result<_, _>>()?;
-    let rows: Vec<(String, bool)> = rows
+    let rows: Vec<(String, bool, String)> = rows
         .into_iter()
-        .filter(|(k, _)| kinds.contains(&k.as_str()))
+        .filter(|(k, _, _)| kinds.contains(&k.as_str()))
         .collect();
     match rows.first() {
-        Some((_, false)) => return Ok(()),
-        Some((stored, true)) => {
+        Some((_, false, shown)) => return Err(EditError::ItemExists(shown.clone())),
+        Some((stored, true, _)) => {
             tx.execute(
                 "UPDATE word_item SET removed = 0 WHERE word_id = ?1 AND kind = ?2 AND value_key = ?3",
                 params![id.get(), stored, key],
@@ -305,15 +345,18 @@ fn add_form(
 ) -> Result<(), EditError> {
     let form = owner_form(form).map_err(|issue| invalid(&[issue]))?;
     let key = item_key(&form);
-    let stored: Option<bool> = tx
+    let stored: Option<(bool, bool, String)> = tx
         .query_row(
-            "SELECT removed FROM word_form WHERE word_id = ?1 AND form_key = ?2",
+            "SELECT removed, common, form FROM word_form WHERE word_id = ?1 AND form_key = ?2",
             params![id.get(), key],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
     match stored {
-        // Already there: the owner's `common` flag wins.
+        Some((false, stored_common, shown)) if stored_common == common => {
+            return Err(EditError::ItemExists(shown));
+        }
+        // Removed, or there with the other flag: back, with the owner's flag.
         Some(_) => {
             tx.execute(
                 "UPDATE word_form SET removed = 0, common = ?3 WHERE word_id = ?1 AND form_key = ?2",
@@ -543,7 +586,7 @@ fn set_flag(
 }
 
 /// Delete a word with everything the catalog holds about it (sources
-/// links, lists, forms, sentences, overrides, suggestions, aliases). The
+/// links, lists, forms, sentences, overrides, suggestions, pack spellings). The
 /// caller removes the word's cards first (`scheduler`).
 pub fn delete_word(tx: &Transaction<'_>, id: WordId) -> Result<(), EditError> {
     if tx.execute("DELETE FROM word WHERE id = ?1", [id.get()])? == 0 {

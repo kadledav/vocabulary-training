@@ -224,6 +224,11 @@ async fn r04_a_changed_headword_is_still_found_by_the_pack() {
     let id = id_of(&env, "lull").await;
     let view = patch_ok(&env, id, json!({ "headword": "lull (sb) to sleep" })).await;
     assert_eq!(view["headword"], "lull (sb) to sleep");
+    assert_eq!(
+        view["pack_spellings"],
+        json!([{ "headword": "lull", "key": "lull" }]),
+        "the word still answers to the pack's spelling"
+    );
 
     env.import(BOOK, vec![lull()]).await;
     assert_eq!(env.int("SELECT COUNT(*) FROM word"), 2, "no second lull");
@@ -231,24 +236,125 @@ async fn r04_a_changed_headword_is_still_found_by_the_pack() {
     assert_eq!(view["headword"], "lull (sb) to sleep");
     assert_eq!(view["sentences"].as_array().expect("s").len(), 3);
 
-    // Another word's headword (or one of its former ones) is refused.
+    // Another word's headword (or a pack's spelling of another word) is
+    // refused, naming what collides.
     let (status, body) = patch(&env, id, json!({ "headword": "Sift" })).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["error"]["code"], "headword_taken");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .expect("m")
+            .contains("\"sift\"")
+    );
     let sift = id_of(&env, "sift").await;
-    let (status, _) = patch(&env, sift, json!({ "headword": "lull" })).await;
-    assert_eq!(
-        status,
-        StatusCode::CONFLICT,
-        "lull is the first word's alias"
+    let (status, body) = patch(&env, sift, json!({ "headword": "Lull" })).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("\"lull\"") && message.contains("\"lull (sb) to sleep\""),
+        "names the pack spelling and the word as shown: {message}"
     );
 
-    // Back to the pack's spelling (in another case): its own key again.
-    patch_ok(&env, id, json!({ "headword": "Lull" })).await;
-    assert_eq!(env.int("SELECT COUNT(*) FROM word_alias"), 1);
+    // Back to the pack's spelling (in another case): nothing else is kept.
+    let view = patch_ok(&env, id, json!({ "headword": "Lull" })).await;
+    assert_eq!(view["pack_spellings"], json!([]));
+    assert_eq!(
+        env.int("SELECT COUNT(*) FROM word_pack_spelling WHERE key = 'lull (sb) to sleep'"),
+        0
+    );
     env.import(BOOK, vec![lull()]).await;
     assert_eq!(env.int("SELECT COUNT(*) FROM word"), 2);
     assert_eq!(detail(&env, id).await["headword"], "Lull");
+}
+
+/// Finding: an owner's intermediate spelling (a typo, or a change he took
+/// back) never stays attached to the word, so a later, genuinely
+/// different pack word with that spelling is a word of its own.
+#[tokio::test]
+async fn r04_the_owners_own_spellings_leave_nothing_behind() {
+    let env = env();
+    env.import(BOOK, vec![lull()]).await;
+    let id = id_of(&env, "lull").await;
+    patch_ok(&env, id, json!({ "headword": "brontlex" })).await;
+    patch_ok(&env, id, json!({ "headword": "lul" })).await;
+    let view = patch_ok(&env, id, json!({ "headword": "lull" })).await;
+    assert_eq!(view["pack_spellings"], json!([]));
+    assert_eq!(env.int("SELECT COUNT(*) FROM word_pack_spelling"), 1);
+
+    env.import(BOOK, vec![word("brontlex", 4, 3)]).await;
+    assert_eq!(env.int("SELECT COUNT(*) FROM word"), 2, "a word of its own");
+    assert_eq!(detail(&env, id).await["headword"], "lull");
+    assert_eq!(
+        detail(&env, id).await["sentences"]
+            .as_array()
+            .expect("s")
+            .len(),
+        3
+    );
+    // Another word may take a spelling the owner gave up.
+    let other = id_of(&env, "brontlex").await;
+    patch_ok(&env, other, json!({ "headword": "lul" })).await;
+}
+
+/// The owner sees the pack spellings a renamed word answers to and can
+/// remove one; a pack with it then brings a new word.
+#[tokio::test]
+async fn r04_a_pack_spelling_can_be_removed() {
+    let env = env();
+    env.import(BOOK, vec![lull()]).await;
+    let id = id_of(&env, "lull").await;
+    patch_ok(&env, id, json!({ "headword": "lull to sleep" })).await;
+    let uri = format!("/api/words/{id}/spellings");
+    // The current headword is not a removable spelling; unknown keys 404.
+    for key in ["lull to sleep", "nothing"] {
+        let (status, _) = env
+            .request("DELETE", &uri, Some(&json!({ "key": key })))
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{key}");
+    }
+    let (status, view) = env
+        .request("DELETE", &uri, Some(&json!({ "key": "lull" })))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["pack_spellings"], json!([]));
+    env.import(BOOK, vec![lull()]).await;
+    assert_eq!(env.int("SELECT COUNT(*) FROM word"), 2);
+    assert_eq!(detail(&env, id).await["headword"], "lull to sleep");
+}
+
+/// One pack with both the old (pack) spelling and the new headword of a
+/// renamed word: both entries are merged into it and the report says so.
+#[tokio::test]
+async fn r04_a_pack_with_both_spellings_of_a_word_is_reported() {
+    let env = env();
+    env.import(BOOK, vec![lull()]).await;
+    let id = id_of(&env, "lull").await;
+    patch_ok(&env, id, json!({ "headword": "lull to sleep" })).await;
+    let mut renamed = word("lull to sleep", 7, 0);
+    renamed["czech"] = json!(["uspat"]);
+    renamed["sentences"] = json!([{
+        "en": "They [[lull to sleep]] the test baby.",
+        "cs": "[[Uspávají]] testovací miminko.",
+        "origin": "example",
+    }]);
+    let report = env.import(BOOK, vec![lull(), renamed]).await;
+    assert_eq!(env.int("SELECT COUNT(*) FROM word"), 1);
+    let pack = &report["packs"][0];
+    let warnings = pack["warnings"].as_array().expect("warnings");
+    let warning = warnings
+        .iter()
+        .find(|w| w["pointer"] == "/words/1/headword")
+        .unwrap_or_else(|| panic!("a warning for the second entry: {pack}"));
+    let message = warning["message"].as_str().expect("message");
+    assert!(
+        message.contains("\"lull\"") && message.contains("\"lull to sleep\""),
+        "{message}"
+    );
+    // Nothing of either entry is lost.
+    let view = detail(&env, id).await;
+    assert!(values(&view["items"]["czech"]).contains(&"uspat".to_owned()));
+    assert_eq!(view["sentences"].as_array().expect("s").len(), 4);
 }
 
 #[tokio::test]
@@ -262,8 +368,9 @@ async fn r04_removed_items_and_forms_never_come_back_but_can_be_added_again() {
         ("confusable", "loll"),
         ("form", "lulling"),
     ] {
-        let uri = format!("/api/words/{id}/items/{kind}/{}", encode(key));
-        let (status, view) = env.request("DELETE", &uri, Some(&json!({}))).await;
+        let uri = format!("/api/words/{id}/items");
+        let body = json!({ "kind": kind, "key": key });
+        let (status, view) = env.request("DELETE", &uri, Some(&body)).await;
         assert_eq!(status, StatusCode::OK, "{kind}: {view}");
     }
     env.import(BOOK, vec![lull()]).await;
@@ -280,8 +387,14 @@ async fn r04_removed_items_and_forms_never_come_back_but_can_be_added_again() {
     assert_eq!(view["czech"], json!(["ukolébat"]));
 
     // The last Czech equivalent stays.
-    let uri = format!("/api/words/{id}/items/czech/{}", encode("ukolébat"));
-    let (status, body) = env.request("DELETE", &uri, Some(&json!({}))).await;
+    let uri = format!("/api/words/{id}/items");
+    let (status, body) = env
+        .request(
+            "DELETE",
+            &uri,
+            Some(&json!({ "kind": "czech", "key": "ukolébat" })),
+        )
+        .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     assert_eq!(body["error"]["code"], "last_czech");
 
@@ -319,14 +432,45 @@ async fn r04_removed_items_and_forms_never_come_back_but_can_be_added_again() {
         view["items"]["forms"][1]["common"], true,
         "the owner's flag"
     );
-    // Adding what is already there changes nothing.
-    let (status, _) = env
+    // Adding what is already there (another case) is refused, naming it;
+    // nothing changes.
+    let (status, body) = env
         .post(
             &format!("/api/words/{id}/items"),
             &json!({ "kind": "czech", "value": "UKOLÉBAT" }),
         )
         .await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "item_exists");
+    assert_eq!(
+        body["error"]["message"],
+        "\"ukolébat\" is already in the list."
+    );
+    // A form that is there with the same flag likewise; with the other flag
+    // the flag changes (and offers an Undo).
+    let (status, body) = env
+        .post(
+            &format!("/api/words/{id}/items"),
+            &json!({ "kind": "form", "value": "Lulled" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let (status, view) = env
+        .post(
+            &format!("/api/words/{id}/items"),
+            &json!({ "kind": "form", "value": "lulled", "common": false }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["items"]["forms"][0]["common"], false);
+    assert!(view["undo"].is_string());
+    let (status, _) = env
+        .post(
+            &format!("/api/words/{id}/items"),
+            &json!({ "kind": "accepted", "value": "LULLED" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "the owner's accepted answer");
     assert_eq!(
         detail(&env, id).await["items"]["czech"]
             .as_array()
@@ -334,19 +478,6 @@ async fn r04_removed_items_and_forms_never_come_back_but_can_be_added_again() {
             .len(),
         3
     );
-}
-
-/// Percent-encode a path segment (the item keys are Czech words).
-fn encode(text: &str) -> String {
-    text.bytes()
-        .map(|b| {
-            if b.is_ascii_alphanumeric() || b == b'-' {
-                (b as char).to_string()
-            } else {
-                format!("%{b:02X}")
-            }
-        })
-        .collect()
 }
 
 #[tokio::test]
@@ -590,7 +721,11 @@ async fn r04_reset_card_forgets_the_learning_state_but_keeps_the_history() {
     let card = &view["cards"][0];
     assert_eq!(card["state"], "new");
     assert!(card["stability"].is_null() && card["due_day"].is_null());
-    assert!(card["introduced_day"].is_null() && card["format"].is_null());
+    assert!(card["format"].is_null());
+    assert_eq!(
+        card["introduced_day"], "2026-11-20",
+        "introduced today: it keeps today's new-word slot"
+    );
     assert_eq!(card["reps"], 0);
     assert_eq!(view["status"], "new");
     assert_eq!(
@@ -658,4 +793,189 @@ async fn r04_deleting_a_word_removes_it_with_its_cards_and_history() {
     // A later pack with the word adds it as a new word.
     env.import(BOOK, vec![lull()]).await;
     assert_ne!(id_of(&env, "lull").await, id);
+}
+
+#[tokio::test]
+async fn r04_single_line_fields_and_the_spelling_note_follow_the_import_rules() {
+    let env = env();
+    env.import(BOOK, vec![lull()]).await;
+    let id = id_of(&env, "lull").await;
+    for edit in [
+        json!({ "headword": "lull\nto sleep" }),
+        json!({ "grammar": "verb\nnoun" }),
+        json!({ "spelling_note": "Double l." }),
+        json!({ "spelling_note": "Double l.", "spelling": false }),
+    ] {
+        let (status, body) = patch(&env, id, edit.clone()).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{edit}: {body}");
+        assert_eq!(body["error"]["code"], "invalid");
+    }
+    for (kind, value) in [("czech", "uko\nlébat"), ("form", "lul\nled")] {
+        let (status, body) = env
+            .post(
+                &format!("/api/words/{id}/items"),
+                &json!({ "kind": kind, "value": value }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{kind}: {body}");
+    }
+    let view = detail(&env, id).await;
+    assert_eq!(view["headword"], "lull");
+    assert!(view["spelling_note"].is_null());
+    // With spelling practice the note is stored; turning spelling off later
+    // keeps it, as a pack would.
+    let view = patch_ok(
+        &env,
+        id,
+        json!({ "spelling": true, "spelling_note": "Double l." }),
+    )
+    .await;
+    assert_eq!(view["spelling_note"], "Double l.");
+    let view = patch_ok(&env, id, json!({ "spelling": false })).await;
+    assert_eq!(view["spelling_note"], "Double l.");
+}
+
+/// A deleted word's ids (word, sentences, suggestions) are never given to
+/// a new row: a stale page or an Undo for it must not reach another word.
+#[tokio::test]
+async fn r04_ids_of_a_deleted_word_are_never_reused() {
+    let env = env();
+    env.import(BOOK, vec![word("sift", 6, 3)]).await;
+    env.import(BOOK, vec![lull()]).await;
+    let id = id_of(&env, "lull").await;
+    patch_ok(&env, id, json!({ "meaning": "Owner meaning." })).await;
+    env.import(BOOK, vec![lull()]).await;
+    let view = detail(&env, id).await;
+    let sentence = view["sentences"][2]["id"].as_i64().expect("sentence");
+    let conflict = conflicts(&view, "meaning")[0]["id"].as_i64().expect("c");
+    assert_eq!(id, env.int("SELECT MAX(id) FROM word"), "the newest word");
+    let (status, _) = env
+        .request("DELETE", &format!("/api/words/{id}"), Some(&json!({})))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let mut other = word("brontle", 5, 3);
+    other["meaning"] = json!("Another invented meaning.");
+    env.import(BOOK, vec![other]).await;
+    env.import(BOOK, vec![word("brontle", 6, 3)]).await;
+    let new = id_of(&env, "brontle").await;
+    assert!(new > id, "word id {new} after deleted {id}");
+    assert!(
+        env.int("SELECT MIN(id) FROM sentence WHERE word_id = (SELECT MAX(id) FROM word)")
+            > sentence
+    );
+    assert!(env.int("SELECT COALESCE(MAX(id), 0) FROM field_conflict") > conflict);
+    // The stale requests find nothing.
+    let (status, _) = patch(&env, id, json!({ "usefulness": 3 })).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = env
+        .request(
+            "PATCH",
+            &format!("/api/sentences/{sentence}"),
+            Some(&json!({ "en": "The [[brontle]] test.", "cs": "Test [[brontle]]." })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = env
+        .post(
+            &format!("/api/conflicts/{conflict}"),
+            &json!({ "use": "keep" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(detail(&env, new).await["usefulness"], 5);
+}
+
+/// Finding: the owner's accepted answers and the pack's are one list. One
+/// the owner added and removed is not brought back by a pack; one a pack
+/// also brings is listed once; removing it removes it for good.
+#[tokio::test]
+async fn r04_owner_accepted_answers_and_the_packs_are_one_list() {
+    let env = env();
+    env.import(BOOK, vec![lull()]).await;
+    let id = id_of(&env, "lull").await;
+    let add = |value: &'static str| {
+        let env = &env;
+        async move {
+            let (status, view) = env
+                .post(
+                    &format!("/api/words/{id}/items"),
+                    &json!({ "kind": "accepted", "value": value }),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{view}");
+        }
+    };
+    add("lulled").await;
+    add("lulling").await;
+    let (status, _) = env
+        .request(
+            "DELETE",
+            &format!("/api/words/{id}/items"),
+            Some(&json!({ "kind": "accepted", "key": "lulled" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let mut pack = lull();
+    pack["accepted"] = json!(["lulls", "lulled", "Lulling"]);
+    env.import(BOOK, vec![pack.clone()]).await;
+    let view = detail(&env, id).await;
+    assert_eq!(values(&view["items"]["accepted"]), ["lulls", "lulling"]);
+    assert_eq!(
+        env.int("SELECT COUNT(*) FROM word_item WHERE kind = 'accepted' AND value_key IN ('lulled', 'lulling')"),
+        0,
+        "no pack row for what the owner has or removed"
+    );
+    // Rows of both kinds (from before this fix) are listed once and
+    // removed together.
+    env.exec(&format!(
+        "INSERT INTO word_item (word_id, kind, value, value_key, position, origin) \
+         VALUES ({id}, 'accepted', 'Lulling', 'lulling', 9, 'pack')"
+    ));
+    let view = detail(&env, id).await;
+    assert_eq!(values(&view["items"]["accepted"]), ["lulls", "Lulling"]);
+    let (status, view) = env
+        .request(
+            "DELETE",
+            &format!("/api/words/{id}/items"),
+            Some(&json!({ "kind": "accepted", "key": "lulling" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(values(&view["items"]["accepted"]), ["lulls"]);
+    env.import(BOOK, vec![pack]).await;
+    assert_eq!(
+        values(&detail(&env, id).await["items"]["accepted"]),
+        ["lulls"]
+    );
+}
+
+/// Author's edge case (b): a later pack that brings exactly the owner's
+/// corrected sentence recognises it and adds no copy.
+#[tokio::test]
+async fn r25_a_pack_with_the_owners_corrected_sentence_adds_no_copy() {
+    let env = env();
+    env.import(BOOK, vec![word("lull", 7, 3)]).await;
+    let id = id_of(&env, "lull").await;
+    let sentence = detail(&env, id).await["sentences"][0]["id"]
+        .as_i64()
+        .expect("sentence");
+    let en = "The owner's own [[lull]] line.";
+    let cs = "Vlastní řádek s [[lull]].";
+    let (status, view) = env
+        .request(
+            "PATCH",
+            &format!("/api/sentences/{sentence}"),
+            Some(&json!({ "en": en, "cs": cs })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    let mut pack = word("lull", 7, 3);
+    pack["sentences"]
+        .as_array_mut()
+        .expect("sentences")
+        .push(json!({ "en": en, "cs": cs, "origin": "example" }));
+    env.import(BOOK, vec![pack]).await;
+    let view = detail(&env, id).await;
+    assert_eq!(view["sentences"].as_array().expect("s").len(), 3, "{view}");
 }

@@ -24,10 +24,12 @@ pub use cards::{
     scheduled_cards, sentence_last_shown,
 };
 pub use model::{Model, Rating, desired_retention, model};
-pub use owner::{HistoryRow, delete_cards, history, reset_card};
+pub use owner::{
+    CardsSnapshot, HistoryRow, cards_snapshot, delete_cards, history, reset_card, restore_cards,
+};
 pub use review::{
     AnswerMatch, RawGrade, ReviewInput, ReviewOutcome, StoredReview, UndoOutcome, UnlockedCard,
-    find_review, raw_grade, record_review, review_outcome, undo_review,
+    card_as_rated, find_review, raw_grade, record_review, review_outcome, undo_review,
 };
 
 use crate::catalog::WordTraits;

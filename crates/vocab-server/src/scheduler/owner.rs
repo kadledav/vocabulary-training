@@ -1,11 +1,12 @@
 //! What the Words screens read and change in the scheduler (design §7.1
 //! screens 6 and 7): every card at once for the word list, a word's review
-//! history, "Reset card" and the cards of a deleted word.
+//! history, "Reset card", the cards of a deleted word, and the cards'
+//! state before and after an owner change (its Undo, design §8).
 
 use rusqlite::{Connection, Transaction, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use super::cards::Card;
+use super::cards::{self, Card, Snapshot};
 use super::{CardFormat, CardId, CardKind, ReviewId};
 use crate::catalog::WordId;
 use crate::clock::{Moment, StudyDay};
@@ -64,8 +65,10 @@ pub fn history(conn: &Connection, word: WordId) -> rusqlite::Result<Vec<HistoryR
 /// reviewed. An Understand card becomes a new word again (introduced
 /// through the new-word quota, its format chosen again at its first
 /// review); a Produce or Spelling card is due tomorrow, like a freshly
-/// unlocked one. Its reviews stay in the history. Returns the card, `None`
-/// when the word has no card of that kind.
+/// unlocked one. Its reviews stay in the history. A card introduced today
+/// keeps today as its introduction day: it already used one of today's
+/// new-word slots, and resetting it must not free that slot (R-54).
+/// Returns the card, `None` when the word has no card of that kind.
 pub fn reset_card(
     tx: &Transaction<'_>,
     word: WordId,
@@ -78,10 +81,11 @@ pub fn reset_card(
     };
     let changed = tx.execute(
         "UPDATE card SET format = NULL, state = 'new', stability = NULL, difficulty = NULL, \
-         due_day = ?3, last_review_day = NULL, last_review_at = NULL, introduced_day = NULL, \
+         due_day = ?3, last_review_day = NULL, last_review_at = NULL, \
+         introduced_day = CASE WHEN introduced_day = ?4 THEN introduced_day END, \
          reps = 0, lapses = 0, consecutive_fives = 0, leech = 'none', leech_lapses_at_ack = 0 \
          WHERE word_id = ?1 AND kind = ?2",
-        params![word.get(), kind.as_str(), due],
+        params![word.get(), kind.as_str(), due, now.day],
     )?;
     if changed == 0 {
         return Ok(None);
@@ -99,4 +103,40 @@ pub fn reset_card(
 /// cascade of `session_item`). Returns how many cards were deleted.
 pub fn delete_cards(tx: &Transaction<'_>, word: WordId) -> rusqlite::Result<usize> {
     tx.execute("DELETE FROM card WHERE word_id = ?1", [word.get()])
+}
+
+/// The scheduling state of every card of a word (opaque to other modules):
+/// taken before and after an owner change, written back by its Undo.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CardsSnapshot(Vec<(i64, Snapshot)>);
+
+/// The state of the word's cards now.
+pub fn cards_snapshot(conn: &Connection, word: WordId) -> rusqlite::Result<CardsSnapshot> {
+    Ok(CardsSnapshot(
+        cards::cards_of_word(conn, word)?
+            .iter()
+            .map(|card| (card.id.get(), Snapshot::of(card)))
+            .collect(),
+    ))
+}
+
+/// Put the word's cards back to `before`: each card's state as it was, and
+/// a card the change created (unlocked) deleted again while nobody has
+/// reviewed it. The caller has checked that the cards are exactly as the
+/// change left them.
+pub fn restore_cards(
+    tx: &Transaction<'_>,
+    word: WordId,
+    before: &CardsSnapshot,
+) -> rusqlite::Result<()> {
+    let created: Vec<CardId> = cards::cards_of_word(tx, word)?
+        .iter()
+        .map(|card| card.id)
+        .filter(|id| !before.0.iter().any(|(known, _)| *known == id.get()))
+        .collect();
+    cards::delete_unreviewed(tx, &created)?;
+    for (id, snapshot) in &before.0 {
+        snapshot.restore(tx, CardId::new(*id))?;
+    }
+    Ok(())
 }

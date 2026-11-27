@@ -25,6 +25,8 @@
 //! does the same for every stored word at startup, so databases imported
 //! before cards existed are backfilled.
 
+use std::collections::HashMap;
+
 use rusqlite::Transaction;
 use vocab_pack::paste::PasteError;
 use vocab_pack::types::WordResult;
@@ -37,6 +39,8 @@ use crate::importer::{
     Via,
 };
 use crate::scheduler::{self, CardKind};
+use crate::session;
+use crate::undo::{self, UndoError, UndoToken};
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorkflowError {
@@ -59,6 +63,17 @@ pub enum WorkflowError {
     /// "Reset card" for a card the word does not have (yet).
     #[error("This word has no {0} card yet.")]
     NoSuchCard(CardKind),
+    /// The Undo is gone or too old.
+    #[error(transparent)]
+    Undo(#[from] UndoError),
+    /// The word is no longer as the change left it: undoing would guess.
+    #[error(
+        "This change can no longer be undone: the word was changed since (in another tab, by an import or by practice)."
+    )]
+    ChangedSince,
+    /// A snapshot could not be written or read back (a bug, never the owner's).
+    #[error("undo state: {0}")]
+    UndoState(String),
 }
 
 /// What the owner is told when a pack could not be imported.
@@ -256,9 +271,30 @@ fn import_pack(
         pack_import_id: import_id,
         now: &ctx.now,
     };
+    // Pack entries that turn out to be one word in the app (a pack spelling
+    // and the owner's new headword of the same word): both are merged, and
+    // the report says so (nothing is lost, but the owner should know).
+    let mut merged_into: HashMap<WordId, (usize, &str)> = HashMap::new();
     for word in &validation.words {
         if let WordResult::Valid(word) = word {
             let merge = catalog::merge_word(tx, &link, word)?;
+            if let Some(id) = merge.word_id {
+                match merged_into.get(&id) {
+                    Some((index, earlier)) => report.add_warning(
+                        &format!("/words/{}/headword", word.index),
+                        format!(
+                            "\"{earlier}\" (word {}) and \"{}\" (word {}) are the same word in the app; \
+                             both were merged into it. Check the word for doubled values.",
+                            index + 1,
+                            word.headword,
+                            word.index + 1,
+                        ),
+                    ),
+                    None => {
+                        merged_into.insert(id, (word.index, word.headword.as_str()));
+                    }
+                }
+            }
             // Cards for the merged word, in the same transaction (design
             // §5.1 step 4); M6 adds `audio::request` here.
             if let Some(id) = merge.word_id
@@ -360,9 +396,11 @@ pub fn word_action(
             if catalog::word_traits(tx, id)?.is_none() {
                 return Err(EditError::WordNotFound.into());
             }
-            if scheduler::reset_card(tx, id, kind, now)?.is_none() {
+            let Some(card) = scheduler::reset_card(tx, id, kind, now)? else {
                 return Err(WorkflowError::NoSuchCard(kind));
-            }
+            };
+            // An item queued for the card's old state is not practised.
+            session::withdraw_card(tx, card.id)?;
         }
     }
     refresh_cards(tx, id, now)
@@ -382,7 +420,7 @@ pub fn add_word_item(
     refresh_cards(tx, id, now)
 }
 
-/// Remove an item from a list field (`DELETE /api/words/{id}/items/…`).
+/// Remove an item from a list field (`DELETE /api/words/{id}/items`).
 pub fn remove_word_item(
     tx: &Transaction<'_>,
     id: WordId,
@@ -392,6 +430,17 @@ pub fn remove_word_item(
 ) -> Result<(), WorkflowError> {
     catalog::remove_item(tx, id, kind, key, &now.stamp())?;
     refresh_cards(tx, id, now)
+}
+
+/// Forget a pack spelling of a word (`DELETE /api/words/{id}/spellings`).
+pub fn remove_pack_spelling(
+    tx: &Transaction<'_>,
+    id: WordId,
+    key: &str,
+    now: &Moment,
+) -> Result<(), WorkflowError> {
+    catalog::remove_pack_spelling(tx, id, key, &now.stamp())?;
+    Ok(())
 }
 
 /// Correct a sentence (`PATCH /api/sentences/{id}`). Returns its word.
@@ -431,6 +480,86 @@ pub fn resolve_conflict(
     let word = catalog::resolve_conflict(tx, conflict, use_incoming, &now.stamp())?;
     refresh_cards(tx, word, now)?;
     Ok(word)
+}
+
+// ── Undo of an owner change (design §8 `POST /api/words/{id}/undo`) ──────
+//
+// The Undo restores the exact state before the change, server side: the
+// catalog's rows of the word (override rows, `edited`/`hidden` flags,
+// removed items, suggestions, pack spellings) and its cards (a card the
+// change unlocked is deleted again, a suspended one comes back), instead of
+// a client sending "the opposite change" that leaves markers behind.
+
+/// The state of one word an Undo returns to.
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct WordState {
+    catalog: catalog::WordSnapshot,
+    cards: scheduler::CardsSnapshot,
+}
+
+/// The word's state as text (`None`: no such word).
+fn word_state(tx: &Transaction<'_>, id: WordId) -> Result<Option<String>, WorkflowError> {
+    let Some(catalog) = catalog::word_snapshot(tx, id)? else {
+        return Ok(None);
+    };
+    let state = WordState {
+        catalog,
+        cards: scheduler::cards_snapshot(tx, id)?,
+    };
+    serde_json::to_string(&state)
+        .map(Some)
+        .map_err(|e| WorkflowError::UndoState(e.to_string()))
+}
+
+/// Run an owner change of word `id` and store its Undo. Returns the
+/// change's result and the Undo's token (`None` when nothing changed: an
+/// earlier Undo of the word then stays valid).
+pub fn with_undo<T>(
+    tx: &Transaction<'_>,
+    id: WordId,
+    now: &Moment,
+    change: impl FnOnce(&Transaction<'_>) -> Result<T, WorkflowError>,
+) -> Result<(T, Option<UndoToken>), WorkflowError> {
+    let before = word_state(tx, id)?;
+    let value = change(tx)?;
+    let token = match (before, word_state(tx, id)?) {
+        (Some(before), Some(after)) if before != after => {
+            Some(undo::record(tx, id, &before, &after, now)?)
+        }
+        _ => None,
+    };
+    Ok((value, token))
+}
+
+/// Undo the owner's latest change of word `id` (`token` from its answer):
+/// refused when the token is gone or too old, or when the word changed
+/// since in any way (another tab, an import, a practice rating).
+pub fn undo_change(
+    tx: &Transaction<'_>,
+    id: WordId,
+    token: &UndoToken,
+    now: &Moment,
+) -> Result<(), WorkflowError> {
+    let stored = undo::take(tx, id, token, now)??;
+    let current = word_state(tx, id)?.ok_or(UndoError::Gone)?;
+    if current != stored.after {
+        return Err(WorkflowError::ChangedSince);
+    }
+    let before: WordState = serde_json::from_str(&stored.before)
+        .map_err(|e| WorkflowError::UndoState(e.to_string()))?;
+    catalog::restore_word(tx, &before.catalog)?;
+    scheduler::restore_cards(tx, id, &before.cards)?;
+    Ok(())
+}
+
+/// The word of a sentence, for an Undo of a sentence change.
+pub fn sentence_word(tx: &Transaction<'_>, sentence: i64) -> Result<WordId, WorkflowError> {
+    Ok(catalog::word_of_sentence(tx, sentence)?.ok_or(EditError::SentenceNotFound)?)
+}
+
+/// The word of a pack suggestion, for an Undo of its answer.
+pub fn conflict_word(tx: &Transaction<'_>, conflict: i64) -> Result<WordId, WorkflowError> {
+    Ok(catalog::word_of_conflict(tx, conflict)?.ok_or(EditError::ConflictNotFound)?)
 }
 
 /// Delete a word: its cards and review history (scheduler), then everything

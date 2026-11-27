@@ -20,6 +20,7 @@ const TABLES: &[&str] = &[
     "card",
     "field_conflict",
     "fsrs_params",
+    "id_floor",
     "pack_import",
     "practice_session",
     "review_log",
@@ -28,11 +29,12 @@ const TABLES: &[&str] = &[
     "setting",
     "source",
     "word",
-    "word_alias",
     "word_form",
     "word_item",
     "word_override",
+    "word_pack_spelling",
     "word_source",
+    "word_undo",
 ];
 
 fn data_dir() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -106,7 +108,9 @@ fn r85_synthetic_fixture_satisfies_every_constraint() {
         tx.execute_batch(
             "INSERT INTO audio_engine (id, frontend, engine, checked_at) \
              VALUES (1, 'g2p-2', 'kokoro-test', '2026-11-17T10:00:00Z'); \
-             INSERT INTO word_alias (key, word_id) VALUES ('test-former-key', 1);",
+             INSERT INTO word_pack_spelling (key, word_id, headword) VALUES ('test-former-key', 1, 'Test-former-key'); \
+             INSERT INTO word_undo (word_id, token, expires_at, before_json, after_json) \
+             VALUES (1, '00112233445566778899aabbccddeeff', '2026-11-17T10:10:00Z', '{}', '{}');",
         )
         .map_err(DbError::from)
     }))
@@ -798,6 +802,28 @@ fn r02_migration_flags_general_vocabulary_as_a_defaulted_title() {
     );
 }
 
+/// Row counts of the tables whose data an upgrade must keep.
+fn table_counts(conn: &Connection) -> Vec<(&'static str, i64)> {
+    [
+        "word",
+        "word_form",
+        "word_item",
+        "sentence",
+        "card",
+        "review_log",
+        "audio_clip",
+        "field_conflict",
+    ]
+    .into_iter()
+    .map(|table| {
+        let n = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .expect("count");
+        (table, n)
+    })
+    .collect()
+}
+
 fn form_rows(conn: &Connection, condition: &str) -> Vec<String> {
     conn.prepare(&format!(
         "SELECT word_id, form, form_key, common, position FROM word_form \
@@ -819,26 +845,27 @@ fn form_rows(conn: &Connection, condition: &str) -> Vec<String> {
     .collect()
 }
 
-/// Migration 0007 (M7, R-04) on a database at version 6 holding the
-/// synthetic fixture: the alias table exists and is empty, every stored
-/// form is kept and not removed, the constraints hold. (The version-6
-/// database is built from the migrations' SQL; the Rust data step of 0005
-/// only re-keys sentences and plays no part here.)
+/// Migrations 0006 and 0007 (M6, M7; R-04, R-85) on a database of the
+/// released schema (version 5, v0.1.1) holding the synthetic fixture
+/// (words, forms, sentences, cards, reviews, clips, suggestions): every
+/// word's key is its first pack spelling, every stored form is kept and not
+/// removed, the id floors start at the stored ids, the constraints hold.
+/// (The version-5 database is built from the migrations' SQL; the Rust data
+/// step of 0005 only re-keys sentences and plays no part here.)
 #[test]
-fn r04_v6_database_with_data_migrates_to_v7() {
+fn r04_released_v5_database_with_data_migrates_to_v7() {
     let (_root, data) = data_dir();
-    let forms_before = {
+    let (forms_before, counts_before) = {
         let conn = v4_database(&data);
-        for sql in [
-            include_str!("../migrations/0005_review_round_1.sql"),
-            include_str!("../migrations/0006_audio.sql"),
-        ] {
-            conn.execute_batch(sql).expect("migration");
-        }
-        conn.pragma_update(None, "user_version", 6)
+        conn.execute_batch(include_str!("../migrations/0005_review_round_1.sql"))
+            .expect("migration");
+        conn.pragma_update(None, "user_version", 5)
             .expect("version");
-        form_rows(&conn, "1")
+        (form_rows(&conn, "1"), table_counts(&conn))
     };
+    for (table, n) in &counts_before {
+        assert!(*n > 0, "the fixture has {table}");
+    }
     assert!(!forms_before.is_empty(), "the fixture has forms");
     drop(Db::open(&data).expect("migrates"));
     let conn = inspect(&data);
@@ -847,10 +874,24 @@ fn r04_v6_database_with_data_migrates_to_v7() {
         .expect("user_version");
     assert_eq!(version, 7);
     assert_eq!(form_rows(&conn, "removed = 0"), forms_before);
-    let aliases: i64 = conn
-        .query_row("SELECT COUNT(*) FROM word_alias", [], |r| r.get(0))
-        .expect("alias table");
-    assert_eq!(aliases, 0);
+    assert_eq!(table_counts(&conn), counts_before, "no row lost");
+    let unmatched: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM word w LEFT JOIN word_pack_spelling p \
+             ON p.key = w.headword_key AND p.word_id = w.id AND p.headword = w.headword \
+             WHERE p.key IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .expect("spellings");
+    assert_eq!(unmatched, 0, "every word's own spelling");
+    let spellings: i64 = conn
+        .query_row("SELECT COUNT(*) FROM word_pack_spelling", [], |r| r.get(0))
+        .expect("count");
+    let words: i64 = conn
+        .query_row("SELECT COUNT(*) FROM word", [], |r| r.get(0))
+        .expect("count");
+    assert_eq!(spellings, words);
     conn.pragma_update(None, "foreign_keys", "ON").expect("fk");
     assert!(
         conn.execute("UPDATE word_form SET removed = 2", [])
@@ -859,20 +900,60 @@ fn r04_v6_database_with_data_migrates_to_v7() {
     );
     assert!(
         conn.execute(
-            "INSERT INTO word_alias (key, word_id) VALUES ('test-old', 999)",
+            "INSERT INTO word_pack_spelling (key, word_id, headword) VALUES ('test-old', 999, 'x')",
             []
         )
         .is_err(),
-        "an alias belongs to an existing word"
+        "a spelling belongs to an existing word"
     );
     let word: i64 = conn
         .query_row("SELECT MIN(id) FROM word", [], |r| r.get(0))
         .expect("word");
     conn.execute(
-        "INSERT INTO word_alias (key, word_id) VALUES ('test-old', ?1)",
+        "INSERT INTO word_pack_spelling (key, word_id, headword) VALUES ('test-old', ?1, 'Test-old')",
         [word],
     )
-    .expect("alias");
+    .expect("spelling");
+    // Ids are never reused: the floors start at the highest stored ids and
+    // follow every delete, also one by a cascade.
+    let floor = |name: &str| -> i64 {
+        conn.query_row(
+            "SELECT last_id FROM id_floor WHERE name = ?1",
+            [name],
+            |r| r.get(0),
+        )
+        .expect("floor")
+    };
+    let max = |table: &str| -> i64 {
+        conn.query_row(
+            &format!("SELECT COALESCE(MAX(id), 0) FROM {table}"),
+            [],
+            |r| r.get(0),
+        )
+        .expect("max")
+    };
+    for table in ["word", "sentence", "field_conflict"] {
+        assert_eq!(floor(table), max(table), "{table}");
+    }
+    let newest: i64 = max("word");
+    let newest_sentence: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(id), 0) FROM sentence WHERE word_id = ?1",
+            [newest],
+            |r| r.get(0),
+        )
+        .expect("sentence");
+    conn.execute("DELETE FROM card WHERE word_id = ?1", [newest])
+        .expect("cards");
+    conn.execute(
+        "DELETE FROM review_log WHERE card_id NOT IN (SELECT id FROM card)",
+        [],
+    )
+    .expect("reviews");
+    conn.execute("DELETE FROM word WHERE id = ?1", [newest])
+        .expect("delete");
+    assert_eq!(floor("word"), newest);
+    assert!(floor("sentence") >= newest_sentence);
     assert!(pragma_rows(&conn, "foreign_key_check").is_empty());
     assert_eq!(pragma_rows(&conn, "integrity_check"), vec!["Text(\"ok\")"]);
 }

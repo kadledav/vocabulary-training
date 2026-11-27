@@ -324,7 +324,13 @@ pub fn record_review(
     };
     after.last_review_day = Some(day);
     after.last_review_at = Some(now.stamp());
-    after.introduced_day = before.introduced_day.or(Some(day));
+    // The first review introduces the card (also after "Reset card": a
+    // card reset on an earlier day counts as introduced again today).
+    after.introduced_day = if before.reps == 0 {
+        Some(day)
+    } else {
+        before.introduced_day.or(Some(day))
+    };
     after.reps += 1;
     if after.leech != LeechState::Flagged {
         let lapses_since_ack = after.lapses.saturating_sub(after.leech_lapses_at_ack);
@@ -404,6 +410,18 @@ pub fn record_review(
         unlocked,
         undone: false,
     })
+}
+
+/// Is the card of review `id` still as that rating left it (its latest
+/// review is this one)? Not after "Reset card": undoing the rating would
+/// then bring back the state the owner reset.
+pub fn card_as_rated(conn: &Connection, id: ReviewId) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM review_log r JOIN card c ON c.id = r.card_id \
+         WHERE r.id = ?1 AND c.last_review_at IS r.reviewed_at)",
+        [id.0],
+        |row| row.get(0),
+    )
 }
 
 /// Undo one review (design §6.7.9): the card is restored from the

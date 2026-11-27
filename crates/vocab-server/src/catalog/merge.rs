@@ -1,6 +1,7 @@
 //! Merging a pack word into the catalog (design §5.4, R-03, R-22).
 //!
-//! A pack word is matched to an existing word by `headword_key`. The merge
+//! A pack word is matched to an existing word by `headword_key` or by a
+//! spelling an earlier pack used for it (`identity`). The merge
 //! never touches learning state and never deletes anything:
 //!
 //! | Fields | Rule |
@@ -23,10 +24,11 @@ use std::collections::{HashMap, HashSet};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::Serialize;
 use serde_json::Value;
-use vocab_pack::keys::{item_key, span_key};
+use vocab_pack::keys::{item_key, sentence_key, span_key};
 use vocab_pack::types::{PackSentence, PackWord, TagKind};
 
-use super::identity::find_word;
+use super::identity::{find_word, record_pack_spelling};
+use super::ids::{IdTable, next_id};
 use super::{SourceId, WordId, scalar};
 
 /// Where an imported word comes from.
@@ -263,8 +265,14 @@ fn plan(conn: &Connection, source: SourceId, word: &PackWord) -> rusqlite::Resul
     }
 
     // Lists: union by key; any existing row (also removed ones) blocks re-adding.
+    // The owner's accepted answers (`owner_accepted`, design §6.8) are part
+    // of the accepted list: one the owner added (or added and removed again)
+    // is not brought in once more as the pack's.
     let known_items: HashSet<(String, String)> = {
-        let mut stmt = conn.prepare("SELECT kind, value_key FROM word_item WHERE word_id = ?1")?;
+        let mut stmt = conn.prepare(
+            "SELECT CASE kind WHEN 'owner_accepted' THEN 'accepted' ELSE kind END, value_key \
+             FROM word_item WHERE word_id = ?1",
+        )?;
         stmt.query_map([id.0], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<Result<_, _>>()?
     };
@@ -276,12 +284,12 @@ fn plan(conn: &Connection, source: SourceId, word: &PackWord) -> rusqlite::Resul
     )?;
     let new_forms = new_forms(word, &known_forms);
 
-    let known_sentences = known_sentences(conn, id)?;
+    let (known_sentences, by_key) = known_sentences(conn, id)?;
     let mut new_sentences = Vec::new();
     let mut updated_sentences = Vec::new();
     let mut sentences_known = 0;
     for (i, sentence) in word.sentences.iter().enumerate() {
-        match known_sentences.get(&sentence.key) {
+        match by_key.get(&sentence.key).map(|&at| &known_sentences[at]) {
             None => new_sentences.push(i),
             // A correction (another translation, another span) reaches the
             // app; what the owner edited or hid stays his.
@@ -384,25 +392,39 @@ impl KnownSentence {
     }
 }
 
+/// The word's sentences, and which one a sentence key names: the key it
+/// was stored with (the pack's text; kept when the owner edits it) and the
+/// key of its text now, so a pack that brings exactly the owner's
+/// corrected text recognises it instead of adding it again.
 fn known_sentences(
     conn: &Connection,
     id: WordId,
-) -> rusqlite::Result<HashMap<String, KnownSentence>> {
+) -> rusqlite::Result<(Vec<KnownSentence>, HashMap<String, usize>)> {
     let mut stmt = conn.prepare(
-        "SELECT en_key, id, en_marked, cs_marked, edited OR hidden FROM sentence WHERE word_id = ?1",
+        "SELECT en_key, id, en_marked, cs_marked, edited OR hidden FROM sentence \
+         WHERE word_id = ?1 ORDER BY id",
     )?;
-    stmt.query_map([id.0], |row| {
-        Ok((
-            row.get(0)?,
-            KnownSentence {
-                id: row.get(1)?,
-                en: row.get(2)?,
-                cs: row.get(3)?,
-                owner_changed: row.get(4)?,
-            },
-        ))
-    })?
-    .collect()
+    let rows: Vec<(String, KnownSentence)> = stmt
+        .query_map([id.0], |row| {
+            Ok((
+                row.get(0)?,
+                KnownSentence {
+                    id: row.get(1)?,
+                    en: row.get(2)?,
+                    cs: row.get(3)?,
+                    owner_changed: row.get(4)?,
+                },
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut by_key = HashMap::new();
+    for (at, (key, _)) in rows.iter().enumerate() {
+        by_key.insert(key.clone(), at);
+    }
+    for (at, (_, known)) in rows.iter().enumerate() {
+        by_key.entry(sentence_key(&known.en)).or_insert(at);
+    }
+    Ok((rows.into_iter().map(|(_, known)| known).collect(), by_key))
 }
 
 // ── public operations ───────────────────────────────────────────────────────
@@ -421,6 +443,9 @@ pub fn merge_word(
         }
         None => insert_word(tx, link, word)?,
     };
+    // How this pack spelled the word: a later pack with that spelling finds
+    // it, whatever the owner calls it by then.
+    record_pack_spelling(tx, id, &word.key, &word.headword)?;
     apply_lists(tx, id, word, &plan)?;
     apply_sentences(tx, id, link, word, &plan)?;
     apply_link(tx, id, link, word)?;
@@ -435,10 +460,11 @@ fn insert_word(
     link: &ImportLink<'_>,
     word: &PackWord,
 ) -> rusqlite::Result<WordId> {
+    let id = next_id(tx, IdTable::Word)?;
     tx.execute(
         "INSERT INTO word (headword, headword_key, grammar, pronunciation, speak, meaning, usefulness, \
-         goal, hint, spelling, spelling_note, note, icon, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)",
+         goal, hint, spelling, spelling_note, note, icon, created_at, updated_at, id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14, ?15)",
         params![
             word.headword,
             word.key,
@@ -455,9 +481,10 @@ fn insert_word(
             word.note.as_deref().unwrap_or(""),
             word.icon,
             link.now,
+            id,
         ],
     )?;
-    Ok(WordId(tx.last_insert_rowid()))
+    Ok(WordId(id))
 }
 
 fn apply_existing(
@@ -473,7 +500,7 @@ fn apply_existing(
         let current = (!conflict.current.is_null()).then(|| conflict.current.to_string());
         tx.execute(
             "INSERT INTO field_conflict (word_id, field, current_value, incoming_value, \
-             pack_import_id, status, created_at) VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6)",
+             pack_import_id, status, created_at, id) VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?7)",
             params![
                 id.0,
                 conflict.field,
@@ -481,6 +508,7 @@ fn apply_existing(
                 conflict.incoming.to_string(),
                 link.pack_import_id,
                 link.now,
+                next_id(tx, IdTable::FieldConflict)?,
             ],
         )?;
     }
@@ -523,9 +551,9 @@ fn apply_sentences(
         let s = &word.sentences[i];
         tx.execute(
             "INSERT INTO sentence (word_id, en_marked, cs_marked, en_key, origin, location, source_id, \
-             position, pack_import_id, created_at, updated_at) \
+             position, pack_import_id, created_at, updated_at, id) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, \
-             (SELECT COALESCE(MAX(position) + 1, 0) FROM sentence WHERE word_id = ?1), ?8, ?9, ?9)",
+             (SELECT COALESCE(MAX(position) + 1, 0) FROM sentence WHERE word_id = ?1), ?8, ?9, ?9, ?10)",
             params![
                 id.0,
                 s.en,
@@ -536,6 +564,7 @@ fn apply_sentences(
                 link.source_id.0,
                 link.pack_import_id,
                 link.now,
+                next_id(tx, IdTable::Sentence)?,
             ],
         )?;
     }
