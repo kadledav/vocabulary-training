@@ -11,30 +11,7 @@
 
 import { DatabaseSync } from 'node:sqlite';
 
-import { advanceClock, expect, freezeClock, installClock, test } from './fixtures.js';
-
-/**
- * Make every word known on its Understand card (nothing due, no new word)
- * and give `headwords` a Produce card that waits for its first review
- * since today, as an unlock leaves it (design §6.4).
- *
- * @param {import('./fixtures.js').App} app
- * @param {string[]} headwords
- */
-async function waitingProduce(app, headwords) {
-  const today = await app.api('GET', '/api/today');
-  const db = new DatabaseSync(app.dbPath);
-  db.prepare(
-    `UPDATE card SET state = 'review', stability = 40.0, difficulty = 5.0, due_day = '2099-01-01',
-     last_review_day = ?, introduced_day = '2026-10-01', reps = 4, format = 'word_only' WHERE kind = 'understand'`,
-  ).run(today.study_day);
-  const insert = db.prepare(
-    `INSERT INTO card (word_id, kind, state, due_day, created_at)
-     SELECT id, 'produce', 'new', ?, '2026-11-01T00:00:00Z' FROM word WHERE headword = ?`,
-  );
-  for (const headword of headwords) insert.run(today.study_day, headword);
-  db.close();
-}
+import { advanceClock, expect, freezeClock, installClock, test, waitingProduce } from './fixtures.js';
 
 /**
  * Reviews stored so far: what the answer details look like in the log.
@@ -333,6 +310,7 @@ test('R-70 the answer field and its buttons stay above the on-screen keyboard', 
   void pageErrors;
   await waitingProduce(app, ['glimmerous']);
   await startProduceBlock(page, app, { touch: true });
+  await page.getByTestId('hint-button').tap();
   await input(page).tap();
   // The keyboard takes the lower 45 % of the 812 px screen: the visual
   // viewport shrinks to 450 px (as on an iPhone).
@@ -342,7 +320,7 @@ test('R-70 the answer field and its buttons stay above the on-screen keyboard', 
     Object.defineProperty(vv, 'offsetTop', { configurable: true, get: () => 0 });
     vv.dispatchEvent(new Event('resize'));
   });
-  for (const id of ['answer-input', 'check', 'hint-button', 'dont-know', 'self-rate']) {
+  for (const id of ['hint', 'answer-input', 'check', 'hint-button', 'dont-know', 'self-rate']) {
     const box = await page.getByTestId(id).boundingBox();
     expect(box, id).not.toBeNull();
     const b = /** @type {{ x: number, y: number, width: number, height: number }} */ (box);

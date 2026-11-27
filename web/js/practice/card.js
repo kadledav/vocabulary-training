@@ -135,13 +135,11 @@ function clozeSentence(sentence) {
 /**
  * The question side of a Produce card: the blanked sentence and the Czech
  * sentence as the cue (the matching Czech words highlighted); without a
- * sentence, the Czech gloss. The hint (first letter and letter count)
- * shows once asked for.
+ * sentence, the Czech gloss.
  *
  * @param {Item} item
- * @param {{ pattern: string, letters: number } | null} hint
  */
-export function produceQuestion(item, hint) {
+export function produceQuestion(item) {
   const sentence = item.sentence;
   return h(
     'div',
@@ -156,15 +154,22 @@ export function produceQuestion(item, hint) {
           h('span', { class: 'cz-tag', 'aria-hidden': 'true' }, 'CZ'),
           h('p', { class: 'sentence-cs', lang: 'cs' }, item.word.czech.join(', ')),
         ),
-    hint
-      ? h(
-          'p',
-          { class: 'typed-hint', 'data-testid': 'hint' },
-          h('span', { class: 'muted' }, 'Hint: '),
-          h('span', { class: 'mono', lang: 'en' }, hint.pattern),
-          h('span', { class: 'muted' }, ` (${hint.letters} ${hint.letters === 1 ? 'letter' : 'letters'})`),
-        )
-      : null,
+  );
+}
+
+/**
+ * The hint line (first letter and letter count), shown right above the
+ * answer field so the on-screen keyboard never hides it.
+ *
+ * @param {{ pattern: string, letters: number }} hint
+ */
+export function typedHint(hint) {
+  return h(
+    'p',
+    { class: 'typed-hint', 'data-testid': 'hint' },
+    h('span', { class: 'muted' }, 'Hint: '),
+    h('span', { class: 'mono', lang: 'en' }, hint.pattern),
+    h('span', { class: 'muted' }, ` (${hint.letters} ${hint.letters === 1 ? 'letter' : 'letters'})`),
   );
 }
 

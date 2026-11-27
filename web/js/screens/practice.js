@@ -31,7 +31,7 @@
 import { clipFor, clipsFor, playClip, preloadClips, stopClip } from '../clips.js';
 import { h, mount } from '../dom.js';
 import { keyAction, keyTarget } from '../keys.js';
-import { answerView, checkResult, criterion, produceQuestion, questionView, revealLabel } from '../practice/card.js';
+import { answerView, checkResult, criterion, produceQuestion, questionView, revealLabel, typedHint } from '../practice/card.js';
 import {
   TYPED_MAX,
   canAddAccepted,
@@ -651,7 +651,7 @@ export function renderPractice(root, isCurrent) {
       return;
     }
     if (state.phase === 'question') {
-      mount(body, isTyped(item) ? produceQuestion(item, state.hintShown ? hint(expectedAnswer(item)) : null) : questionView(item, audio));
+      mount(body, isTyped(item) ? produceQuestion(item) : questionView(item, audio));
       return;
     }
     const check = isTyped(item) ? state.check : null;
@@ -693,8 +693,10 @@ export function renderPractice(root, isCurrent) {
   /** The answer field, Check, Hint, I don't know and "I'll just rate myself". */
   const drawTypedQuestion = () => {
     const hadFocus = document.activeElement === answerInput;
+    const item = state.item;
     mount(
       bottomContent,
+      state.hintShown && item ? typedHint(hint(expectedAnswer(item))) : null,
       h(
         'div',
         { class: 'answer-row' },

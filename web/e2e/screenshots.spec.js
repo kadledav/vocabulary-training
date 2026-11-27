@@ -6,7 +6,7 @@
 
 import path from 'node:path';
 
-import { expect, startBookBlock, test, waitGuard } from './fixtures.js';
+import { expect, startBookBlock, test, waitGuard, waitingProduce } from './fixtures.js';
 
 const dir = process.env.SCREENSHOT_DIR;
 
@@ -59,6 +59,65 @@ for (const theme of /** @type {const} */ (['dark', 'light'])) {
     await page.getByRole('button', { name: 'Log in' }).click();
     await expect(page.getByTestId('login-status')).toHaveText('Wrong password. Try again.');
     await shot('9-login');
+  });
+}
+
+/** M8: the Produce card's question and answer states, Today and Settings. */
+for (const theme of /** @type {const} */ (['dark', 'light'])) {
+  test(`M8 Produce screens, ${theme}`, async ({ page, app }, info) => {
+    test.skip(!dir, 'set SCREENSHOT_DIR to take screenshots');
+    const shot = (/** @type {string} */ name) =>
+      page.screenshot({ path: path.join(/** @type {string} */ (dir), `m8-${info.project.name}-${theme}-${name}.png`) });
+    await app.api('PATCH', '/api/settings', { theme, new_typed_per_day: 3 });
+    await waitingProduce(app, ['glimmerous', 'brontle', 'quabble', 'snorkish']);
+    await page.goto(`${app.url}/#/`);
+    await expect(page.getByTestId('typed-waiting')).toBeVisible();
+    await shot('1-today');
+    await page.getByTestId('start').click();
+    await expect(page.getByTestId('answer-input')).toBeVisible();
+    await shot('2-question');
+    await page.getByTestId('answer-input').fill('glimmerous');
+    await page.getByTestId('check').click();
+    await expect(page.getByTestId('check-result')).toBeVisible();
+    await shot('3-answer-correct');
+    await waitGuard();
+    await page.getByRole('button', { name: /^Rate 2,/ }).click();
+    await expect(page.getByTestId('cloze')).toBeVisible();
+    await page.waitForTimeout(300);
+    await page.getByTestId('hint-button').click();
+    await page.getByTestId('answer-input').fill('brontel');
+    await shot('4-question-hint-typed');
+    if (info.project.name === 'webkit-phone') {
+      // The on-screen keyboard (45 % of the screen): the bar sits above it.
+      await page.evaluate(() => {
+        const vv = /** @type {VisualViewport} */ (window.visualViewport);
+        Object.defineProperty(vv, 'height', { configurable: true, get: () => 450 });
+        vv.dispatchEvent(new Event('resize'));
+      });
+      await shot('4b-question-keyboard-450px');
+      await page.evaluate(() => {
+        const vv = /** @type {VisualViewport} */ (window.visualViewport);
+        Object.defineProperty(vv, 'height', { configurable: true, get: () => window.innerHeight });
+        vv.dispatchEvent(new Event('resize'));
+      });
+    }
+    await page.getByTestId('check').click();
+    await expect(page.getByTestId('typed')).toBeVisible();
+    await shot('5-answer-not-quite');
+    await page.getByTestId('accept-typed').click();
+    await expect(page.getByTestId('accepted-note')).toBeVisible();
+    await waitGuard();
+    await page.getByRole('button', { name: /^Rate 4,/ }).click();
+    await expect(page.getByTestId('next')).toBeVisible();
+    await shot('6-feedback-after-4');
+    await page.getByTestId('next').click();
+    await page.waitForTimeout(300);
+    await page.getByTestId('dont-know').click();
+    await shot('7-answer-dont-know');
+    await page.goto(`${app.url}/#/settings`);
+    await expect(page.getByLabel('New Produce cards per day')).toBeVisible();
+    await page.getByLabel('New Produce cards per day').scrollIntoViewIfNeeded();
+    await shot('8-settings');
   });
 }
 
