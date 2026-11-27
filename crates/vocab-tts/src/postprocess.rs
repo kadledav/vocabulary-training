@@ -1,31 +1,42 @@
 //! From the engine's samples to the clip the app stores (design §10.3 step
-//! 6): mono at 24 kHz (resampled if the engine runs at another rate), silence
+//! 6): the chunks joined ([`join`]: tightly where the text runs on), mono
+//! at 24 kHz (resampled if the engine runs at another rate), silence
 //! trimmed, loudness normalised to −16 LUFS (EBU R128), peaks held under
-//! −1.5 dBTP by a look-ahead limiter (speech has a high crest factor: plain
-//! scaling to the peak ceiling would leave sentences near −19 LUFS), short
-//! silences padded on both ends, MP3 (LAME, VBR).
+//! −1.5 dBTP in the MP3 by a look-ahead limiter with headroom for the
+//! encoder (speech has a high crest factor: plain scaling to the peak
+//! ceiling would leave sentences near −19 LUFS), short silences padded on
+//! both ends, MP3 (LAME, VBR).
 
 use std::num::NonZeroU32;
 
 use ebur128::{EbuR128, Mode};
 use mp3lame_encoder::{Builder, FlushNoGap, MonoPcm, Quality, VbrMode};
 
+/// Version of what this module does to the audio: part of the app's clip
+/// identity (with the engine's), so a change here makes the app generate
+/// its clips again. Bump it with every change that alters the audio.
+/// `audio-2`: tight joins between words, headroom for the MP3 encoder.
+pub const VERSION: &str = "audio-2";
 /// Sample rate of every clip (Kokoro's own rate; an MPEG-2 Layer III rate).
 pub const OUTPUT_RATE: u32 = 24_000;
 /// Integrated loudness of every clip, LUFS.
 pub const TARGET_LUFS: f64 = -16.0;
 /// The gain is clamped to ±20 dB: a near-silent clip is not blown up.
 const MAX_GAIN_DB: f64 = 20.0;
-/// True-peak ceiling, dBTP.
+/// True-peak ceiling of the MP3, dBTP.
 const PEAK_LIMIT_DBTP: f64 = -1.5;
+/// Headroom kept below the ceiling before encoding: MP3 encoding changes
+/// the waveform and raises the true peak (measured on decoded clips: by up
+/// to 0.9 dB; docs/design/tts-spike.md, "Small memory").
+const ENCODER_HEADROOM_DB: f64 = 1.5;
 /// Leading and trailing samples below this level are cut.
 const SILENCE_DBFS: f64 = -50.0;
 /// Silence added before and after (mobile browsers clip the first
 /// milliseconds of a clip; a short tail sounds natural).
 const PAD_BEFORE_MS: u32 = 60;
 const PAD_AFTER_MS: u32 = 150;
-/// The limiter aims this far below the ceiling (sample peaks; the true
-/// peak between samples can be a little higher), dB.
+/// The limiter aims this far below the ceiling before encoding (sample
+/// peaks; the true peak between samples can be a little higher), dB.
 const LIMITER_MARGIN_DB: f64 = 0.5;
 /// Limiter look-ahead (the gain falls smoothly over this time before a
 /// peak) and release (time constant of the recovery after it).
@@ -34,9 +45,19 @@ const LIMITER_RELEASE_MS: f64 = 80.0;
 /// Make-up passes: the limiter lowers the loudness a little; it is made up
 /// by at most this much more gain per pass (never beyond `MAX_GAIN_DB`).
 const MAX_MAKEUP_DB: f64 = 6.0;
-const MAKEUP_PASSES: usize = 4;
+const MAKEUP_PASSES: usize = 8;
+/// Rounds of the limiter with a lower aim when the true peak is still above
+/// the ceiling (see `normalize`).
+const TRUE_PEAK_ROUNDS: usize = 4;
 /// Half-width of the resampling filter in input samples (at cutoff 1).
 const RESAMPLE_TAPS: f64 = 16.0;
+/// A tight join ([`Seam::Words`]): what counts as silence at a chunk's end
+/// or start (relative to the chunk's peak), how much of it is kept on each
+/// side, the gap of silence put between, and the fades on both sides.
+const SEAM_SILENCE_DB: f64 = -40.0;
+const SEAM_KEEP_MS: u32 = 10;
+const SEAM_GAP_MS: u32 = 40;
+const SEAM_FADE_MS: u32 = 5;
 
 /// Mono samples (−1.0..1.0) at a sample rate.
 #[derive(Clone, PartialEq)]
@@ -145,6 +166,74 @@ pub enum PostError {
     Encode(String),
 }
 
+/// How the audio of two chunks meets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Seam {
+    /// As the engine made it: the end of one utterance and the start of the
+    /// next (the text pauses there: a sentence end, a comma, …).
+    Pause,
+    /// Between two words where the text runs on: the silence the engine
+    /// put at the end of the first chunk and the start of the second is cut
+    /// to a short gap between words, with fades on both sides (no click).
+    Words,
+}
+
+/// Join the audio of consecutive chunks; `seams[i]` is how part `i` meets
+/// part `i + 1` (missing seams count as [`Seam::Pause`]). All parts must have
+/// the same sample rate.
+pub fn join(parts: Vec<Pcm>, seams: &[Seam]) -> Result<Pcm, PostError> {
+    let Some(rate) = parts.first().map(|p| p.sample_rate) else {
+        return Err(PostError::Silent);
+    };
+    if let Some(other) = parts.iter().find(|p| p.sample_rate != rate) {
+        return Err(PostError::SampleRate(other.sample_rate));
+    }
+    let frames = |ms: u32| (u64::from(rate) * u64::from(ms) / 1000) as usize;
+    let total = parts.iter().map(|p| p.samples.len()).sum();
+    let mut out: Vec<f32> = Vec::with_capacity(total);
+    let mut tight_before = false;
+    for (i, part) in parts.into_iter().enumerate() {
+        let mut samples = part.samples;
+        let tight_after = seams.get(i) == Some(&Seam::Words);
+        let threshold = (peak(&samples) * db_to_linear(SEAM_SILENCE_DB)) as f32;
+        let loud = |s: &f32| s.abs() >= threshold && *s != 0.0;
+        if tight_after && let Some(last) = samples.iter().rposition(loud) {
+            samples.truncate((last + 1 + frames(SEAM_KEEP_MS)).min(samples.len()));
+            fade(&mut samples, frames(SEAM_FADE_MS), false);
+        }
+        if tight_before && let Some(first) = samples.iter().position(loud) {
+            samples.drain(..first.saturating_sub(frames(SEAM_KEEP_MS)));
+            fade(&mut samples, frames(SEAM_FADE_MS), true);
+            out.resize(out.len() + frames(SEAM_GAP_MS), 0.0);
+        }
+        out.extend_from_slice(&samples);
+        tight_before = tight_after;
+    }
+    Ok(Pcm::new(out, rate))
+}
+
+/// Raise (`fade_in`) the first or lower the last `len` samples smoothly
+/// (half a cosine).
+fn fade(samples: &mut [f32], len: usize, fade_in: bool) {
+    let len = len.min(samples.len());
+    if len == 0 {
+        return;
+    }
+    let n = samples.len();
+    for k in 0..len {
+        let gain = 0.5 - 0.5 * (std::f64::consts::PI * (k as f64 + 0.5) / len as f64).cos();
+        let index = if fade_in { k } else { n - 1 - k };
+        samples[index] = (f64::from(samples[index]) * gain) as f32;
+    }
+}
+
+fn peak(samples: &[f32]) -> f64 {
+    samples
+        .iter()
+        .map(|s| f64::from(s.abs()))
+        .fold(0.0, f64::max)
+}
+
 /// Run the whole chain on `pcm`.
 pub fn to_mp3(pcm: Pcm) -> Result<Clip, PostError> {
     if pcm.sample_rate == 0 {
@@ -169,27 +258,40 @@ pub fn to_mp3(pcm: Pcm) -> Result<Clip, PostError> {
 /// Loudness to [`TARGET_LUFS`] (gain clamped to ±[`MAX_GAIN_DB`]) with the
 /// limiter holding the peaks; make-up passes restore the loudness the
 /// limiter took (each pass is partly limited again); finally the true peak
-/// is checked and, if still above the ceiling, the whole clip is scaled
-/// down.
+/// is checked and, if still above the ceiling less the encoder's headroom,
+/// the whole clip is scaled down.
 fn normalize(samples: &mut [f32], rate: u32) -> Result<(), PostError> {
     let gain_db = (TARGET_LUFS - loudness(samples, rate)?).clamp(-MAX_GAIN_DB, MAX_GAIN_DB);
     scale(samples, db_to_linear(gain_db));
-    let limit = db_to_linear(PEAK_LIMIT_DBTP - LIMITER_MARGIN_DB);
-    limit_peaks(samples, rate, limit);
-    let mut total_db = gain_db;
-    for _ in 0..MAKEUP_PASSES {
-        let makeup_db = (TARGET_LUFS - loudness(samples, rate)?)
-            .clamp(0.0, MAX_MAKEUP_DB)
-            .min(MAX_GAIN_DB - total_db);
-        if makeup_db < 0.1 {
-            break;
-        }
-        scale(samples, db_to_linear(makeup_db));
-        total_db += makeup_db;
+    // The make-up restores what the limiter takes, up to the target, never
+    // beyond the loudness the clamped gain reached (a near-silent clip
+    // stays quiet).
+    let goal = loudness(samples, rate)?.min(TARGET_LUFS);
+    let ceiling_db = PEAK_LIMIT_DBTP - ENCODER_HEADROOM_DB;
+    let ceiling = db_to_linear(ceiling_db);
+    let mut margin_db = LIMITER_MARGIN_DB;
+    // The limiter holds sample peaks; the true peak between samples can be
+    // higher. If it is above the ceiling, the limiter aims lower by that
+    // much and runs again (a few times), which costs far less loudness
+    // than scaling the whole clip down.
+    for _ in 0..TRUE_PEAK_ROUNDS {
+        let limit = db_to_linear(ceiling_db - margin_db);
         limit_peaks(samples, rate, limit);
+        for _ in 0..MAKEUP_PASSES {
+            let makeup_db = (goal - loudness(samples, rate)?).clamp(0.0, MAX_MAKEUP_DB);
+            if makeup_db < 0.1 {
+                break;
+            }
+            scale(samples, db_to_linear(makeup_db));
+            limit_peaks(samples, rate, limit);
+        }
+        let peak = true_peak(samples, rate)?;
+        if peak <= ceiling {
+            return Ok(());
+        }
+        margin_db += 20.0 * (peak / ceiling).log10() + 0.1;
     }
     let peak = true_peak(samples, rate)?;
-    let ceiling = db_to_linear(PEAK_LIMIT_DBTP);
     if peak > ceiling {
         scale(samples, ceiling / peak);
     }
@@ -567,18 +669,125 @@ mod tests {
         let samples = normalized(peaky(OUTPUT_RATE));
         let lufs = measured_loudness(&samples);
         assert!((lufs - TARGET_LUFS).abs() < 0.7, "{lufs} LUFS");
+        // Before encoding, the encoder's headroom is left free under the
+        // ceiling (the MP3's own peaks are higher).
+        let before_encoding = db_to_linear(PEAK_LIMIT_DBTP - ENCODER_HEADROOM_DB) + 1e-6;
         let peak = true_peak(&samples, OUTPUT_RATE).expect("test setup");
-        assert!(peak <= db_to_linear(PEAK_LIMIT_DBTP) + 1e-6, "peak {peak}");
+        assert!(peak <= before_encoding, "peak {peak}");
+        const { assert!(ENCODER_HEADROOM_DB >= 1.0) };
         // A full-scale square-ish signal is limited, not clipped.
         let square: Vec<f32> = tone(200.0, 1.0, 1.0, OUTPUT_RATE)
             .iter()
             .map(|s| s.signum() * 0.99)
             .collect();
         let samples = normalized(square);
-        assert!(
-            true_peak(&samples, OUTPUT_RATE).expect("test setup")
-                <= db_to_linear(PEAK_LIMIT_DBTP) + 1e-6
+        assert!(true_peak(&samples, OUTPUT_RATE).expect("test setup") <= before_encoding);
+    }
+
+    #[test]
+    fn r40_quiet_peaky_speech_reaches_the_target_too() {
+        // So quiet that the gain is near its clamp: the make-up that
+        // restores what the limiter took is not part of that clamp.
+        let mut quiet = peaky(OUTPUT_RATE);
+        let level = measured_loudness(&quiet);
+        scale(
+            &mut quiet,
+            db_to_linear(TARGET_LUFS - MAX_GAIN_DB + 1.0 - level),
         );
+        let samples = normalized(quiet);
+        let lufs = measured_loudness(&samples);
+        assert!((lufs - TARGET_LUFS).abs() < 0.3, "{lufs} LUFS");
+        let peak = true_peak(&samples, OUTPUT_RATE).expect("test setup");
+        assert!(peak <= db_to_linear(PEAK_LIMIT_DBTP - ENCODER_HEADROOM_DB) + 1e-6);
+    }
+
+    /// An utterance as the engine makes it: `lead` ms of silence, a tone
+    /// for `ms`, `trail` ms of silence.
+    fn utterance(lead: u32, ms: u32, trail: u32) -> Pcm {
+        let n = |ms: u32| (OUTPUT_RATE * ms / 1000) as usize;
+        let mut samples = vec![0.0; n(lead)];
+        samples.extend(tone(220.0, f64::from(ms) / 1000.0, 0.4, OUTPUT_RATE));
+        samples.resize(samples.len() + n(trail), 0.0);
+        Pcm::new(samples, OUTPUT_RATE)
+    }
+
+    /// Lengths (ms) of the runs of silence between sound in `samples`.
+    fn inner_gaps_ms(samples: &[f32]) -> Vec<u64> {
+        let mut gaps = Vec::new();
+        let mut run = 0usize;
+        let mut sound = false;
+        for s in samples {
+            if s.abs() < 1e-3 {
+                run += 1;
+            } else {
+                if sound && run > 0 {
+                    gaps.push(duration_ms(run, OUTPUT_RATE));
+                }
+                sound = true;
+                run = 0;
+            }
+        }
+        gaps
+    }
+
+    #[test]
+    fn r40_a_tight_seam_leaves_a_word_gap_without_a_click() {
+        let parts = || vec![utterance(120, 400, 180), utterance(120, 400, 180)];
+        // At a pause the engine's silences stay: 180 + 120 ms.
+        let paused = join(parts(), &[Seam::Pause]).expect("joined");
+        assert_eq!(
+            paused.samples().len(),
+            2 * OUTPUT_RATE as usize * 700 / 1000
+        );
+        let gaps = inner_gaps_ms(paused.samples());
+        assert!(gaps.iter().any(|g| (290..=310).contains(g)), "{gaps:?}");
+        // Between words: a short gap.
+        let tight = join(parts(), &[Seam::Words]).expect("joined");
+        let gaps: Vec<u64> = inner_gaps_ms(tight.samples())
+            .into_iter()
+            .filter(|g| *g > 5)
+            .collect();
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert!((35..=80).contains(&gaps[0]), "{gaps:?}");
+        // The outer silences are untouched (trimmed later, with the clip).
+        assert_eq!(tight.samples()[..OUTPUT_RATE as usize / 10], [0.0; 2400]);
+        // No click: the level changes smoothly into and out of the gap.
+        let jumps = tight
+            .samples()
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0f32, f32::max);
+        let tone_step = (2.0 * std::f32::consts::PI * 220.0 / OUTPUT_RATE as f32) * 0.4;
+        assert!(jumps <= tone_step * 1.01, "{jumps} > {tone_step}");
+        // Several seams, a missing one counts as a pause.
+        let three = join(
+            vec![
+                utterance(100, 300, 100),
+                utterance(100, 300, 100),
+                utterance(100, 300, 100),
+            ],
+            &[Seam::Words],
+        )
+        .expect("joined");
+        let long_gaps = inner_gaps_ms(three.samples())
+            .into_iter()
+            .filter(|g| *g > 150)
+            .count();
+        assert_eq!(long_gaps, 1);
+    }
+
+    #[test]
+    fn r40_join_needs_parts_of_one_rate() {
+        assert!(matches!(join(Vec::new(), &[]), Err(PostError::Silent)));
+        let other = Pcm::new(vec![0.1; 100], 22_050);
+        assert!(matches!(
+            join(vec![utterance(0, 100, 0), other], &[Seam::Words]),
+            Err(PostError::SampleRate(22_050))
+        ));
+        // A silent part (nothing to trim to) is kept as it is.
+        let silent = Pcm::new(vec![0.0; 2400], OUTPUT_RATE);
+        let joined = join(vec![utterance(0, 100, 0), silent], &[Seam::Words]).expect("joined");
+        assert_eq!(joined.samples().len(), 2400 + 2400);
     }
 
     #[test]

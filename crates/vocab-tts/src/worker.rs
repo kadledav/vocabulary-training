@@ -11,18 +11,30 @@
 //!
 //! The engine process loads the lexicons and the model, answers one line
 //! (ready, or why not), then serves requests from its stdin until stdin is
-//! closed. Protocol: one JSON object per line ([`Ready`], [`Request`],
-//! [`Reply`]); the engine process logs to stderr (the container log), its
-//! stdout carries only the protocol.
+//! closed. Protocol: one JSON object per line ([`Hello`], [`Request`],
+//! [`Reply`]: while it speaks, a `working` line after every chunk, then the
+//! answer); the engine process logs to stderr (the container log), its
+//! stdout carries only the protocol. Anything else on its stdout is a
+//! protocol error at once (the engine process is stopped, the request
+//! fails), never a line to wait past.
 //!
-//! * A start that fails (model missing, unreadable, no answer within
-//!   [`START_TIMEOUT`]) is an error on the request and in the log, and
-//!   [`Worker::healthy`] is false until a start succeeds.
+//! * A start that fails (model missing, unreadable, the engine process
+//!   killed while loading, e.g. for lack of memory, no answer within
+//!   [`START_TIMEOUT`]) is [`SpeakError::Unavailable`] (the service answers
+//!   `503 engine_unavailable`; the app waits and retries without counting it
+//!   against the text) and is logged, and [`Worker::healthy`] is false until
+//!   a start succeeds.
 //! * An engine process that dies while it speaks (killed by the kernel when
 //!   the container is out of memory, or a crash) is [`SpeakError::Crashed`]:
-//!   the app counts it like a crash of the whole service before.
+//!   the app counts it as a crash of that text.
+//! * An engine process that says nothing for [`SILENCE_TIMEOUT`] while it
+//!   speaks (hung: a chunk takes seconds, a minute on a very slow CPU) is
+//!   stopped; the request fails.
 //! * Cancelled work (request timeout, client gone) stops the engine process
 //!   at once; the next request starts a new one.
+//! * When the service stops ([`Backend::shut_down`]), the engine process is
+//!   killed at once and the request in progress ends with
+//!   [`SpeakError::ShuttingDown`].
 
 use std::io::{BufRead, Read, Write};
 use std::path::Path;
@@ -48,6 +60,11 @@ pub const SUBCOMMAND: &str = "worker";
 pub const START_TIMEOUT: Duration = Duration::from_secs(120);
 /// Time an engine process gets to exit after its stdin is closed.
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Longest wait for the next line of an engine process that speaks: it
+/// writes one after every chunk (≤ 100 symbols, ~2 s on a fast core; the
+/// slowest seen, at a quarter of a CPU, ~15 s), and the last one after the
+/// post-processing of the whole clip.
+const SILENCE_TIMEOUT: Duration = Duration::from_secs(180);
 /// How often the idle engine process is looked at.
 const IDLE_CHECK: Duration = Duration::from_secs(1);
 /// Longest line of the protocol: a reply holds the MP3 as hex (60 s of
@@ -83,13 +100,15 @@ struct Request {
 #[serde(rename_all = "snake_case")]
 enum Refusal {
     NothingToSay,
-    TooLong(usize),
+    TooLong(u64),
     Failed(String),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Reply {
+    /// A chunk is done (a sign of life; the answer follows).
+    Working {},
     Spoken(Spoken),
     Refused(Refusal),
 }
@@ -98,7 +117,7 @@ impl From<SpeakError> for Refusal {
     fn from(err: SpeakError) -> Self {
         match err {
             SpeakError::NothingToSay => Self::NothingToSay,
-            SpeakError::TooLong(symbols) => Self::TooLong(symbols),
+            SpeakError::TooLong(audio_ms) => Self::TooLong(audio_ms),
             other => Self::Failed(other.to_string()),
         }
     }
@@ -108,7 +127,7 @@ impl From<Refusal> for SpeakError {
     fn from(refusal: Refusal) -> Self {
         match refusal {
             Refusal::NothingToSay => Self::NothingToSay,
-            Refusal::TooLong(symbols) => Self::TooLong(symbols),
+            Refusal::TooLong(audio_ms) => Self::TooLong(audio_ms),
             Refusal::Failed(message) => Self::Worker(message),
         }
     }
@@ -171,15 +190,16 @@ fn serve(
             return Err(std::io::Error::other("request line too long"));
         }
         let reply = match serde_json::from_str::<Request>(&line) {
-            Ok(request) => speak(local, &request),
+            Ok(request) => speak(local, &request, &mut output),
             Err(_) => Reply::Refused(Refusal::Failed("malformed request".to_owned())),
         };
         write_line(&mut output, &reply)?;
     }
 }
 
-/// One request; validated again (the front validated it already).
-fn speak(local: &Local, request: &Request) -> Reply {
+/// One request; validated again (the front validated it already). A
+/// `working` line goes to `output` after every chunk.
+fn speak(local: &Local, request: &Request, output: &mut impl Write) -> Reply {
     let text = match SpeakText::new(&request.text) {
         Ok(text) => text,
         Err(err) => return Reply::Refused(Refusal::Failed(err.to_string())),
@@ -187,7 +207,10 @@ fn speak(local: &Local, request: &Request) -> Reply {
     let (Some(voice), Ok(speed)) = (Voice::parse(&request.voice), Speed::new(request.speed)) else {
         return Reply::Refused(Refusal::Failed("invalid voice or speed".to_owned()));
     };
-    match local.speak_now(&text, voice, speed) {
+    // A failed write here fails again with the answer, which ends the
+    // engine process.
+    let mut working = || write_line(output, &Reply::Working {}).unwrap_or(());
+    match local.speak_now(&text, voice, speed, &mut working) {
         Ok(spoken) => Reply::Spoken(spoken),
         Err(err) => Reply::Refused(err.into()),
     }
@@ -234,6 +257,10 @@ pub struct Worker {
     idle: Duration,
     slot: Mutex<Slot>,
     healthy: AtomicBool,
+    /// Set when the service stops.
+    stopping: Cancel,
+    /// [`SILENCE_TIMEOUT`] (shorter in tests).
+    silence: Duration,
 }
 
 #[derive(Debug)]
@@ -259,6 +286,8 @@ enum Broken {
     Gone,
     /// It wrote something that is not the protocol, or the pipe failed.
     Protocol(String),
+    /// It said nothing for [`SILENCE_TIMEOUT`].
+    Silent,
 }
 
 impl Worker {
@@ -273,6 +302,8 @@ impl Worker {
                 last_used: Instant::now(),
             }),
             healthy: AtomicBool::new(true),
+            stopping: Cancel::new(),
+            silence: SILENCE_TIMEOUT,
         })
     }
 
@@ -290,7 +321,11 @@ impl Worker {
                 let Ok(mut slot) = worker.slot.try_lock() else {
                     continue;
                 };
-                if slot.last_used.elapsed() >= worker.idle
+                if worker.stopping.is_cancelled()
+                    && let Some(running) = slot.running.take()
+                {
+                    running.abandon("shutting down").await;
+                } else if slot.last_used.elapsed() >= worker.idle
                     && let Some(running) = slot.running.take()
                 {
                     running.stop("idle").await;
@@ -334,17 +369,23 @@ impl Worker {
             served: 0,
         };
         let hello = tokio::select! {
-            hello = tokio::time::timeout(START_TIMEOUT, running.read_line()) => Some(hello),
-            () = cancel.cancelled() => None,
+            hello = tokio::time::timeout(START_TIMEOUT, running.read_line()) => Ok(hello),
+            () = cancel.cancelled() => Err(SpeakError::Cancelled),
+            () = self.stopping.cancelled() => Err(SpeakError::ShuttingDown),
         };
-        let Some(hello) = hello else {
-            running.abandon("cancelled while loading").await;
-            return Err(SpeakError::Cancelled);
+        let hello = match hello {
+            Ok(hello) => hello,
+            Err(err) => {
+                running.abandon("stopped while loading").await;
+                return Err(err);
+            }
         };
         let failure = match hello {
             Ok(Ok(line)) => match serde_json::from_str::<Hello>(&line) {
                 Ok(Hello::Ready(ready)) => {
-                    self.healthy.store(true, Ordering::SeqCst);
+                    if !self.healthy.swap(true, Ordering::SeqCst) {
+                        tracing::info!("the engine can be started again");
+                    }
                     tracing::info!(
                         pid = running.pid,
                         lexicons_ms = ready.lexicons_ms,
@@ -362,7 +403,7 @@ impl Worker {
                 format!("the engine process exited while loading ({status})")
             }
             Ok(Err(Broken::Protocol(message))) => message,
-            Err(_) => format!(
+            Ok(Err(Broken::Silent)) | Err(_) => format!(
                 "the engine process was not ready within {} s",
                 START_TIMEOUT.as_secs()
             ),
@@ -371,10 +412,15 @@ impl Worker {
         Err(self.start_failed(failure))
     }
 
+    /// Logged when the engine becomes unavailable, not again for every
+    /// request while it stays so.
     fn start_failed(&self, message: String) -> SpeakError {
-        self.healthy.store(false, Ordering::SeqCst);
-        tracing::error!(error = %message, "the engine could not be started");
-        SpeakError::Worker(message)
+        if self.healthy.swap(false, Ordering::SeqCst) {
+            tracing::error!(error = %message, "the engine could not be started");
+        } else {
+            tracing::debug!(error = %message, "the engine could not be started (again)");
+        }
+        SpeakError::Unavailable(message)
     }
 
     async fn speak_in_process(
@@ -385,6 +431,9 @@ impl Worker {
         cancel: Cancel,
     ) -> Result<Spoken, SpeakError> {
         let mut slot = self.slot.lock().await;
+        if self.stopping.is_cancelled() {
+            return Err(SpeakError::ShuttingDown);
+        }
         // Waited for the engine: is anybody still waiting for this?
         if cancel.is_cancelled() {
             return Err(SpeakError::Cancelled);
@@ -399,12 +448,16 @@ impl Worker {
             speed: f64::from(speed.get()),
         };
         let outcome = tokio::select! {
-            reply = running.exchange(&request) => Some(reply),
-            () = cancel.cancelled() => None,
+            reply = running.exchange(&request, self.silence) => Ok(reply),
+            () = cancel.cancelled() => Err((SpeakError::Cancelled, "cancelled")),
+            () = self.stopping.cancelled() => Err((SpeakError::ShuttingDown, "shutting down")),
         };
-        let Some(outcome) = outcome else {
-            running.abandon("cancelled").await;
-            return Err(SpeakError::Cancelled);
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err((err, why)) => {
+                running.abandon(why).await;
+                return Err(err);
+            }
         };
         match outcome {
             Ok(reply) => {
@@ -418,6 +471,8 @@ impl Worker {
                 match reply {
                     Reply::Spoken(spoken) => Ok(spoken),
                     Reply::Refused(refusal) => Err(refusal.into()),
+                    // `exchange` reads past these.
+                    Reply::Working {} => Err(SpeakError::Worker("no answer".to_owned())),
                 }
             }
             Err(Broken::Gone) => {
@@ -428,6 +483,18 @@ impl Worker {
             Err(Broken::Protocol(message)) => {
                 running.abandon("protocol error").await;
                 Err(SpeakError::Worker(message))
+            }
+            Err(Broken::Silent) => {
+                tracing::error!(
+                    pid = running.pid,
+                    silent_s = self.silence.as_secs(),
+                    "the engine process stopped answering while speaking"
+                );
+                running.abandon("hung").await;
+                Err(SpeakError::Worker(format!(
+                    "no sign of life from the engine process for {} s",
+                    self.silence.as_secs()
+                )))
             }
         }
     }
@@ -448,41 +515,50 @@ impl Backend for Worker {
             .try_lock()
             .map_or(true, |slot| slot.running.is_some())
     }
+
+    /// Work in progress kills its engine process and ends; an idle one is
+    /// killed by the idle watch within a second (or with the runtime).
+    fn shut_down(&self) {
+        self.stopping.cancel();
+    }
 }
 
 impl Running {
-    /// One protocol line (without the line break).
+    /// One protocol line (without the line break): a line that is not
+    /// (a library printing to stdout, a partial line before the answer) is
+    /// an error at once, as the answer cannot be trusted to follow. Only its
+    /// size is logged (it could hold phonemes).
     async fn read_line(&mut self) -> Result<String, Broken> {
         let mut line = String::new();
-        loop {
-            line.clear();
-            let read = (&mut self.stdout)
-                .take(MAX_REPLY_LINE)
-                .read_line(&mut line)
-                .await
-                .map_err(|err| Broken::Protocol(format!("engine process output: {err}")))?;
-            if read == 0 {
-                return Err(Broken::Gone);
-            }
-            if !line.ends_with('\n') {
-                return Err(Broken::Protocol(
-                    "engine process output: line too long".to_owned(),
-                ));
-            }
-            if line.starts_with('{') {
-                line.pop();
-                return Ok(line);
-            }
-            // Not ours (a library printing to stdout): skipped, and only its
-            // size is logged (it could hold phonemes).
-            tracing::warn!(
-                bytes = line.len(),
-                "engine process wrote something else to stdout; ignored"
-            );
+        let read = (&mut self.stdout)
+            .take(MAX_REPLY_LINE)
+            .read_line(&mut line)
+            .await
+            .map_err(|err| Broken::Protocol(format!("engine process output: {err}")))?;
+        if read == 0 {
+            return Err(Broken::Gone);
         }
+        if !line.ends_with('\n') {
+            return Err(Broken::Protocol(
+                "engine process output: line too long".to_owned(),
+            ));
+        }
+        if !line.starts_with('{') {
+            tracing::error!(
+                bytes = line.len(),
+                "engine process wrote something else to stdout"
+            );
+            return Err(Broken::Protocol(
+                "engine process output: not the protocol".to_owned(),
+            ));
+        }
+        line.pop();
+        Ok(line)
     }
 
-    async fn exchange(&mut self, request: &Request) -> Result<Reply, Broken> {
+    /// Send `request`, read lines until the answer; `silence`: longest wait
+    /// for a line.
+    async fn exchange(&mut self, request: &Request, silence: Duration) -> Result<Reply, Broken> {
         let mut line =
             serde_json::to_vec(request).map_err(|err| Broken::Protocol(err.to_string()))?;
         line.push(b'\n');
@@ -491,8 +567,16 @@ impl Running {
         if self.stdin.write_all(&line).await.is_err() || self.stdin.flush().await.is_err() {
             return Err(Broken::Gone);
         }
-        let reply = self.read_line().await?;
-        serde_json::from_str(&reply).map_err(|_| Broken::Protocol("malformed reply".to_owned()))
+        loop {
+            let line = tokio::time::timeout(silence, self.read_line())
+                .await
+                .map_err(|_| Broken::Silent)??;
+            match serde_json::from_str(&line) {
+                Ok(Reply::Working {}) => {}
+                Ok(reply) => return Ok(reply),
+                Err(_) => return Err(Broken::Protocol("malformed reply".to_owned())),
+            }
+        }
     }
 
     /// Close its stdin and let it exit; killed if it does not in time.
@@ -576,20 +660,14 @@ fn elapsed_ms(since: Instant) -> u64 {
 mod tests {
     use super::*;
     use crate::engine::{EngineError, Synthesizer};
-    use crate::phonemize::{Lexicon, Phonemes, parse_symbols};
+    use crate::phonemize::{Lexicon, parse_symbols};
     use crate::postprocess::Pcm;
 
     /// Half a second of a tone, whatever it is asked to say.
     struct Tone;
 
     impl Synthesizer for Tone {
-        fn synthesize(
-            &mut self,
-            _: &Phonemes,
-            _: Voice,
-            _: Speed,
-            _: &Cancel,
-        ) -> Result<Pcm, EngineError> {
+        fn synthesize(&mut self, _: &str, _: Voice, _: Speed) -> Result<Pcm, EngineError> {
             let samples = (0..12_000)
                 .map(|i| (0.3 * (f64::from(i) * 0.06).sin()) as f32)
                 .collect();
@@ -599,7 +677,7 @@ mod tests {
 
     fn local() -> Arc<Local> {
         let lexicon = || Lexicon::parse("hello h ə l ˈ O\n").expect("test setup");
-        let symbols = parse_symbols("h 50\nl 54\nO 31\nə 83\nˈ 156\n").expect("test setup");
+        let symbols = parse_symbols(". 4\nh 50\nl 54\nO 31\nə 83\nˈ 156\n").expect("test setup");
         Local::new(
             Phonemizer::new(lexicon(), lexicon(), symbols),
             Box::new(Tone),
@@ -625,6 +703,8 @@ mod tests {
         let lines: Vec<String> = String::from_utf8(output)
             .expect("utf-8")
             .lines()
+            // A sign of life after each chunk (one chunk here).
+            .filter(|line| *line != r#"{"working":{}}"#)
             .map(str::to_owned)
             .collect();
         assert_eq!(lines.len(), 5, "{lines:?}");
@@ -666,11 +746,91 @@ mod tests {
         assert!(serve(line.as_bytes(), Vec::new(), &local(), ready).is_err());
     }
 
+    const READY: &str = r#"{"ready":{"lexicons_ms":1,"model_ms":2}}"#;
+    const SPOKEN: &str = r#"{"spoken":{"clip":{"mp3":"fff3e4c4","duration_ms":640,"loudness_lufs":-16.1},"tally":{"lexicon":1,"derived":0,"fallback":0,"spelled":0,"dropped":0},"phoneme_symbols":5,"synthesis_ms":3,"postprocess_ms":1}}"#;
+
+    /// A worker around `sh -c script` (the ready line as $1, an answer as
+    /// $2) that waits at most `silence` for a line.
+    fn scripted(script: &str, silence: Duration) -> Arc<Worker> {
+        Arc::new(Worker {
+            command: WorkerCommand::new("sh", &["-c", script, "fake-engine", READY, SPOKEN]),
+            idle: Duration::from_secs(60),
+            slot: Mutex::new(Slot {
+                running: None,
+                last_used: Instant::now(),
+            }),
+            healthy: AtomicBool::new(true),
+            stopping: Cancel::new(),
+            silence,
+        })
+    }
+
+    async fn say(worker: &Arc<Worker>) -> Result<Spoken, SpeakError> {
+        let text = SpeakText::new("hello").expect("test setup");
+        Arc::clone(worker)
+            .speak(text, Voice::AfHeart, Speed::NORMAL, Cancel::new())
+            .await
+    }
+
+    #[tokio::test]
+    async fn r83_a_hung_engine_process_is_stopped_but_a_working_one_is_not() {
+        let silence = Duration::from_millis(600);
+        // Signs of life every 0.2 s for 1.2 s: twice the silence limit in all.
+        let working = scripted(
+            r#"printf '%s\n' "$1"; read -r line; for i in 1 2 3 4 5 6; do sleep 0.2; printf '{"working":{}}\n'; done; printf '%s\n' "$2"; sleep 60"#,
+            silence,
+        );
+        let spoken = say(&working).await.expect("slow but working");
+        assert_eq!(spoken.clip.duration_ms(), 640);
+        // Nothing after the request: stopped after the silence limit.
+        let hung = scripted(r#"printf '%s\n' "$1"; read -r line; sleep 60"#, silence);
+        let started = Instant::now();
+        let result = say(&hung).await;
+        assert!(
+            matches!(&result, Err(SpeakError::Worker(message)) if message.contains("no sign of life")),
+            "{result:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(!hung.is_running().await, "killed");
+        // Half a line, then nothing: the same.
+        let partial = scripted(
+            r#"printf '%s\n' "$1"; read -r line; printf '{"spok'; sleep 60"#,
+            silence,
+        );
+        let result = say(&partial).await;
+        assert!(
+            matches!(&result, Err(SpeakError::Worker(message)) if message.contains("no sign of life")),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn r83_the_engine_process_writes_a_sign_of_life_after_each_chunk() {
+        let request = r#"{"text": "hello. hello. hello.", "voice": "af_heart", "speed": 1.0}"#;
+        let mut output = Vec::new();
+        let ready = Ready {
+            lexicons_ms: 0,
+            model_ms: 0,
+        };
+        serve(
+            format!("{request}\n").as_bytes(),
+            &mut output,
+            &local(),
+            ready,
+        )
+        .expect("serves");
+        let output = String::from_utf8(output).expect("utf-8");
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 1 + 3 + 1, "ready, three chunks, the answer");
+        assert!(lines[1..4].iter().all(|l| *l == r#"{"working":{}}"#));
+        assert!(lines[4].starts_with(r#"{"spoken":"#));
+    }
+
     #[test]
     fn r83_refusals_carry_no_text_and_map_back() {
         assert!(matches!(
-            SpeakError::from(Refusal::from(SpeakError::TooLong(901))),
-            SpeakError::TooLong(901)
+            SpeakError::from(Refusal::from(SpeakError::TooLong(50_001))),
+            SpeakError::TooLong(50_001)
         ));
         assert!(matches!(
             SpeakError::from(Refusal::from(SpeakError::NothingToSay)),

@@ -30,6 +30,9 @@ const VOICES_TIMEOUT: Duration = Duration::from_secs(10);
 const SPEAK_TIMEOUT: Duration = Duration::from_secs(630);
 /// The service's error code when its engine process died on the text.
 const ENGINE_CRASHED: &str = "engine_crashed";
+/// The service's `503` codes for "up, but cannot work now": its engine
+/// cannot be started, or it is stopping. Nothing to do with the text.
+const UNAVAILABLE: [&str; 2] = ["engine_unavailable", "shutting_down"];
 
 /// The configured TTS service.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,10 +150,20 @@ pub enum CallError {
     #[error("{0}")]
     Temporary(String),
     /// The request was sent, then the connection died without a complete
-    /// answer, or the service says its engine process died on this text
-    /// (`500 engine_crashed`): this text may crash it.
+    /// answer: the service went away while working on it (a stop, a
+    /// restart, a crash: the caller looks whether it is still there).
     #[error("connection dropped: {0}")]
     Dropped(String),
+    /// The service says its engine process died on this text
+    /// (`500 engine_crashed`, e.g. killed for lack of memory): this text may
+    /// crash it.
+    #[error("engine crashed: {0}")]
+    Crashed(String),
+    /// The service is up but cannot work now (`503 engine_unavailable`: its
+    /// engine cannot be started; `503 shutting_down`: it is stopping):
+    /// nothing to do with the text.
+    #[error("unavailable: {0}")]
+    Unavailable(String),
     /// The service refused this text for good (4xx): its error code.
     #[error("refused: {0}")]
     Refused(String),
@@ -309,8 +322,11 @@ fn check_status(response: &Response) -> Result<(), CallError> {
     match response.status {
         200 => Ok(()),
         500 if error_code(&response.body) == ENGINE_CRASHED => {
-            Err(dropped(format!("500 {ENGINE_CRASHED}")))
+            Err(CallError::Crashed(format!("500 {ENGINE_CRASHED}")))
         }
+        503 if UNAVAILABLE.contains(&error_code(&response.body).as_str()) => Err(
+            CallError::Unavailable(format!("503 {}", error_code(&response.body))),
+        ),
         400..=499 if response.status != 408 && response.status != 429 => Err(CallError::Refused(
             format!("{} {}", response.status, error_code(&response.body)),
         )),
@@ -502,8 +518,15 @@ mod tests {
         assert_eq!(check_status(&response(200, "")), Ok(()));
         assert!(matches!(
             check_status(&response(500, crashed)),
-            Err(CallError::Dropped(_))
+            Err(CallError::Crashed(_))
         ));
+        for code in ["engine_unavailable", "shutting_down"] {
+            let body = format!(r#"{{"error":{{"code":"{code}"}}}}"#);
+            assert_eq!(
+                check_status(&response(503, &body)),
+                Err(CallError::Unavailable(format!("503 {code}")))
+            );
+        }
         assert!(matches!(
             check_status(&response(500, failed)),
             Err(CallError::Temporary(_))

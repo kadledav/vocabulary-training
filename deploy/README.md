@@ -137,16 +137,31 @@ voices, US `af_heart` and UK `bf_emma`). It needs no setup:
   IP address — and refuses to start with anything else.
 - Memory: the model is loaded only while clips are being made, in an
   engine process that ends `VOCAB_TTS_IDLE_SECONDS` (default 180) after the
-  last clip; then the container is back at a few MiB. While it works:
-  about 345 MiB for words and sentences, at most about 415 MiB for the
-  longest and worst texts the service accepts (measured with the
-  container's cgroup numbers, docs/design/tts-spike.md, "Small memory").
-  `GET /healthz` says `"engine": "running"` or `"stopped"`.
-- Limits: 512 MB memory without swap, 1 CPU, 64 PIDs. If a text ever
-  needs more, the kernel stops only the engine process: that clip fails
-  (after three tries, "crashed the audio service"), the service stays up.
+  last clip; then the container is back at a few MiB. While it works, two
+  kinds of memory count against its limit: its own (anonymous) memory,
+  about 350 MiB for words and sentences and at most about 435 MiB for the
+  longest and worst texts the service accepts, at any speed; and about
+  180 MiB of file cache — the model, which is read again for every chunk of
+  text. The file cache is not RAM the service holds: the kernel drops it
+  when the host needs the memory (the next chunk then reads the model from
+  disk). Measured with the container's cgroup numbers,
+  docs/design/tts-spike.md, "Small memory". `GET /healthz` says
+  `"engine": "running"` or `"stopped"`.
+- Limits: 640 MB memory without swap (a cap that fits both, not a
+  reservation), 1 CPU, 64 PIDs. Texts that would need more audio (more
+  than 50 s, or much slower speech than the app asks for) are refused
+  before the engine starts. If a text ever needs more memory anyway, the
+  kernel stops only the engine process: that clip fails (after three tries,
+  "crashed the audio service"), the service stays up. If the engine cannot
+  start at all (for example a limit set too low), the service answers
+  "unavailable"; the app then waits and retries every minute without
+  counting it against any clip, and logs it once.
   `docker ps` shows it `healthy` a few seconds after the start (the model is
   loaded once for a self-test of both voices, then released).
+- Stopping or redeploying it is safe at any time, also in the middle of a
+  clip: it stops its engine at once, tells the app "shutting down" (the
+  clip is retried later, nothing is counted against it) and exits within
+  seconds (`stop_grace_period: 30s` is only a backstop).
 - Its log has one line per clip with lengths and a hash of the text, never
   the text itself (`docker logs vocabulary-tts`).
 - The app queues a clip for every headword (the pack's `speak` text if
@@ -188,8 +203,8 @@ voices, US `af_heart` and UK `bf_emma`). It needs no setup:
 
 1. Take the new `vocabulary-tts` settings from `docker-compose.example.yml`:
    `VOCAB_TTS_THREADS=1`, `VOCAB_TTS_IDLE_SECONDS=180`, `mem_limit` and
-   `memswap_limit: 512m`, `cpus: 1.0`; set both `image:` lines from the
-   release notes; redeploy. No migration.
+   `memswap_limit: 640m`, `cpus: 1.0`, `stop_grace_period: 30s`; set both
+   `image:` lines from the release notes; redeploy. No migration.
 2. The service now uses the small (int8) model, so the app makes every clip
    again, in the background (the old clips play until their replacement is
    ready, then they are deleted). Expect the audio container at a few

@@ -18,17 +18,24 @@
 //!   its replacement is ready, which then deletes it (replaced one by one).
 //! * **Worker:** one task, one clip at a time (words first). Unreachable
 //!   service: the worker waits (30 s doubling to 10 min) without spending a
-//!   clip's attempts. A clip that fails while the service is up (5xx, an
-//!   answer that is not audio or too large, a timeout) is retried after
-//!   30 s, 2 min, 10 min, 1 h, 6 h, 24 h, then marked failed; a refusal
-//!   (4xx) or a clip over 60 s fails at once. A connection that dies after
-//!   the request was sent, or the service's `500 engine_crashed` (its
-//!   engine process died on the text, e.g. out of memory), counts as an
-//!   attempt and a crash: three crashes and the clip fails ("crashed the
-//!   audio service"). A slow synthesis is not a failure: the call waits up
-//!   to 630 s (the service gives up after 600 s). A clip that failed
-//!   waits behind the others, so one clip never blocks the queue. Settings
-//!   can retry failed clips.
+//!   clip's attempts. A service that is up but cannot work now (`503
+//!   engine_unavailable`: its engine cannot be started, e.g. for lack of
+//!   memory; `503 shutting_down`: it is being stopped or redeployed): the
+//!   worker waits 60 s and tries again, without spending an attempt. Either
+//!   is logged once when it begins and once when it ends. A clip that
+//!   fails while the service is up (5xx, an answer that is not audio or too
+//!   large, a timeout) is retried after 30 s, 2 min, 10 min, 1 h, 6 h, 24 h,
+//!   then marked failed; a refusal (4xx) or a clip over 60 s fails at once.
+//!   The service's `500 engine_crashed` (its engine process died on the
+//!   text, e.g. out of memory) counts as an attempt and a crash: three
+//!   crashes and the clip fails ("crashed the audio service"). A connection
+//!   that dies after the request was sent counts the same only when the
+//!   service is still there afterwards; when it is gone (stopped,
+//!   restarting) the clip is not charged and the worker waits as for an
+//!   unreachable service. A slow synthesis is not a failure: the call
+//!   waits up to 630 s (the service gives up after 600 s). A clip that
+//!   failed waits behind the others, so one clip never blocks the queue.
+//!   Settings can retry failed clips.
 //! * **Storage:** at most [`CacheLimits::total_bytes`] of clips (2 GiB), and
 //!   never closer than [`CacheLimits::reserve_bytes`] to a full disk (the
 //!   database shares it): beyond either the worker makes no new clips,
@@ -50,7 +57,7 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -80,6 +87,8 @@ const SYNC_INTERVAL: Duration = Duration::from_secs(600);
 const IDLE_WAIT: Duration = Duration::from_secs(30);
 const UNREACHABLE_FIRST_WAIT: Duration = Duration::from_secs(30);
 const UNREACHABLE_MAX_WAIT: Duration = Duration::from_secs(600);
+/// Wait while the service is up but cannot work (its `Retry-After`).
+const UNAVAILABLE_WAIT: Duration = Duration::from_secs(60);
 /// Route prefix of clip files (the router serves `/api/audio/clips/{hash}.mp3`).
 const CLIP_URL_PREFIX: &str = "/api/audio/clips/";
 /// Longest clip kept (the service caps a text at 600 characters, about
@@ -182,6 +191,9 @@ pub enum Step {
     Idle,
     /// The service cannot be reached.
     Unreachable,
+    /// The service is up but cannot work now (its engine cannot be
+    /// started, or it is stopping).
+    Unavailable,
     /// No room for new clips ([`Storage`]).
     Paused,
 }
@@ -203,6 +215,28 @@ struct Inner {
     limits: CacheLimits,
     /// The storage warning was logged (once per pause).
     storage_warned: AtomicBool,
+    /// Whether the service works, as last seen ([`Service`] as `u8`): logged
+    /// when it changes, not for every try.
+    service: AtomicU8,
+}
+
+/// How the TTS service was last seen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum Service {
+    Up = 0,
+    Unreachable = 1,
+    Unavailable = 2,
+}
+
+impl Service {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Unreachable,
+            2 => Self::Unavailable,
+            _ => Self::Up,
+        }
+    }
 }
 
 fn now_plus(now: Timestamp, delay: Duration) -> String {
@@ -271,6 +305,7 @@ impl Audio {
                 sync_requested: AtomicBool::new(true),
                 limits,
                 storage_warned: AtomicBool::new(false),
+                service: AtomicU8::new(Service::Up as u8),
             }),
         })
     }
@@ -315,7 +350,7 @@ impl Audio {
                         self.work_one().await
                     }
                     Err(SyncError::Unreachable(message)) => {
-                        tracing::warn!(error = %message, endpoint = %self.inner.endpoint, "TTS service unreachable");
+                        self.note_service(Service::Unreachable, &message);
                         self.inner.sync_requested.store(true, Ordering::SeqCst);
                         Ok(Step::Unreachable)
                     }
@@ -337,6 +372,10 @@ impl Audio {
                     let wait = unreachable_wait;
                     unreachable_wait = (unreachable_wait * 2).min(UNREACHABLE_MAX_WAIT);
                     wait
+                }
+                Ok(Step::Unavailable) => {
+                    unreachable_wait = UNREACHABLE_FIRST_WAIT;
+                    UNAVAILABLE_WAIT
                 }
                 // An import or a voice change (wake) may free space.
                 Ok(Step::Paused) => SYNC_INTERVAL,
@@ -466,6 +505,31 @@ impl Audio {
         Ok((storage, used))
     }
 
+    /// Log when the service's state changes (`message` says why it is not
+    /// up; it never holds a text).
+    fn note_service(&self, now: Service, message: &str) {
+        let was = Service::from_u8(self.inner.service.swap(now as u8, Ordering::SeqCst));
+        if was == now {
+            return;
+        }
+        let endpoint = &self.inner.endpoint;
+        match now {
+            Service::Up => {
+                tracing::info!(%endpoint, "TTS service works again; making clips");
+            }
+            Service::Unreachable => tracing::warn!(
+                error = %message,
+                %endpoint,
+                "TTS service unreachable; clips wait (no attempts spent)"
+            ),
+            Service::Unavailable => tracing::warn!(
+                error = %message,
+                %endpoint,
+                "TTS service cannot work now; clips wait (no attempts spent)"
+            ),
+        }
+    }
+
     fn note_storage(&self, storage: Storage, used: i64) {
         let paused = storage != Storage::Ok;
         let was = self.inner.storage_warned.swap(paused, Ordering::SeqCst);
@@ -532,6 +596,28 @@ impl Audio {
         Ok(())
     }
 
+    /// An attempt that crashed the service's engine: retried later, or
+    /// failed for good after [`MAX_CRASHES`].
+    async fn record_crash(
+        &self,
+        job: &queue::Job,
+        short: &str,
+        message: &str,
+        now: String,
+    ) -> Result<(), AudioError> {
+        let tries = queue::Tries {
+            attempts: job.attempts + 1,
+            crashes: job.crashes + 1,
+        };
+        self.record_failure(job, tries, message, now).await?;
+        if tries.crashes >= MAX_CRASHES {
+            tracing::error!(clip = %short, crashes = tries.crashes, "audio clip failed: it crashed the TTS service");
+        } else {
+            tracing::warn!(clip = %short, crashes = tries.crashes, error = %message, "TTS service crashed on an audio clip; retry later");
+        }
+        Ok(())
+    }
+
     /// Make the next due clip.
     pub async fn work_one(&self) -> Result<Step, AudioError> {
         let (storage, used) = self.storage().await?;
@@ -553,6 +639,13 @@ impl Audio {
         let started = std::time::Instant::now();
         let result = client::speak(&self.inner.endpoint, &job.text, &job.voice).await;
         let short = job.hash[..8].to_owned();
+        if !matches!(
+            result,
+            Err(CallError::Unavailable(_) | CallError::Dropped(_) | CallError::Temporary(_))
+        ) {
+            // It answered about the text: it works.
+            self.note_service(Service::Up, "");
+        }
         match result {
             Ok(clip) if clip.duration_ms > MAX_CLIP_MS => {
                 let error = format!("clip longer than {} s", MAX_CLIP_MS / 1000);
@@ -597,28 +690,37 @@ impl Audio {
                 tracing::warn!(clip = %short, error = %code, "audio clip refused by the TTS service");
                 Ok(Step::Worked)
             }
+            Err(CallError::Unavailable(message)) => {
+                // Its engine cannot start, or it is stopping: not this
+                // text's fault, and no reason to send the next one now.
+                self.note_service(Service::Unavailable, &message);
+                Ok(Step::Unavailable)
+            }
             Err(CallError::Dropped(message)) => {
-                // The service took the text and the connection died: it may
-                // have crashed on it (and be restarting now). An attempt and
-                // a crash, whatever the service says afterwards.
-                let tries = queue::Tries {
-                    attempts: job.attempts + 1,
-                    crashes: job.crashes + 1,
-                };
-                self.record_failure(&job, tries, &message, now).await?;
-                if tries.crashes >= MAX_CRASHES {
-                    tracing::error!(clip = %short, crashes = tries.crashes, "audio clip failed: it crashed the TTS service");
-                } else {
-                    tracing::warn!(clip = %short, crashes = tries.crashes, error = %message, "TTS service dropped the connection; retry later");
+                // The connection died after the request was sent. A service
+                // that is gone now was stopped or restarted (a text only
+                // reaches its engine process, whose death it reports as
+                // `engine_crashed`): the clip is not charged.
+                if let Err(err) = client::versions(&self.inner.endpoint).await {
+                    self.note_service(Service::Unreachable, &err.to_string());
+                    return Ok(Step::Unreachable);
                 }
+                self.note_service(Service::Up, "");
+                // Still there: something about this exchange broke it.
+                self.record_crash(&job, &short, &message, now).await?;
+                Ok(Step::Worked)
+            }
+            Err(CallError::Crashed(message)) => {
+                self.record_crash(&job, &short, &message, now).await?;
                 Ok(Step::Worked)
             }
             Err(CallError::Temporary(message)) => {
                 // A service that is down does not cost the clip an attempt.
                 if client::versions(&self.inner.endpoint).await.is_err() {
-                    tracing::warn!(error = %message, "TTS service unreachable");
+                    self.note_service(Service::Unreachable, &message);
                     return Ok(Step::Unreachable);
                 }
+                self.note_service(Service::Up, "");
                 let tries = queue::Tries {
                     attempts: job.attempts + 1,
                     crashes: job.crashes,

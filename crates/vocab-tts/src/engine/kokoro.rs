@@ -8,8 +8,7 @@ use sherpa_onnx::{
     OfflineTtsModelConfig,
 };
 
-use super::{Cancel, EngineError, MODEL, SPEAKERS, SYMBOLS, Synthesizer, VOICES};
-use crate::phonemize::Phonemes;
+use super::{EngineError, MODEL, SPEAKERS, SYMBOLS, Synthesizer, VOICES};
 use crate::postprocess::Pcm;
 use crate::speech::{Speed, Voice};
 
@@ -101,47 +100,28 @@ impl Kokoro {
 }
 
 impl Synthesizer for Kokoro {
-    fn synthesize(
-        &mut self,
-        phonemes: &Phonemes,
-        voice: Voice,
-        speed: Speed,
-        cancel: &Cancel,
-    ) -> Result<Pcm, EngineError> {
-        let mut samples = Vec::new();
-        let mut rate = None;
-        // One chunk per call (the same audio as one call with all chunks:
-        // each ends with the same pause), each with a fresh session that is
-        // dropped before the next one is made (never two models in memory);
-        // work stops between chunks once cancelled.
-        for chunk in phonemes.chunks() {
-            if cancel.is_cancelled() {
-                return Err(EngineError::Cancelled);
-            }
-            let codepoints: Vec<i32> = chunk
-                .chars()
-                .filter_map(|c| i32::try_from(u32::from(c)).ok())
-                .collect();
-            let tts = self.fresh_session()?;
-            let config = GenerationConfig {
-                sid: speaker_id(voice),
-                speed: speed.get(),
-                silence_scale: SILENCE_SCALE,
-                phoneme_codepoints: Some(vec![codepoints]),
-                ..Default::default()
-            };
-            let audio = tts
-                .generate_with_config("", &config, None::<fn(&[f32], f32) -> bool>)
-                .ok_or(EngineError::NoAudio)?;
-            rate = Some(u32::try_from(audio.sample_rate()).map_err(|_| EngineError::NoAudio)?);
-            samples.extend_from_slice(audio.samples());
+    /// Each chunk with a fresh session that is dropped before the next one
+    /// is made (never two models in memory).
+    fn synthesize(&mut self, chunk: &str, voice: Voice, speed: Speed) -> Result<Pcm, EngineError> {
+        let codepoints: Vec<i32> = chunk
+            .chars()
+            .filter_map(|c| i32::try_from(u32::from(c)).ok())
+            .collect();
+        let tts = self.fresh_session()?;
+        let config = GenerationConfig {
+            sid: speaker_id(voice),
+            speed: speed.get(),
+            silence_scale: SILENCE_SCALE,
+            phoneme_codepoints: Some(vec![codepoints]),
+            ..Default::default()
+        };
+        let audio = tts
+            .generate_with_config("", &config, None::<fn(&[f32], f32) -> bool>)
+            .ok_or(EngineError::NoAudio)?;
+        let rate = u32::try_from(audio.sample_rate()).map_err(|_| EngineError::NoAudio)?;
+        if audio.samples().is_empty() {
+            return Err(EngineError::NoAudio);
         }
-        if cancel.is_cancelled() {
-            return Err(EngineError::Cancelled);
-        }
-        match rate {
-            Some(rate) if !samples.is_empty() => Ok(Pcm::new(samples, rate)),
-            _ => Err(EngineError::NoAudio),
-        }
+        Ok(Pcm::new(audio.samples().to_vec(), rate))
     }
 }

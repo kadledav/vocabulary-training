@@ -51,7 +51,7 @@ async fn r40_speak_returns_an_mp3_clip() {
         *calls,
         [Call {
             voice: Voice::AfHeart,
-            chunks: vec!["həlˈO, wˈɜɹld.".to_owned()],
+            chunk: "həlˈO, wˈɜɹld.".to_owned(),
             speed: 1.0
         }]
     );
@@ -75,10 +75,10 @@ async fn r42_the_uk_voice_speaks_with_the_uk_lexicon() {
     assert_eq!(status, StatusCode::OK);
     let calls = calls.lock().expect("test setup");
     assert_eq!(calls[0].voice, Voice::BfEmma);
-    assert_eq!(calls[0].chunks, ["təmˈɑːtQ"]);
+    assert_eq!(calls[0].chunk, "təmˈɑːtQ");
     assert!((calls[0].speed - 0.8).abs() < 1e-6);
     assert_eq!(calls[1].voice, Voice::AfHeart);
-    assert_eq!(calls[1].chunks, ["təmˈAtO"]);
+    assert_eq!(calls[1].chunk, "təmˈAtO");
 }
 
 #[tokio::test]
@@ -95,7 +95,7 @@ async fn r42_voices_are_listed() {
         serde_json::json!({ "voices": [
             { "id": "af_heart", "accent": "en-US", "default": true },
             { "id": "bf_emma", "accent": "en-GB", "default": false },
-        ], "frontend": vocab_tts::phonemize::FRONTEND_VERSION, "engine": "kokoro-int8-multi-lang-v1_0+sherpa-onnx-2.0.1"})
+        ], "frontend": vocab_tts::phonemize::FRONTEND_VERSION, "engine": "kokoro-int8-multi-lang-v1_0+sherpa-onnx-2.0.1+audio-2"})
     );
 }
 
@@ -304,10 +304,12 @@ async fn r83_one_synthesis_at_a_time_and_busy_beyond_the_queue() {
 async fn hold_engine(
     app: &axum::Router,
     started_rx: mpsc::Receiver<()>,
+    text: &str,
 ) -> tokio::task::JoinHandle<StatusCode> {
+    let body = format!(r#"{{"text": "{text}"}}"#);
     let first = tokio::spawn({
         let app = app.clone();
-        async move { send(&app, speak_request(r#"{"text": "hello"}"#)).await.0 }
+        async move { send(&app, speak_request(&body)).await.0 }
     });
     tokio::task::spawn_blocking(move || started_rx.recv().expect("test setup"))
         .await
@@ -325,7 +327,7 @@ async fn r83_abandoned_requests_never_reach_the_engine() {
         gate: Some((started_tx, release_rx)),
     };
     let app = app_with(engine, 1);
-    let first = hold_engine(&app, started_rx).await;
+    let first = hold_engine(&app, started_rx, "hello").await;
     // The second waits for the engine; its client gives up (timeout).
     let second = tokio::spawn({
         let app = app.clone();
@@ -342,9 +344,9 @@ async fn r83_abandoned_requests_never_reach_the_engine() {
         .lock()
         .expect("test setup")
         .iter()
-        .map(|c| c.chunks.clone())
+        .map(|c| c.chunk.clone())
         .collect();
-    assert_eq!(said, [vec!["həlˈO".to_owned()]]);
+    assert_eq!(said, ["həlˈO"]);
     // Nothing is stuck: the next request is served.
     release_tx.send(()).expect("test setup");
     let (status, _, _) = send(&app, speak_request(r#"{"text": "world"}"#)).await;
@@ -361,7 +363,7 @@ async fn r83_work_in_the_engine_stops_when_the_request_is_gone() {
         gate: Some((started_tx, release_rx)),
     };
     let app = app_with(engine, 0);
-    let first = hold_engine(&app, started_rx).await;
+    let first = hold_engine(&app, started_rx, "hello. hello.").await;
     first.abort();
     assert!(first.await.is_err());
     release_tx.send(()).expect("test setup");
@@ -381,9 +383,11 @@ async fn r83_work_in_the_engine_stops_when_the_request_is_gone() {
         .lock()
         .expect("test setup")
         .iter()
-        .map(|c| c.chunks.clone())
+        .map(|c| c.chunk.clone())
         .collect();
-    assert_eq!(said, [vec!["wˈɜɹld".to_owned()]]);
+    // The first chunk of the abandoned request was under way; the second
+    // never started.
+    assert_eq!(said, ["həlˈO.", "wˈɜɹld"]);
 }
 
 #[tokio::test]
@@ -410,4 +414,59 @@ async fn r84_text_that_would_take_too_long_to_speak_is_unprocessable() {
     assert!(calls.lock().expect("test setup").is_empty());
     let (status, _, _) = send(&app, speak_request(r#"{"text": "zz zz"}"#)).await;
     assert_eq!(status, StatusCode::OK);
+}
+
+/// An app whose only word "zz" is 100 symbols (one chunk at normal speed).
+fn app_with_long_word() -> (axum::Router, Arc<Mutex<Vec<Call>>>) {
+    let long = format!("zz {}\n", vec!["s"; 100].join(" "));
+    let phonemizer = Phonemizer::new(
+        Lexicon::parse(&long).expect("test setup"),
+        Lexicon::parse(&long).expect("test setup"),
+        parse_symbols(SYMBOLS).expect("test setup"),
+    );
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let engine = FakeEngine {
+        calls: Arc::clone(&calls),
+        gate: None,
+    };
+    let app = vocab_tts::http::app(Speaker::new(Local::new(phonemizer, Box::new(engine)), 1));
+    (app, calls)
+}
+
+#[tokio::test]
+async fn r84_slower_speech_gets_shorter_chunks_and_a_smaller_budget() {
+    let (app, calls) = app_with_long_word();
+    // Five words: ~31 s at normal speed; twice that at half speed is more
+    // than the 50 s a clip may have, so it is refused before the engine.
+    let text = ["zz"; 5].join(" ");
+    let (status, _, _) = send(&app, speak_request(&format!(r#"{{"text": "{text}"}}"#))).await;
+    assert_eq!(status, StatusCode::OK);
+    calls.lock().expect("test setup").clear();
+    let body = format!(r#"{{"text": "{text}", "speed": 0.5}}"#);
+    let (status, _, body) = send(&app, speak_request(&body)).await;
+    assert_eq!(
+        (status, error_code(&body).as_str()),
+        (StatusCode::UNPROCESSABLE_ENTITY, "too_long_to_speak")
+    );
+    assert!(calls.lock().expect("test setup").is_empty());
+    // Accepted at half speed, in chunks of at most half the length.
+    let (status, _, _) = send(&app, speak_request(r#"{"text": "zz zz", "speed": 0.5}"#)).await;
+    assert_eq!(status, StatusCode::OK);
+    let calls = calls.lock().expect("test setup");
+    assert_eq!(calls.len(), 4);
+    assert!(calls.iter().all(|c| c.chunk.chars().count() <= 50));
+}
+
+#[tokio::test]
+async fn r84_audio_beyond_the_limit_stops_the_engine_and_is_unprocessable() {
+    let (app, calls) = app_with_long_word();
+    // Eight words are estimated just under 50 s; the fake engine makes 8 s
+    // per word, so the limit is passed during the seventh: no eighth.
+    let text = ["zz"; 8].join(" ");
+    let (status, _, body) = send(&app, speak_request(&format!(r#"{{"text": "{text}"}}"#))).await;
+    assert_eq!(
+        (status, error_code(&body).as_str()),
+        (StatusCode::UNPROCESSABLE_ENTITY, "too_long_to_speak")
+    );
+    assert_eq!(calls.lock().expect("test setup").len(), 7);
 }

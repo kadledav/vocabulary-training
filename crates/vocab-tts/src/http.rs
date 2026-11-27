@@ -8,16 +8,21 @@
 //!   the fallback dictionary or spelled letter by letter), `X-Words-Spelled`,
 //!   `X-Frontend` and `X-Engine` (versions, for the app's clip identity);
 //!   `400` invalid request/text/voice/speed, `413` body over
-//!   4 KiB, `415` not JSON, `422` nothing speakable, `500`
+//!   4 KiB, `415` not JSON, `422` nothing speakable or too long to speak
+//!   (more than 50 s of audio, estimated or made), `500`
 //!   `synthesis_failed` or `engine_crashed` (the engine process died on
-//!   this text), `503` busy or timeout.
+//!   this text), `503` `busy`, `timeout`, and with `Retry-After`:
+//!   `engine_unavailable` (the engine cannot be started now: nothing to do
+//!   with the text) or `shutting_down` (the service stops; the work was
+//!   stopped).
 //! * `GET /v1/voices` → the voices and their accents, and the front-end and
 //!   engine versions (the app's clip identity).
 //! * `GET /healthz` → `200` `{"status": "ok", "engine": "running" |
 //!   "stopped"}` (whether the engine process is running now; it holds the
 //!   lexicons, and the model while it speaks) once the start self-test
-//!   spoke (before the listener opens), `503` `engine_failed` while the
-//!   engine process cannot be started (until a start succeeds).
+//!   spoke (before the listener opens), `503` `engine_failed` (with
+//!   `Retry-After`) after the engine process could not be started, until a
+//!   start succeeds (the next speak request tries again).
 //!
 //! No authentication: the container is reachable only from the app, on an
 //! internal network without a route anywhere else (R-83). Every input is
@@ -46,9 +51,8 @@ use serde::Deserialize;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 
-use crate::engine::ENGINE_VERSION;
 use crate::phonemize::FRONTEND_VERSION;
-use crate::speaker::{SpeakError, Speaker};
+use crate::speaker::{SpeakError, Speaker, engine_version};
 use crate::speech::{Accent, SpeakText, Speed, Voice};
 
 const HEALTHZ_PATH: &str = "/healthz";
@@ -68,6 +72,9 @@ const MAX_CONNECTIONS: usize = 32;
 const MAX_CONCURRENT_REQUESTS: usize = 16;
 /// `Retry-After` of a busy answer, seconds.
 const BUSY_RETRY_SECS: u64 = 5;
+/// `Retry-After` while the engine cannot be started or the service stops,
+/// seconds.
+const UNAVAILABLE_RETRY_SECS: u64 = 60;
 
 /// The application router.
 pub fn app(speaker: Arc<Speaker>) -> Router {
@@ -91,6 +98,15 @@ fn error(status: StatusCode, code: &str, message: &str) -> Response {
     (status, Json(body)).into_response()
 }
 
+/// `503` with `Retry-After`.
+fn unavailable(code: &str, message: &str, retry_secs: u64) -> Response {
+    let mut response = error(StatusCode::SERVICE_UNAVAILABLE, code, message);
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from(retry_secs));
+    response
+}
+
 async fn not_found() -> Response {
     error(StatusCode::NOT_FOUND, "not_found", "Not found")
 }
@@ -104,10 +120,10 @@ async fn healthz(State(speaker): State<Arc<Speaker>>) -> Response {
         };
         Json(serde_json::json!({ "status": "ok", "engine": engine })).into_response()
     } else {
-        error(
-            StatusCode::SERVICE_UNAVAILABLE,
+        unavailable(
             "engine_failed",
             "the engine cannot be started (see the log)",
+            UNAVAILABLE_RETRY_SECS,
         )
     }
 }
@@ -126,7 +142,7 @@ async fn voices() -> Response {
     Json(serde_json::json!({
         "voices": voices,
         "frontend": FRONTEND_VERSION,
-        "engine": ENGINE_VERSION,
+        "engine": engine_version(),
     }))
     .into_response()
 }
@@ -212,7 +228,9 @@ async fn speak(
             headers.insert("x-approximate", HeaderValue::from(tally.approximate()));
             headers.insert("x-words-spelled", HeaderValue::from(tally.spelled));
             headers.insert("x-frontend", HeaderValue::from_static(FRONTEND_VERSION));
-            headers.insert("x-engine", HeaderValue::from_static(ENGINE_VERSION));
+            if let Ok(value) = HeaderValue::from_str(&engine_version()) {
+                headers.insert("x-engine", value);
+            }
             response
         }
         Err(SpeakError::NothingToSay) => error(
@@ -223,7 +241,7 @@ async fn speak(
         Err(SpeakError::TooLong(_)) => error(
             StatusCode::UNPROCESSABLE_ENTITY,
             "too_long_to_speak",
-            "the text would take too long to speak (numbers or letters spelled out)",
+            "the text would take too long to speak (more than 50 s of audio at this speed)",
         ),
         Err(SpeakError::Cancelled) => error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -231,16 +249,18 @@ async fn speak(
             "the request took too long",
         ),
         Err(SpeakError::Busy) => {
-            let mut response = error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "busy",
-                "the engine is busy; retry later",
-            );
-            response
-                .headers_mut()
-                .insert(header::RETRY_AFTER, HeaderValue::from(BUSY_RETRY_SECS));
-            response
+            unavailable("busy", "the engine is busy; retry later", BUSY_RETRY_SECS)
         }
+        Err(SpeakError::Unavailable(_)) => unavailable(
+            "engine_unavailable",
+            "the engine cannot be started now (see the log); retry later",
+            UNAVAILABLE_RETRY_SECS,
+        ),
+        Err(SpeakError::ShuttingDown) => unavailable(
+            "shutting_down",
+            "the service is stopping; retry later",
+            UNAVAILABLE_RETRY_SECS,
+        ),
         Err(err @ SpeakError::Crashed(_)) => {
             tracing::error!(error = %err, text_chars = chars, text_sha256 = %fingerprint, voice = voice.id(), "synthesis crashed");
             error(

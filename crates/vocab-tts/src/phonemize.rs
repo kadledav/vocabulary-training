@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use unicode_normalization::UnicodeNormalization;
 use unicode_normalization::char::is_combining_mark;
 
-use crate::speech::{Accent, SpeakText};
+use crate::speech::{Accent, SpeakText, Speed};
 
 /// File names in the model directory.
 const US_LEXICON: &str = "lexicon-us-en.txt";
@@ -41,7 +41,7 @@ const FALLBACK: &str = "cmudict.dict";
 /// Version of this front-end: part of the app's clip identity, so a change
 /// in how text becomes phonemes regenerates the clips. Bump it with every
 /// change of the rules or the dictionaries.
-pub const FRONTEND_VERSION: &str = "g2p-4";
+pub const FRONTEND_VERSION: &str = "g2p-5";
 /// Phoneme symbols per chunk the engine synthesises in one pass (Kokoro's
 /// context is 510). The engine's memory grows with the chunk length and
 /// with every new chunk shape (int8 model, one fresh engine process, the
@@ -49,10 +49,17 @@ pub const FRONTEND_VERSION: &str = "g2p-4";
 /// model, of 100-symbol chunks +210 MiB, of 75 +170 MiB), so chunks stay
 /// short. 100 symbols: a sentence of up to ~17 words is one chunk, a longer
 /// one is cut at its last pause (comma, semicolon, …) before the limit, or
-/// else between two words.
-const MAX_CHUNK_SYMBOLS: usize = 100;
+/// else between two words ([`Chunks`]). The limit is for the normal speed:
+/// slower speech makes more audio, and so more memory, per symbol, so the
+/// chunks are shorter by the same factor ([`Speed::stretch`]).
+pub const MAX_CHUNK_SYMBOLS: usize = 100;
 /// Where a chunk that must be cut ends best: at its last pause.
 const CUT_MARKS: [char; 5] = [',', ';', ':', '—', '…'];
+/// What a pause inside a chunk counts for against the chunk's limit, in
+/// symbols: the model makes a comma about as long as three sounds (measured:
+/// a chunk of "a, a, a, …" was 7.5 s of audio, one of words 5.5 s, and the
+/// engine's memory grows with the audio of a chunk).
+const PAUSE_WEIGHT: usize = 3;
 /// Stress and length marks: not sounds (skipped when looking at the last
 /// sound of a stem).
 const MARKS: [char; 3] = ['ˈ', 'ˌ', 'ː'];
@@ -316,7 +323,19 @@ impl Tally {
 #[derive(Clone, PartialEq, Eq)]
 pub struct Phonemes {
     chunks: Vec<String>,
+    /// How each chunk but the last ends.
+    cuts: Vec<Cut>,
     tally: Tally,
+}
+
+/// Where the text was cut between two chunks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cut {
+    /// At a pause of the text (sentence end, comma, dash, …).
+    Pause,
+    /// Between two words without a pause, or inside a long word: the text
+    /// runs on, the audio should too.
+    Words,
 }
 
 impl fmt::Debug for Phonemes {
@@ -336,6 +355,12 @@ impl Phonemes {
         &self.chunks
     }
 
+    /// How the text was cut between chunk `i` and `i + 1`, for every pair
+    /// of neighbouring chunks (one fewer than [`Phonemes::chunks`]).
+    pub fn cuts(&self) -> &[Cut] {
+        &self.cuts
+    }
+
     /// Words that were not in any dictionary and are spoken letter by letter.
     pub fn spelled_out(&self) -> usize {
         self.tally.spelled
@@ -352,6 +377,12 @@ impl Phonemes {
 
     pub fn symbol_count(&self) -> usize {
         self.chunks.iter().map(|c| c.chars().count()).sum()
+    }
+
+    /// The symbols, a pause counted as [`PAUSE_WEIGHT`] (the measure of
+    /// the chunk limit; roughly proportional to the audio).
+    pub fn weight(&self) -> usize {
+        self.chunks.iter().map(|c| weight(c)).sum()
     }
 }
 
@@ -433,14 +464,23 @@ impl Phonemizer {
         (self.us.fallback.len(), self.gb.fallback.len())
     }
 
-    /// The phonemes of `text` in the given accent.
+    /// The phonemes of `text` in the given accent, chunked for the normal
+    /// speed.
     pub fn phonemize(&self, text: &SpeakText, accent: Accent) -> Phonemes {
+        self.phonemize_at(text, accent, Speed::NORMAL)
+    }
+
+    /// The phonemes of `text` in the given accent, chunked for `speed`
+    /// (shorter chunks for slower speech, see [`MAX_CHUNK_SYMBOLS`]).
+    pub fn phonemize_at(&self, text: &SpeakText, accent: Accent, speed: Speed) -> Phonemes {
         let dictionaries = match accent {
             Accent::Us => &self.us,
             Accent::Gb => &self.gb,
         };
         let mut tally = Tally::default();
-        let mut chunks = Chunks::default();
+        // Rounded down: never more audio per chunk than at normal speed.
+        let limit = (MAX_CHUNK_SYMBOLS as f32 / speed.stretch()) as usize;
+        let mut chunks = Chunks::new(limit);
         for piece in pieces(text.as_str()) {
             match piece {
                 Piece::Word(word) => {
@@ -452,8 +492,8 @@ impl Phonemizer {
                     }
                     // A number or a compound is several words: each is a
                     // unit of its own, so even a long one is chunked.
-                    for part in phonemes.split(' ').filter(|p| !p.is_empty()) {
-                        chunks.word(part);
+                    for (i, part) in phonemes.split(' ').filter(|p| !p.is_empty()).enumerate() {
+                        chunks.word(part, i == 0);
                     }
                 }
                 Piece::Pause(mark) => {
@@ -464,8 +504,10 @@ impl Phonemizer {
                 Piece::Dropped => tally.dropped += 1,
             }
         }
+        let (chunks, cuts) = chunks.finish();
         Phonemes {
-            chunks: chunks.finish(),
+            chunks,
+            cuts,
             tally,
         }
     }
@@ -479,56 +521,136 @@ impl Phonemizer {
     }
 }
 
-/// Builds chunks of at most [`MAX_CHUNK_SYMBOLS`] symbols: breaks after a
-/// sentence end, before a word that would not fit (at the chunk's last
-/// pause if there is one, so the cut falls where the text breathes), and
-/// inside a single word that alone is longer than a chunk (no chunk ever
-/// exceeds the limit, whatever the input).
-#[derive(Debug, Default)]
+/// Symbols of `phonemes`, a pause counted as [`PAUSE_WEIGHT`].
+fn weight(phonemes: &str) -> usize {
+    phonemes
+        .chars()
+        .map(|c| {
+            if CUT_MARKS.contains(&c) {
+                PAUSE_WEIGHT
+            } else {
+                1
+            }
+        })
+        .sum()
+}
+
+/// Builds chunks of at most `limit` symbols (by [`weight`]): breaks after a sentence end,
+/// and before a word that would not fit, where the text breaks best:
+///
+/// 1. at the chunk's last pause (comma, semicolon, …) if the rest then fits,
+/// 2. else between two words of the text: before the incoming word, or, if
+///    that word is a part of a longer one (a number read digit by digit or in
+///    words, a hyphenated compound), before the whole of it if it then fits;
+/// 3. else inside the word (between its parts), and only a single part that
+///    alone is longer than a chunk is cut inside its symbols (no chunk ever
+///    exceeds the limit, whatever the input).
+///
+/// Each chunk records how it ends ([`Cut`]), so the audio can be joined
+/// tightly where the text has no pause.
+#[derive(Debug)]
 struct Chunks {
+    limit: usize,
     done: Vec<String>,
+    ends: Vec<Cut>,
     current: String,
     len: usize,
+    /// Byte offsets in `current` of the spaces before words of the text
+    /// (not before the further parts of one word).
+    word_starts: Vec<usize>,
 }
 
 impl Chunks {
-    fn close(&mut self) {
-        if self.len > 0 {
-            self.done.push(std::mem::take(&mut self.current));
-            self.len = 0;
+    fn new(limit: usize) -> Self {
+        Self {
+            limit: limit.max(1),
+            done: Vec::new(),
+            ends: Vec::new(),
+            current: String::new(),
+            len: 0,
+            word_starts: Vec::new(),
         }
     }
 
-    /// Make room for `needed` more symbols (and a space): end the chunk at
-    /// its last pause when the rest then fits, else end it here.
-    fn make_room(&mut self, needed: usize) {
-        if self.len == 0 || self.len + 1 + needed <= MAX_CHUNK_SYMBOLS {
+    /// End the current chunk here (nothing if it is empty).
+    fn close(&mut self, end: Cut) {
+        if self.len > 0 {
+            self.done.push(std::mem::take(&mut self.current));
+            self.ends.push(end);
+            self.len = 0;
+            self.word_starts.clear();
+        }
+    }
+
+    /// End the current chunk at byte `end`; what follows from byte `rest`
+    /// on starts the next chunk.
+    fn split(&mut self, end: usize, rest: usize, cut: Cut) {
+        let tail = self.current[rest..].to_owned();
+        self.current.truncate(end);
+        self.done.push(std::mem::replace(&mut self.current, tail));
+        self.ends.push(cut);
+        self.len = weight(&self.current);
+        self.word_starts = self
+            .word_starts
+            .iter()
+            .filter(|&&start| start >= rest)
+            .map(|&start| start - rest)
+            .collect();
+    }
+
+    /// Whether a chunk of `tail` symbols still has room for `needed` more
+    /// (and a space).
+    fn fits(&self, tail: usize, needed: usize) -> bool {
+        tail + 1 + needed <= self.limit
+    }
+
+    /// Make room for `needed` more symbols (and a space); `word_start`:
+    /// they begin a word of the text (see [`Chunks`] for where it cuts).
+    fn make_room(&mut self, needed: usize, word_start: bool) {
+        if self.len == 0 || self.fits(self.len, needed) {
             return;
         }
         if let Some(cut) = self.current.rfind(CUT_MARKS) {
             let end = cut + self.current[cut..].chars().next().map_or(1, char::len_utf8);
-            let tail = self.current[end..].trim_start().to_owned();
-            let tail_len = tail.chars().count();
-            if tail_len > 0 && tail_len + 1 + needed <= MAX_CHUNK_SYMBOLS {
-                self.current.truncate(end);
-                self.done.push(std::mem::replace(&mut self.current, tail));
-                self.len = tail_len;
+            let rest = self.current.len() - self.current[end..].trim_start().len();
+            let tail = weight(&self.current[rest..]);
+            if tail > 0 && self.fits(tail, needed) {
+                self.split(end, rest, Cut::Pause);
                 return;
             }
         }
-        self.close();
+        if !word_start && let Some(&space) = self.word_starts.last() {
+            let tail = weight(&self.current[space + 1..]);
+            if self.fits(tail, needed) {
+                self.split(space, space + 1, Cut::Words);
+                return;
+            }
+        }
+        let end = if self.current.ends_with(CUT_MARKS) {
+            Cut::Pause
+        } else {
+            Cut::Words
+        };
+        self.close(end);
     }
 
-    fn word(&mut self, phonemes: &str) {
+    /// One word of the text, or (`word_start` false) a further part of one
+    /// (the words of a number, the parts of a compound).
+    fn word(&mut self, phonemes: &str, word_start: bool) {
         let symbols: Vec<char> = phonemes.chars().collect();
-        for piece in symbols.chunks(MAX_CHUNK_SYMBOLS) {
-            self.make_room(piece.len());
+        let mut starts = word_start;
+        for piece in symbols.chunks(self.limit) {
+            self.make_room(piece.len(), starts);
             if self.len > 0 {
+                if starts {
+                    self.word_starts.push(self.current.len());
+                }
                 self.current.push(' ');
                 self.len += 1;
             }
             self.current.extend(piece);
             self.len += piece.len();
+            starts = false;
         }
     }
 
@@ -536,20 +658,22 @@ impl Chunks {
         if self.len == 0 {
             return; // nothing to pause after
         }
-        if self.len + 1 > MAX_CHUNK_SYMBOLS {
-            self.close();
+        let cost = weight(mark.encode_utf8(&mut [0; 4]));
+        if self.len + cost > self.limit {
+            self.close(Cut::Pause);
             return;
         }
         self.current.push(mark);
-        self.len += 1;
+        self.len += cost;
         if matches!(mark, '.' | '!' | '?') {
-            self.close();
+            self.close(Cut::Pause);
         }
     }
 
-    fn finish(mut self) -> Vec<String> {
-        self.close();
-        self.done
+    fn finish(mut self) -> (Vec<String>, Vec<Cut>) {
+        self.close(Cut::Pause);
+        self.ends.pop(); // the end of the text joins nothing
+        (self.done, self.ends)
     }
 }
 
@@ -1110,14 +1234,14 @@ a ˈ A
 
     #[test]
     fn r40_no_chunk_exceeds_the_limit_even_for_one_huge_word() {
-        let mut chunks = Chunks::default();
+        let mut chunks = Chunks::new(MAX_CHUNK_SYMBOLS);
         // Five and a half chunks long: the comma after it still fits.
         let huge = "b".repeat(MAX_CHUNK_SYMBOLS * 5 + MAX_CHUNK_SYMBOLS / 2);
-        chunks.word("həlˈO");
-        chunks.word(&huge);
+        chunks.word("həlˈO", true);
+        chunks.word(&huge, true);
         chunks.pause(',');
-        chunks.word("kˈæt");
-        let done = chunks.finish();
+        chunks.word("kˈæt", true);
+        let (done, _) = chunks.finish();
         assert!(
             done.iter().all(|c| c.chars().count() <= MAX_CHUNK_SYMBOLS),
             "{done:?}"
@@ -1142,33 +1266,105 @@ a ˈ A
 
     #[test]
     fn r40_a_long_chunk_is_cut_at_its_last_pause() {
-        let mut chunks = Chunks::default();
+        let mut chunks = Chunks::new(MAX_CHUNK_SYMBOLS);
         // Three words and a comma fit in a chunk, four do not.
         let word = "a".repeat(MAX_CHUNK_SYMBOLS / 4 + 3);
         let w = word.len();
         for _ in 0..2 {
-            chunks.word(&word);
+            chunks.word(&word, true);
         }
         chunks.pause(',');
-        chunks.word(&word);
+        chunks.word(&word, true);
         // The fourth word does not fit: the chunk ends at the comma and the
         // third word moves on with it.
-        chunks.word(&word);
-        let done = chunks.finish();
+        chunks.word(&word, true);
+        let (done, _) = chunks.finish();
         assert_eq!(done.len(), 2, "{done:?}");
         assert!(done[0].ends_with(','), "{done:?}");
         assert_eq!(done[0].chars().count(), 2 * w + 2);
         assert_eq!(done[1], format!("{word} {word}"));
         // No pause to cut at: the chunk ends before the word.
-        let mut chunks = Chunks::default();
+        let mut chunks = Chunks::new(MAX_CHUNK_SYMBOLS);
         for _ in 0..4 {
-            chunks.word(&word);
+            chunks.word(&word, true);
         }
-        let done = chunks.finish();
+        let (done, _) = chunks.finish();
         assert_eq!(
             done.iter().map(|c| c.chars().count()).collect::<Vec<_>>(),
             [3 * w + 2, w]
         );
+    }
+
+    #[test]
+    fn r40_each_cut_says_whether_the_text_pauses_there() {
+        let word = "a".repeat(MAX_CHUNK_SYMBOLS / 4 + 3);
+        let mut chunks = Chunks::new(MAX_CHUNK_SYMBOLS);
+        chunks.word(&word, true);
+        chunks.pause('.');
+        chunks.word(&word, true);
+        chunks.pause(',');
+        chunks.word(&word, true);
+        chunks.word(&word, true);
+        for _ in 0..3 {
+            chunks.word(&word, true);
+        }
+        let (done, cuts) = chunks.finish();
+        assert_eq!(done.len(), 4, "{done:?}");
+        // After the sentence, at the comma, then between two words.
+        assert_eq!(cuts, [Cut::Pause, Cut::Pause, Cut::Words]);
+        let p = us("hello world. hello");
+        assert_eq!(p.chunks().len(), 2);
+        assert_eq!(p.cuts(), [Cut::Pause]);
+        assert!(us("hello world").cuts().is_empty());
+    }
+
+    #[test]
+    fn r40_a_number_is_not_cut_where_a_word_boundary_fits() {
+        // Six 15-digit numbers (read digit by digit): each chunk ends between
+        // two numbers, never inside one.
+        let p = us(&["313131313131313"; 6].join(" "));
+        let one = us("313131313131313");
+        assert_eq!(one.chunks().len(), 1);
+        assert!(p.chunks().len() > 1);
+        for chunk in p.chunks() {
+            assert_eq!(
+                chunk.split(' ').count() % 15,
+                0,
+                "a chunk of whole numbers: {chunk}"
+            );
+        }
+        assert!(p.cuts().iter().all(|cut| *cut == Cut::Words));
+        // The same for the parts of a word that is longer than the room
+        // left: the part goes with its word.
+        let mut chunks = Chunks::new(20);
+        chunks.word("aaaaaaaa", true);
+        chunks.word("bbbbbb", true);
+        chunks.word("cccccc", false);
+        let (done, cuts) = chunks.finish();
+        assert_eq!(done, ["aaaaaaaa", "bbbbbb cccccc"]);
+        assert_eq!(cuts, [Cut::Words]);
+        // A word with nothing before it in its chunk is cut inside.
+        let mut chunks = Chunks::new(10);
+        chunks.word("aaaaaa", true);
+        chunks.word("bbbbbb", false);
+        let (done, _) = chunks.finish();
+        assert_eq!(done, ["aaaaaa", "bbbbbb"]);
+    }
+
+    #[test]
+    fn r40_slower_speech_gets_shorter_chunks() {
+        let text = SpeakText::new(&vec!["hello"; 90].join(" ")).expect("test setup");
+        let p = phonemizer();
+        for (speed, limit) in [(1.0, 100), (1.5, 100), (0.5, 50), (0.75, 75)] {
+            let speed = Speed::new(speed).expect("test setup");
+            let chunks = p.phonemize_at(&text, Accent::Us, speed);
+            let longest = chunks.chunks().iter().map(|c| c.chars().count()).max();
+            assert!(
+                longest.is_some_and(|n| n <= limit && n > limit - 7),
+                "{longest:?}"
+            );
+            assert_eq!(chunks.chunks().concat().matches("həlˈO").count(), 90);
+        }
     }
 
     #[test]
