@@ -28,6 +28,7 @@ const TABLES: &[&str] = &[
     "setting",
     "source",
     "word",
+    "word_alias",
     "word_form",
     "word_item",
     "word_override",
@@ -70,7 +71,7 @@ fn r85_empty_database_migrates_to_v1_with_foreign_keys_and_integrity_ok() {
     let version: u32 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("user_version");
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
 
     let mut stmt = conn
         .prepare("SELECT name, strict FROM pragma_table_list WHERE schema = 'main' AND name NOT LIKE 'sqlite_%' ORDER BY name")
@@ -104,7 +105,8 @@ fn r85_synthetic_fixture_satisfies_every_constraint() {
     rt.block_on(db.write(|tx| {
         tx.execute_batch(
             "INSERT INTO audio_engine (id, frontend, engine, checked_at) \
-             VALUES (1, 'g2p-2', 'kokoro-test', '2026-11-17T10:00:00Z');",
+             VALUES (1, 'g2p-2', 'kokoro-test', '2026-11-17T10:00:00Z'); \
+             INSERT INTO word_alias (key, word_id) VALUES ('test-former-key', 1);",
         )
         .map_err(DbError::from)
     }))
@@ -258,7 +260,7 @@ fn r85_reopening_is_idempotent() {
     let version: u32 = inspect(&data)
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("user_version");
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
 }
 
 #[test]
@@ -271,7 +273,7 @@ fn r85_newer_schema_is_refused() {
     match Db::open(&data) {
         Err(DbError::SchemaTooNew {
             found: 99,
-            known: 6,
+            known: 7,
         }) => {}
         other => panic!("expected SchemaTooNew, got {other:?}"),
     }
@@ -343,7 +345,7 @@ fn r85_v1_database_with_data_migrates_to_v2() {
     let version: u32 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("user_version");
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
     let (headword, spelling): (String, Option<i64>) = conn
         .query_row(
             "SELECT headword, spelling FROM word WHERE id = 1",
@@ -397,7 +399,7 @@ fn r85_v2_database_with_data_migrates_to_v3() {
     let version: u32 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("user_version");
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
     let (items, with_format): (i64, i64) = conn
         .query_row(
             "SELECT count(*), count(format) FROM session_item",
@@ -457,7 +459,7 @@ fn r85_v4_database_with_data_migrates_to_v5() {
     let version: u32 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("user_version");
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
     let defaulted: Vec<(String, bool)> = conn
         .prepare("SELECT slug, title_defaulted FROM source ORDER BY id")
         .expect("prepare")
@@ -794,4 +796,83 @@ fn r02_migration_flags_general_vocabulary_as_a_defaulted_title() {
             ("test-other".to_owned(), false),
         ]
     );
+}
+
+fn form_rows(conn: &Connection, condition: &str) -> Vec<String> {
+    conn.prepare(&format!(
+        "SELECT word_id, form, form_key, common, position FROM word_form \
+         WHERE {condition} ORDER BY rowid"
+    ))
+    .expect("prepare")
+    .query_map([], |r| {
+        Ok(format!(
+            "{}|{}|{}|{}|{}",
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, i64>(3)?,
+            r.get::<_, i64>(4)?
+        ))
+    })
+    .expect("query")
+    .map(|r| r.expect("row"))
+    .collect()
+}
+
+/// Migration 0007 (M7, R-04) on a database at version 6 holding the
+/// synthetic fixture: the alias table exists and is empty, every stored
+/// form is kept and not removed, the constraints hold. (The version-6
+/// database is built from the migrations' SQL; the Rust data step of 0005
+/// only re-keys sentences and plays no part here.)
+#[test]
+fn r04_v6_database_with_data_migrates_to_v7() {
+    let (_root, data) = data_dir();
+    let forms_before = {
+        let conn = v4_database(&data);
+        for sql in [
+            include_str!("../migrations/0005_review_round_1.sql"),
+            include_str!("../migrations/0006_audio.sql"),
+        ] {
+            conn.execute_batch(sql).expect("migration");
+        }
+        conn.pragma_update(None, "user_version", 6)
+            .expect("version");
+        form_rows(&conn, "1")
+    };
+    assert!(!forms_before.is_empty(), "the fixture has forms");
+    drop(Db::open(&data).expect("migrates"));
+    let conn = inspect(&data);
+    let version: u32 = conn
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .expect("user_version");
+    assert_eq!(version, 7);
+    assert_eq!(form_rows(&conn, "removed = 0"), forms_before);
+    let aliases: i64 = conn
+        .query_row("SELECT COUNT(*) FROM word_alias", [], |r| r.get(0))
+        .expect("alias table");
+    assert_eq!(aliases, 0);
+    conn.pragma_update(None, "foreign_keys", "ON").expect("fk");
+    assert!(
+        conn.execute("UPDATE word_form SET removed = 2", [])
+            .is_err(),
+        "CHECK enforced"
+    );
+    assert!(
+        conn.execute(
+            "INSERT INTO word_alias (key, word_id) VALUES ('test-old', 999)",
+            []
+        )
+        .is_err(),
+        "an alias belongs to an existing word"
+    );
+    let word: i64 = conn
+        .query_row("SELECT MIN(id) FROM word", [], |r| r.get(0))
+        .expect("word");
+    conn.execute(
+        "INSERT INTO word_alias (key, word_id) VALUES ('test-old', ?1)",
+        [word],
+    )
+    .expect("alias");
+    assert!(pragma_rows(&conn, "foreign_key_check").is_empty());
+    assert_eq!(pragma_rows(&conn, "integrity_check"), vec!["Text(\"ok\")"]);
 }
