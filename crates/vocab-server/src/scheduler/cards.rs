@@ -111,6 +111,12 @@ pub fn cards_of_word(conn: &Connection, word: WordId) -> rusqlite::Result<Vec<Ca
     cards_where(conn, "word_id = ?1", [word.get()])
 }
 
+/// Every card (the word list joins them to its words in memory: one query
+/// for the whole list, design §7.1 screen 6).
+pub fn all_cards(conn: &Connection) -> rusqlite::Result<Vec<Card>> {
+    cards_where(conn, "1", [])
+}
+
 /// Cards with a due day (reviewed cards and unlocked Produce/Spelling
 /// cards), not suspended. Callers filter by word, scope and kind.
 pub fn scheduled_cards(conn: &Connection) -> rusqlite::Result<Vec<Card>> {

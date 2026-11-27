@@ -1,6 +1,13 @@
 //! Read-only aggregations for the Today screen (design §3.2 `stats`, §7.1
-//! screen 1; R-54, R-59). Uses only the read functions of `catalog`,
-//! `scheduler`, `session` and `settings`.
+//! screen 1; R-54, R-59) and the Words screens ([`words`]). Uses only the
+//! read functions of `catalog`, `scheduler`, `session` and `settings`.
+
+mod words;
+
+pub use words::{
+    CardView, WordDetail, WordListQuery, WordListRow, WordSort, WordStatus, word_detail, word_list,
+    word_status,
+};
 
 use rusqlite::Connection;
 use serde::Serialize;

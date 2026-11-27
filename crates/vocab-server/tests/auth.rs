@@ -183,6 +183,8 @@ async fn error_code(response: Response) -> String {
 /// A concrete URI for a route template.
 fn concrete(path: &str) -> String {
     path.replace("{id}", "1")
+        .replace("{kind}", "czech")
+        .replace("{key}", "test-key")
         .replace("{build}", "0")
         .replace("{*path}", "js/main.js")
 }

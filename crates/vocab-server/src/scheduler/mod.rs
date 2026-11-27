@@ -11,6 +11,7 @@
 
 mod cards;
 mod model;
+mod owner;
 mod review;
 
 use std::fmt;
@@ -18,10 +19,11 @@ use std::fmt;
 use serde::Serialize;
 
 pub use cards::{
-    Card, card, cards_of_word, ensure_cards, introduced_words_on, latest_grades_on, new_cards,
-    normal_load, reviewed_cards_on, scheduled_cards, sentence_last_shown,
+    Card, all_cards, card, cards_of_word, ensure_cards, introduced_words_on, latest_grades_on,
+    new_cards, normal_load, reviewed_cards_on, scheduled_cards, sentence_last_shown,
 };
 pub use model::{Model, Rating, desired_retention, model};
+pub use owner::{HistoryRow, delete_cards, history, reset_card};
 pub use review::{
     AnswerMatch, RawGrade, ReviewInput, ReviewOutcome, StoredReview, UndoOutcome, UnlockedCard,
     find_review, raw_grade, record_review, review_outcome, undo_review,

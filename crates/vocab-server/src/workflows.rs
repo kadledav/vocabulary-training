@@ -29,14 +29,14 @@ use rusqlite::Transaction;
 use vocab_pack::paste::PasteError;
 use vocab_pack::types::WordResult;
 
-use crate::catalog::{self, CapacityError, ImportLink, ReadingUpdate};
+use crate::catalog::{self, CapacityError, EditError, ImportLink, ListKind, ReadingUpdate, WordId};
 use crate::clock::Moment;
 use crate::db::{Db, DbError};
 use crate::importer::{
     self, ImportLogRow, ImportReport, Mode, PACK_ID_REUSED, PackReport, PackStatus, PreparedPack,
     Via,
 };
-use crate::scheduler;
+use crate::scheduler::{self, CardKind};
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorkflowError {
@@ -53,6 +53,12 @@ pub enum WorkflowError {
     /// Importing the pack would pass a hard cap of the catalog.
     #[error(transparent)]
     Capacity(#[from] CapacityError),
+    /// An owner edit was refused (the message is for the owner).
+    #[error(transparent)]
+    Edit(#[from] EditError),
+    /// "Reset card" for a card the word does not have (yet).
+    #[error("This word has no {0} card yet.")]
+    NoSuchCard(CardKind),
 }
 
 /// What the owner is told when a pack could not be imported.
@@ -293,6 +299,149 @@ pub async fn recent_imports(db: &Db, limit: u32) -> Result<Vec<ImportLogRow>, Wo
         Ok(rows)
     })
     .await
+}
+
+// ── the owner's word edits (design §7.1 screen 7; R-04, R-25, R-51) ────────
+//
+// Each runs inside the caller's transaction: the catalog change and the
+// scheduler's follow-up (`ensure_cards`: a goal switched to `recognise`
+// suspends the Produce card, enough visible sentences upgrade a word-only
+// card, an include unlocks nothing new) are stored together or not at all.
+
+/// What an owner action on a word does (design §8 `POST
+/// /api/words/{id}/actions`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WordAction {
+    Suspend,
+    Unsuspend,
+    /// Practise a low-priority word (R-51: recognise-only, lowest retention).
+    Include,
+    Exclude,
+    /// Forget one card's learning state (its history stays).
+    ResetCard(CardKind),
+}
+
+/// Bring the word's cards in line with its (changed) traits.
+fn refresh_cards(tx: &Transaction<'_>, id: WordId, now: &Moment) -> Result<(), WorkflowError> {
+    let traits = catalog::word_traits(tx, id)?.ok_or(EditError::WordNotFound)?;
+    scheduler::ensure_cards(tx, &traits, now)?;
+    Ok(())
+}
+
+/// Edit word fields (`PATCH /api/words/{id}`). Returns the fields whose
+/// value changed.
+pub fn edit_word(
+    tx: &Transaction<'_>,
+    id: WordId,
+    edit: &serde_json::Value,
+    now: &Moment,
+) -> Result<Vec<&'static str>, WorkflowError> {
+    let changed = catalog::update_word(tx, id, edit, &now.stamp())?;
+    refresh_cards(tx, id, now)?;
+    Ok(changed)
+}
+
+/// Suspend, include, reset a card (`POST /api/words/{id}/actions`).
+pub fn word_action(
+    tx: &Transaction<'_>,
+    id: WordId,
+    action: WordAction,
+    now: &Moment,
+) -> Result<(), WorkflowError> {
+    let stamp = now.stamp();
+    match action {
+        WordAction::Suspend | WordAction::Unsuspend => {
+            catalog::set_suspended(tx, id, action == WordAction::Suspend, &stamp)?;
+        }
+        WordAction::Include | WordAction::Exclude => {
+            catalog::set_included(tx, id, action == WordAction::Include, &stamp)?;
+        }
+        WordAction::ResetCard(kind) => {
+            if catalog::word_traits(tx, id)?.is_none() {
+                return Err(EditError::WordNotFound.into());
+            }
+            if scheduler::reset_card(tx, id, kind, now)?.is_none() {
+                return Err(WorkflowError::NoSuchCard(kind));
+            }
+        }
+    }
+    refresh_cards(tx, id, now)
+}
+
+/// Add an item to a list field (`POST /api/words/{id}/items`).
+pub fn add_word_item(
+    tx: &Transaction<'_>,
+    id: WordId,
+    kind: ListKind,
+    value: &str,
+    common: Option<bool>,
+    now: &Moment,
+) -> Result<(), WorkflowError> {
+    catalog::add_item(tx, id, kind, value, common, &now.stamp())?;
+    // Confusables drive the interference rule; nothing else changes cards.
+    refresh_cards(tx, id, now)
+}
+
+/// Remove an item from a list field (`DELETE /api/words/{id}/items/…`).
+pub fn remove_word_item(
+    tx: &Transaction<'_>,
+    id: WordId,
+    kind: ListKind,
+    key: &str,
+    now: &Moment,
+) -> Result<(), WorkflowError> {
+    catalog::remove_item(tx, id, kind, key, &now.stamp())?;
+    refresh_cards(tx, id, now)
+}
+
+/// Correct a sentence (`PATCH /api/sentences/{id}`). Returns its word.
+pub fn edit_sentence(
+    tx: &Transaction<'_>,
+    sentence: i64,
+    en: &str,
+    cs: &str,
+    now: &Moment,
+) -> Result<WordId, WorkflowError> {
+    let word = catalog::update_sentence(tx, sentence, en, cs, &now.stamp())?;
+    refresh_cards(tx, word, now)?;
+    Ok(word)
+}
+
+/// Hide or show a sentence (`POST /api/sentences/{id}/hidden`). Returns its
+/// word. Showing one may give the word enough sentences for the sentence
+/// format (one-way upgrade, design §6.4); hiding never downgrades a card.
+pub fn hide_sentence(
+    tx: &Transaction<'_>,
+    sentence: i64,
+    hidden: bool,
+    now: &Moment,
+) -> Result<WordId, WorkflowError> {
+    let word = catalog::set_sentence_hidden(tx, sentence, hidden, &now.stamp())?;
+    refresh_cards(tx, word, now)?;
+    Ok(word)
+}
+
+/// Answer a pack's suggestion (`POST /api/conflicts/{id}`). Returns the word.
+pub fn resolve_conflict(
+    tx: &Transaction<'_>,
+    conflict: i64,
+    use_incoming: bool,
+    now: &Moment,
+) -> Result<WordId, WorkflowError> {
+    let word = catalog::resolve_conflict(tx, conflict, use_incoming, &now.stamp())?;
+    refresh_cards(tx, word, now)?;
+    Ok(word)
+}
+
+/// Delete a word: its cards and review history (scheduler), then everything
+/// the catalog holds about it. Its practice items go with its cards.
+pub fn delete_word(tx: &Transaction<'_>, id: WordId) -> Result<(), WorkflowError> {
+    if catalog::word_traits(tx, id)?.is_none() {
+        return Err(EditError::WordNotFound.into());
+    }
+    scheduler::delete_cards(tx, id)?;
+    catalog::delete_word(tx, id)?;
+    Ok(())
 }
 
 /// Make every stored word's cards match its traits (idempotent; design

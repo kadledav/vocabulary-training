@@ -20,14 +20,13 @@
 
 use std::collections::{HashMap, HashSet};
 
-use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::Serialize;
 use serde_json::Value;
 use vocab_pack::keys::{item_key, span_key};
 use vocab_pack::types::{PackSentence, PackWord, TagKind};
 
-use super::{SourceId, WordId};
+use super::{SourceId, WordId, scalar};
 
 /// Where an imported word comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,43 +193,16 @@ fn incoming_scalars(word: &PackWord) -> [(&'static str, Option<Value>); 11] {
     ]
 }
 
-fn find_word(conn: &Connection, key: &str) -> rusqlite::Result<Option<WordId>> {
+/// The word a pack headword key belongs to: by its own key, or by a key
+/// it had before the owner changed its headword (`word_alias`, R-04).
+pub(super) fn find_word(conn: &Connection, key: &str) -> rusqlite::Result<Option<WordId>> {
     conn.query_row(
-        "SELECT id FROM word WHERE headword_key = ?1",
+        "SELECT id FROM word WHERE headword_key = ?1 \
+         UNION ALL SELECT word_id FROM word_alias WHERE key = ?1 LIMIT 1",
         [key],
         |row| row.get(0).map(WordId),
     )
     .optional()
-}
-
-/// Current value of a scalar column as JSON (`spelling` as a boolean).
-fn current_scalar(conn: &Connection, word: WordId, field: &str) -> rusqlite::Result<Value> {
-    // `field` is one of the fixed names of `incoming_scalars`, never input.
-    let sql = format!("SELECT {field} FROM word WHERE id = ?1");
-    let value: SqlValue = conn.query_row(&sql, [word.0], |row| row.get(0))?;
-    Ok(match value {
-        SqlValue::Null => Value::Null,
-        SqlValue::Integer(i) if field == "spelling" => Value::Bool(i != 0),
-        SqlValue::Integer(i) => Value::from(i),
-        SqlValue::Real(r) => Value::from(r),
-        SqlValue::Text(t) => Value::String(t),
-        SqlValue::Blob(_) => Value::Null,
-    })
-}
-
-fn is_empty(value: &Value) -> bool {
-    match value {
-        Value::Null => true,
-        Value::String(s) => s.trim().is_empty(),
-        _ => false,
-    }
-}
-
-fn same(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::String(x), Value::String(y)) => x.trim() == y.trim(),
-        _ => a == b,
-    }
 }
 
 fn plan(conn: &Connection, source: SourceId, word: &PackWord) -> rusqlite::Result<Plan> {
@@ -257,15 +229,15 @@ fn plan(conn: &Connection, source: SourceId, word: &PackWord) -> rusqlite::Resul
     let mut conflicts = Vec::new();
     let mut spelling_after = None;
     for (field, incoming) in incoming_scalars(word) {
-        let current = current_scalar(conn, id, field)?;
+        let current = scalar::current(conn, id, field)?;
         if field == "spelling" {
             spelling_after = incoming.clone().or_else(|| Some(current.clone()));
         }
         let Some(incoming) = incoming else { continue };
-        if same(&current, &incoming) {
+        if scalar::same(&current, &incoming) {
             continue;
         }
-        if !overrides.contains(field) && is_empty(&current) {
+        if !overrides.contains(field) && scalar::is_empty(&current) {
             if field == "spelling" {
                 spelling_after = Some(incoming.clone());
             }
@@ -499,16 +471,6 @@ fn insert_word(
     Ok(WordId(tx.last_insert_rowid()))
 }
 
-fn to_sql(value: &Value) -> SqlValue {
-    match value {
-        Value::Null => SqlValue::Null,
-        Value::Bool(b) => SqlValue::Integer(i64::from(*b)),
-        Value::Number(n) => n.as_i64().map_or(SqlValue::Null, SqlValue::Integer),
-        Value::String(s) => SqlValue::Text(s.clone()),
-        other => SqlValue::Text(other.to_string()),
-    }
-}
-
 fn apply_existing(
     tx: &Transaction<'_>,
     id: WordId,
@@ -516,9 +478,7 @@ fn apply_existing(
     plan: &Plan,
 ) -> rusqlite::Result<()> {
     for (field, value) in &plan.fills {
-        // `field` is one of the fixed column names of `incoming_scalars`.
-        let sql = format!("UPDATE word SET {field} = ?1, updated_at = ?2 WHERE id = ?3");
-        tx.execute(&sql, params![to_sql(value), link.now, id.0])?;
+        scalar::write(tx, id, field, value, link.now)?;
     }
     for conflict in plan.conflicts.iter().filter(|c| !c.already_open) {
         let current = (!conflict.current.is_null()).then(|| conflict.current.to_string());

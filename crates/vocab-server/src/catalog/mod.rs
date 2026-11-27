@@ -14,22 +14,28 @@
 //! application. The import preview runs the real [`merge_word`] inside a
 //! transaction that is always rolled back (`workflows`).
 
+mod edit;
 mod merge;
 mod practice;
 mod read;
+mod scalar;
 mod source;
 mod speak;
 
 use serde::Serialize;
 
+pub use edit::{
+    EditError, ListKind, add_item, delete_word, remove_item, resolve_conflict, set_included,
+    set_sentence_hidden, set_suspended, update_sentence, update_word,
+};
 pub use merge::{ConflictReport, ImportLink, ItemsAdded, MergeOutcome, WordMerge, merge_word};
 pub use practice::{
     PracticeWord, WordTraits, all_traits, practice_words, source_exists, traits, word_traits,
 };
 pub use read::{
-    ConflictView, FormView, PresentedForm, PresentedSentence, PresentedTag, SentenceView,
-    SourceLinkView, SourceSummary, TextParts, WordPresentation, WordQuery, WordRow, WordView,
-    presentation, sources, word_view, words,
+    ConflictView, FormItemView, FormView, ItemLists, ItemView, PresentedForm, PresentedSentence,
+    PresentedTag, SentenceView, SourceLinkView, SourceSummary, TextParts, WordPresentation,
+    WordQuery, WordRow, WordView, presentation, sources, word_view, words,
 };
 pub use source::{ReadingUpdate, SourceUpsert, source_titles, upsert_source};
 pub use speak::{SpeakSource, speak_source, speak_sources};
