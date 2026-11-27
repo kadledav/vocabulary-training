@@ -491,3 +491,123 @@ async fn r55_practice_item_carries_the_flag_until_acknowledged() {
     let (_, current) = env.get("/api/sessions/current").await;
     assert_eq!(current["items"][0]["card"]["leech_flagged"], false);
 }
+
+/// Where the problem word `headword` shows: [Progress list, Today's
+/// count, the feedback export, the Words "problem" filter]. One rule, so
+/// always all four or none.
+async fn problem_everywhere(env: &Env, headword: &str) -> bool {
+    let progress = leech_list(env)
+        .await
+        .iter()
+        .any(|l| l["headword"] == headword);
+    let (_, today) = env.get("/api/today").await;
+    let today = today["problem_words"].as_i64().unwrap_or(0) > 0;
+    let (_, feedback) = env.get("/api/export/feedback").await;
+    let feedback = ["needs_hint", "hard_words"].iter().any(|list| {
+        feedback[*list]
+            .as_array()
+            .is_some_and(|l| l.iter().any(|w| w["word"] == headword))
+    });
+    let (_, words) = env.get("/api/words?status=leech").await;
+    let words = words
+        .as_array()
+        .or_else(|| words["words"].as_array())
+        .is_some_and(|l| l.iter().any(|w| w["headword"] == headword));
+    let found = [progress, today, feedback, words];
+    assert!(
+        found.iter().all(|f| *f) || found.iter().all(|f| !f),
+        "{headword}: one rule everywhere, got {found:?}"
+    );
+    progress
+}
+
+fn add_card(env: &Env, headword: &str, kind: &str, format: &str, leech: &str) {
+    env.exec(&format!(
+        "INSERT INTO card (word_id, kind, format, state, stability, difficulty, due_day, reps, \
+           lapses, leech, created_at) \
+         SELECT id, '{kind}', '{format}', 'review', 3.0, 6.0, '2026-11-25', 6, 5, '{leech}', \
+           '2026-11-10T09:00:00Z' FROM word WHERE headword = '{headword}'"
+    ));
+}
+
+#[tokio::test]
+async fn r55_a_suspended_card_or_word_is_no_problem_word_anywhere() {
+    let env = env();
+    // "Recognise only" on a word whose Produce card is the problem: the
+    // problem ends (the card is suspended), the word shows by its
+    // Understand card.
+    env.import(BOOK_A, vec![word("oscar", 7, 3)]).await;
+    understand(
+        &env,
+        "oscar",
+        40.0,
+        "2026-11-20",
+        "2026-11-01",
+        8,
+        0,
+        "none",
+    );
+    add_card(&env, "oscar", "produce", "cloze", "flagged");
+    let oscar = env.word_id("oscar").await.get();
+    assert!(problem_everywhere(&env, "oscar").await);
+    let (status, view) = action(&env, oscar, json!({ "action": "leech_recognise" })).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert!(!problem_everywhere(&env, "oscar").await);
+    let (_, words) = env.get("/api/words?q=oscar").await;
+    let row = &words.as_array().expect("rows")[0];
+    assert_eq!(row["status"], "known", "shown by its active cards");
+    // Back to active: the Produce card is practised again, and (only
+    // acknowledged, not yet remembered) a problem again.
+    let (status, _) = env
+        .request(
+            "PATCH",
+            &format!("/api/words/{oscar}"),
+            Some(&json!({ "goal": "active" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(problem_everywhere(&env, "oscar").await);
+    // A goal switch on the word screen ends it the same way.
+    let (status, _) = env
+        .request(
+            "PATCH",
+            &format!("/api/words/{oscar}"),
+            Some(&json!({ "goal": "recognise" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!problem_everywhere(&env, "oscar").await);
+
+    // The spelling switch turned off over a problem Spelling card.
+    env.import(BOOK_A, vec![word("papa", 7, 3)]).await;
+    understand(&env, "papa", 40.0, "2026-11-20", "2026-11-01", 8, 0, "none");
+    let papa = env.word_id("papa").await.get();
+    let patch = |body: Value| {
+        let env = &env;
+        async move {
+            env.request("PATCH", &format!("/api/words/{papa}"), Some(&body))
+                .await
+        }
+    };
+    assert_eq!(patch(json!({ "spelling": true })).await.0, StatusCode::OK);
+    if env.int("SELECT COUNT(*) FROM card WHERE kind = 'spelling'") == 0 {
+        add_card(&env, "papa", "spelling", "spelling", "none");
+    }
+    env.exec("UPDATE card SET leech = 'flagged', lapses = 5 WHERE kind = 'spelling'");
+    assert!(problem_everywhere(&env, "papa").await);
+    assert_eq!(patch(json!({ "spelling": false })).await.0, StatusCode::OK);
+    assert!(!problem_everywhere(&env, "papa").await);
+
+    // A suspended word with a flagged card (flagged before it was
+    // suspended, or "Suspend word" then unsuspended and flagged again).
+    let quebec = flagged_word(&env, "quebec", 5).await;
+    let (status, _) = action(&env, quebec, json!({ "action": "leech_suspend" })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!problem_everywhere(&env, "quebec").await);
+    env.exec("UPDATE card SET leech = 'flagged' WHERE word_id = (SELECT id FROM word WHERE headword = 'quebec')");
+    assert!(!problem_everywhere(&env, "quebec").await, "suspended word");
+    // Unsuspended: practised again, a problem again (everywhere).
+    let (status, _) = action(&env, quebec, json!({ "action": "unsuspend" })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(problem_everywhere(&env, "quebec").await);
+}

@@ -8,7 +8,6 @@
 //! * **Full** can be large (every review ever made): it is written row by
 //!   row to any [`Write`], never collected, so the HTTP layer can stream it.
 
-use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufWriter, Seek, Write};
 
@@ -21,7 +20,7 @@ use crate::catalog::{
 };
 use crate::clock::{Moment, StudyDay};
 use crate::db::{Db, TableError, TableSink};
-use crate::{importer, scheduler, settings};
+use crate::{importer, scheduler, settings, stats};
 
 /// `format` of the feedback export.
 pub const FEEDBACK_FORMAT: &str = "vocab-feedback";
@@ -82,6 +81,8 @@ pub enum ExportError {
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     Db(#[from] crate::db::DbError),
+    #[error(transparent)]
+    Stats(#[from] stats::StatsError),
     #[error("writing the export: {0}")]
     Io(#[from] std::io::Error),
     #[error("encoding the export: {0}")]
@@ -101,25 +102,9 @@ impl From<TableError> for ExportError {
     }
 }
 
-/// The problem words now (design §6.5: a flagged card, or an acknowledged
-/// one not yet remembered for three weeks), suspended words left out —
-/// the list the Progress screen shows.
-fn problem_word_ids(conn: &Connection) -> rusqlite::Result<Vec<catalog::WordId>> {
-    let mut ids: Vec<catalog::WordId> = scheduler::leech_cards(conn)?
-        .iter()
-        .filter(|c| c.is_problem())
-        .map(|c| c.word_id)
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect();
-    let traits = catalog::traits(conn, &ids)?;
-    ids.retain(|id| traits.get(id).is_some_and(|t| !t.suspended));
-    Ok(ids)
-}
-
 /// The feedback export on study day `day`.
 pub fn feedback(conn: &Connection, day: StudyDay) -> Result<FeedbackExport, ExportError> {
-    let problem = catalog::problem_words(conn, &problem_word_ids(conn)?)?;
+    let problem = catalog::problem_words(conn, &stats::problem_word_ids(conn)?)?;
     let (with_hint, without_hint): (Vec<_>, Vec<_>) =
         problem.into_iter().partition(|w| w.hint.is_some());
     let word = |w: catalog::ProblemWord| FeedbackWord {

@@ -207,7 +207,7 @@ pub fn progress(conn: &Connection, day: StudyDay) -> Result<ProgressView, StatsE
         let state = if row.suspended {
             WordState::Suspended
         } else {
-            WordState::Status(words::word_status(cards))
+            WordState::Status(words::word_status(false, cards))
         };
         let produce = words::can_produce(cards);
         totals.add(state, produce);
@@ -390,19 +390,10 @@ fn activity(conn: &Connection, day: StudyDay) -> Result<ActivityView, StatsError
     })
 }
 
-/// How many words are problem words now (not suspended), for Today's
-/// quiet link to Progress (R-55). Only the words with a leech flag are
-/// looked at.
+/// How many words are problem words now, for Today's quiet link to
+/// Progress (R-55).
 pub fn problem_word_count(conn: &Connection) -> Result<u32, StatsError> {
-    let mut ids: Vec<WordId> = scheduler::leech_cards(conn)?
-        .iter()
-        .filter(|c| c.is_problem())
-        .map(|c| c.word_id)
-        .collect();
-    ids.sort();
-    ids.dedup();
-    let traits = catalog::traits(conn, &ids)?;
-    Ok(count(traits.values().filter(|t| !t.suspended).count()))
+    Ok(count(words::problem_word_ids(conn)?.len()))
 }
 
 #[cfg(test)]

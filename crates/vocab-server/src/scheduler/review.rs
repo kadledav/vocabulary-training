@@ -62,8 +62,14 @@ impl Card {
     }
 
     /// Is the card still a problem card (design §6.5: a flagged card, or an
-    /// acknowledged one not yet remembered for three weeks)?
+    /// acknowledged one not yet remembered for three weeks)? A suspended
+    /// card is never one: it is not practised (the owner's choice, a goal
+    /// or the spelling switch), so it can neither fail nor recover; it
+    /// becomes one again only if it is practised again.
     pub fn is_problem(&self) -> bool {
+        if self.suspended {
+            return false;
+        }
         match self.leech {
             LeechState::None => false,
             LeechState::Flagged => true,

@@ -12,7 +12,7 @@ pub use progress::{
 };
 pub use words::{
     CardView, WordDetail, WordListQuery, WordListRow, WordSort, WordStatus, can_produce,
-    word_detail, word_list, word_status,
+    problem_word_ids, word_detail, word_list, word_status,
 };
 
 use std::collections::HashMap;

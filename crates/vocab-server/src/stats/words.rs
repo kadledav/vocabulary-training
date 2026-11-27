@@ -51,11 +51,37 @@ impl WordStatus {
     }
 }
 
+/// Is the word a problem word (R-55, design §6.5)? The one rule every
+/// screen and the feedback export use: the word is practised (not
+/// suspended) and one of its cards is a problem card (the scheduler owns
+/// the card rule; a suspended card never is one).
+pub fn is_problem_word(word_suspended: bool, cards: &[&Card]) -> bool {
+    !word_suspended && cards.iter().any(|c| c.is_problem())
+}
+
+/// The problem words now, by id (Today's count, the Progress list, the
+/// feedback export). Only the words with a leech flag are looked at.
+pub fn problem_word_ids(conn: &Connection) -> Result<Vec<WordId>, StatsError> {
+    let leech_cards = scheduler::leech_cards(conn)?;
+    let mut by_word: HashMap<WordId, Vec<&Card>> = HashMap::new();
+    for card in &leech_cards {
+        by_word.entry(card.word_id).or_default().push(card);
+    }
+    let mut ids: Vec<WordId> = by_word.keys().copied().collect();
+    ids.sort();
+    let traits = catalog::traits(conn, &ids)?;
+    ids.retain(|id| {
+        traits
+            .get(id)
+            .is_some_and(|t| is_problem_word(t.suspended, &by_word[id]))
+    });
+    Ok(ids)
+}
+
 /// The status of a word from its cards (the Understand card's memory; a
-/// leech flag on any card).
-pub fn word_status(cards: &[&Card]) -> WordStatus {
-    // The scheduler owns the leech rule (design §6.5).
-    if cards.iter().any(|c| c.is_problem()) {
+/// problem card, unless the word is suspended).
+pub fn word_status(word_suspended: bool, cards: &[&Card]) -> WordStatus {
+    if is_problem_word(word_suspended, cards) {
         return WordStatus::Leech;
     }
     let Some(understand) = cards.iter().find(|c| c.kind == CardKind::Understand) else {
@@ -151,7 +177,7 @@ pub fn word_list(conn: &Connection, query: &WordListQuery) -> Result<Vec<WordLis
         .map(|word| {
             let cards = by_word.get(&word.id).map_or(&[][..], Vec::as_slice);
             WordListRow {
-                status: word_status(cards),
+                status: word_status(word.suspended, cards),
                 next_due: next_due(word.suspended, cards),
                 word,
             }
@@ -237,7 +263,7 @@ pub fn word_detail(
     let model = scheduler::model(conn)?;
     let cards = scheduler::cards_of_word(conn, id)?;
     let refs: Vec<&Card> = cards.iter().collect();
-    let status = word_status(&refs);
+    let status = word_status(traits.suspended, &refs);
     let cards = cards
         .into_iter()
         .map(|card| CardView {
@@ -284,8 +310,8 @@ mod tests {
 
     #[test]
     fn r73_status_follows_the_understand_card() {
-        let status = |c: Card| word_status(&[&c]);
-        assert_eq!(word_status(&[]), WordStatus::New);
+        let status = |c: Card| word_status(false, &[&c]);
+        assert_eq!(word_status(false, &[]), WordStatus::New);
         assert_eq!(
             status(card(CardKind::Understand, CardState::New, None)),
             WordStatus::New
@@ -317,11 +343,46 @@ mod tests {
         let understand = card(CardKind::Understand, CardState::Review, Some(40.0));
         let mut produce = card(CardKind::Produce, CardState::Review, Some(3.0));
         produce.leech = LeechState::Flagged;
-        assert_eq!(word_status(&[&understand, &produce]), WordStatus::Leech);
+        assert_eq!(
+            word_status(false, &[&understand, &produce]),
+            WordStatus::Leech
+        );
         produce.leech = LeechState::Acknowledged;
-        assert_eq!(word_status(&[&understand, &produce]), WordStatus::Leech);
+        assert_eq!(
+            word_status(false, &[&understand, &produce]),
+            WordStatus::Leech
+        );
         produce.stability = Some(21.0);
-        assert_eq!(word_status(&[&understand, &produce]), WordStatus::Known);
+        assert_eq!(
+            word_status(false, &[&understand, &produce]),
+            WordStatus::Known
+        );
+    }
+
+    #[test]
+    fn r55_suspension_ends_the_problem_card_or_word_alike() {
+        let understand = card(CardKind::Understand, CardState::Review, Some(40.0));
+        let mut produce = card(CardKind::Produce, CardState::Review, Some(3.0));
+        produce.leech = LeechState::Acknowledged;
+        assert!(is_problem_word(false, &[&understand, &produce]));
+        // "Recognise only", a goal switch or the spelling switch suspend
+        // the card: the word shows by its remaining cards.
+        produce.suspended = true;
+        assert!(!is_problem_word(false, &[&understand, &produce]));
+        assert_eq!(
+            word_status(false, &[&understand, &produce]),
+            WordStatus::Known
+        );
+        // Practised again: a problem again until it is remembered.
+        produce.suspended = false;
+        assert!(is_problem_word(false, &[&understand, &produce]));
+        // A suspended word is no problem word, whatever its cards.
+        produce.leech = LeechState::Flagged;
+        assert!(!is_problem_word(true, &[&understand, &produce]));
+        assert_eq!(
+            word_status(true, &[&understand, &produce]),
+            WordStatus::Known
+        );
     }
 
     #[test]
