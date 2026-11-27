@@ -9,7 +9,6 @@
 
 import { onBusy, onUnauthenticated } from './api.js';
 import { goToLogin } from './auth.js';
-import { primeClips } from './clips.js';
 import { h, mount } from './dom.js';
 import { startRouter } from './router.js';
 import { renderImport } from './screens/import.js';
@@ -57,9 +56,6 @@ if (root) {
   });
   root.before(header, busy);
   mount(root, content);
-  // The first tap or key press anywhere unlocks the media element (iOS), so
-  // a Spelling card can later play its word by itself (design §7.4).
-  for (const type of ['click', 'keydown']) document.addEventListener(type, primeClips, { capture: true, passive: true });
   /** @type {(() => void) | null} */
   let leave = null;
   startRouter((route, isCurrent) => {

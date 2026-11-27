@@ -14,9 +14,9 @@
  *
  * Spelling: the same answer field and buttons (no hint); the question is
  * the word's audio — it starts by itself where the browser lets it (the
- * shared media element was unlocked by an earlier tap), else ▶ Listen is
- * marked and says to tap it; a ▶ also sits next to the field, so it stays
- * in reach above the on-screen keyboard. The check is strict and the answer
+ * shared media element was unlocked by an earlier tap in the block), else
+ * ▶ Listen is marked and says to tap it; a ▶ also sits next to the field,
+ * so it stays in reach above the on-screen keyboard. The check is strict and the answer
  * side shows the letter diff and the spelling note. Without any sound on
  * this device the Czech gloss is the cue (never a dead end).
  *
@@ -36,7 +36,7 @@
  * the owner retries the same rating or first finds out what was saved.
  */
 
-import { clipFor, clipsFor, playClip, preloadClips, stopClip } from '../clips.js';
+import { clipFor, clipsFor, playClip, preloadClips, primeClips, stopClip } from '../clips.js';
 import { h, mount } from '../dom.js';
 import { keyAction, keyTarget } from '../keys.js';
 import {
@@ -1471,6 +1471,16 @@ export function renderPractice(root, isCurrent) {
   };
   screen.addEventListener('pointerdown', onPointerDown, true);
 
+  /**
+   * In a block with Spelling cards, a tap or key press unlocks the media
+   * element (iOS), so the next Spelling card can play its word by itself.
+   */
+  const onGesture = () => {
+    if (state.session?.items.some((item) => isSpelling(item))) primeClips();
+  };
+  screen.addEventListener('click', onGesture, true);
+  document.addEventListener('keydown', onGesture, true);
+
   // ── load ─────────────────────────────────────────────────────────────────
 
   /** @param {Session} session @param {number} finishedBlocks */
@@ -1525,6 +1535,8 @@ export function renderPractice(root, isCurrent) {
     viewport?.removeEventListener('resize', onViewport);
     viewport?.removeEventListener('scroll', onViewport);
     screen.removeEventListener('pointerdown', onPointerDown, true);
+    screen.removeEventListener('click', onGesture, true);
+    document.removeEventListener('keydown', onGesture, true);
     toast.clearTimer();
     if (savingTimer !== null) clearTimeout(savingTimer);
     if (guardTimer !== null) clearTimeout(guardTimer);
