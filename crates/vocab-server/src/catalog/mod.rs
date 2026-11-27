@@ -22,6 +22,7 @@ mod merge;
 mod practice;
 mod read;
 mod scalar;
+mod snapshot;
 mod source;
 mod speak;
 
@@ -41,6 +42,10 @@ pub use read::{
     ConflictView, FormItemView, FormView, ItemLists, ItemView, PresentedForm, PresentedSentence,
     PresentedTag, SentenceView, SourceLinkView, SourceSummary, TextParts, WordPresentation,
     WordQuery, WordRow, WordView, presentation, sources, word_view, words,
+};
+pub use snapshot::{
+    WordSnapshot, restore as restore_word, snapshot as word_snapshot, word_of_conflict,
+    word_of_sentence,
 };
 pub use source::{ReadingUpdate, SourceUpsert, source_titles, upsert_source};
 pub use speak::{SpeakSource, speak_source, speak_sources};

@@ -232,7 +232,7 @@ pub struct ConflictView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ItemView {
     pub value: String,
-    /// `item_key`: names the item in `DELETE …/items/{kind}/{key}`.
+    /// `item_key`: names the item in `DELETE /api/words/{id}/items` `{kind, key}`.
     pub key: String,
     /// Added by the owner (for `accepted`: the owner's own answers).
     pub mine: bool,

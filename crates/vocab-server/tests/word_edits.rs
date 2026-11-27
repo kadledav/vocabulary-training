@@ -368,8 +368,9 @@ async fn r04_removed_items_and_forms_never_come_back_but_can_be_added_again() {
         ("confusable", "loll"),
         ("form", "lulling"),
     ] {
-        let uri = format!("/api/words/{id}/items/{kind}/{}", encode(key));
-        let (status, view) = env.request("DELETE", &uri, Some(&json!({}))).await;
+        let uri = format!("/api/words/{id}/items");
+        let body = json!({ "kind": kind, "key": key });
+        let (status, view) = env.request("DELETE", &uri, Some(&body)).await;
         assert_eq!(status, StatusCode::OK, "{kind}: {view}");
     }
     env.import(BOOK, vec![lull()]).await;
@@ -386,8 +387,14 @@ async fn r04_removed_items_and_forms_never_come_back_but_can_be_added_again() {
     assert_eq!(view["czech"], json!(["ukolébat"]));
 
     // The last Czech equivalent stays.
-    let uri = format!("/api/words/{id}/items/czech/{}", encode("ukolébat"));
-    let (status, body) = env.request("DELETE", &uri, Some(&json!({}))).await;
+    let uri = format!("/api/words/{id}/items");
+    let (status, body) = env
+        .request(
+            "DELETE",
+            &uri,
+            Some(&json!({ "kind": "czech", "key": "ukolébat" })),
+        )
+        .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     assert_eq!(body["error"]["code"], "last_czech");
 
@@ -440,19 +447,6 @@ async fn r04_removed_items_and_forms_never_come_back_but_can_be_added_again() {
             .len(),
         3
     );
-}
-
-/// Percent-encode a path segment (the item keys are Czech words).
-fn encode(text: &str) -> String {
-    text.bytes()
-        .map(|b| {
-            if b.is_ascii_alphanumeric() || b == b'-' {
-                (b as char).to_string()
-            } else {
-                format!("%{b:02X}")
-            }
-        })
-        .collect()
 }
 
 #[tokio::test]
@@ -882,8 +876,8 @@ async fn r04_owner_accepted_answers_and_the_packs_are_one_list() {
     let (status, _) = env
         .request(
             "DELETE",
-            &format!("/api/words/{id}/items/accepted/lulled"),
-            Some(&json!({})),
+            &format!("/api/words/{id}/items"),
+            Some(&json!({ "kind": "accepted", "key": "lulled" })),
         )
         .await;
     assert_eq!(status, StatusCode::OK);
@@ -908,8 +902,8 @@ async fn r04_owner_accepted_answers_and_the_packs_are_one_list() {
     let (status, view) = env
         .request(
             "DELETE",
-            &format!("/api/words/{id}/items/accepted/lulling"),
-            Some(&json!({})),
+            &format!("/api/words/{id}/items"),
+            Some(&json!({ "kind": "accepted", "key": "lulling" })),
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{view}");

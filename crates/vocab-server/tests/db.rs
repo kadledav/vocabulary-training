@@ -34,6 +34,7 @@ const TABLES: &[&str] = &[
     "word_override",
     "word_pack_spelling",
     "word_source",
+    "word_undo",
 ];
 
 fn data_dir() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -107,7 +108,9 @@ fn r85_synthetic_fixture_satisfies_every_constraint() {
         tx.execute_batch(
             "INSERT INTO audio_engine (id, frontend, engine, checked_at) \
              VALUES (1, 'g2p-2', 'kokoro-test', '2026-11-17T10:00:00Z'); \
-             INSERT INTO word_pack_spelling (key, word_id, headword) VALUES ('test-former-key', 1, 'Test-former-key');",
+             INSERT INTO word_pack_spelling (key, word_id, headword) VALUES ('test-former-key', 1, 'Test-former-key'); \
+             INSERT INTO word_undo (word_id, token, expires_at, before_json, after_json) \
+             VALUES (1, '00112233445566778899aabbccddeeff', '2026-11-17T10:10:00Z', '{}', '{}');",
         )
         .map_err(DbError::from)
     }))

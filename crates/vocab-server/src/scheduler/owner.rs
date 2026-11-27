@@ -1,11 +1,12 @@
 //! What the Words screens read and change in the scheduler (design §7.1
 //! screens 6 and 7): every card at once for the word list, a word's review
-//! history, "Reset card" and the cards of a deleted word.
+//! history, "Reset card", the cards of a deleted word, and the cards'
+//! state before and after an owner change (its Undo, design §8).
 
 use rusqlite::{Connection, Transaction, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use super::cards::Card;
+use super::cards::{self, Card, Snapshot};
 use super::{CardFormat, CardId, CardKind, ReviewId};
 use crate::catalog::WordId;
 use crate::clock::{Moment, StudyDay};
@@ -99,4 +100,40 @@ pub fn reset_card(
 /// cascade of `session_item`). Returns how many cards were deleted.
 pub fn delete_cards(tx: &Transaction<'_>, word: WordId) -> rusqlite::Result<usize> {
     tx.execute("DELETE FROM card WHERE word_id = ?1", [word.get()])
+}
+
+/// The scheduling state of every card of a word (opaque to other modules):
+/// taken before and after an owner change, written back by its Undo.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CardsSnapshot(Vec<(i64, Snapshot)>);
+
+/// The state of the word's cards now.
+pub fn cards_snapshot(conn: &Connection, word: WordId) -> rusqlite::Result<CardsSnapshot> {
+    Ok(CardsSnapshot(
+        cards::cards_of_word(conn, word)?
+            .iter()
+            .map(|card| (card.id.get(), Snapshot::of(card)))
+            .collect(),
+    ))
+}
+
+/// Put the word's cards back to `before`: each card's state as it was, and
+/// a card the change created (unlocked) deleted again while nobody has
+/// reviewed it. The caller has checked that the cards are exactly as the
+/// change left them.
+pub fn restore_cards(
+    tx: &Transaction<'_>,
+    word: WordId,
+    before: &CardsSnapshot,
+) -> rusqlite::Result<()> {
+    let created: Vec<CardId> = cards::cards_of_word(tx, word)?
+        .iter()
+        .map(|card| card.id)
+        .filter(|id| !before.0.iter().any(|(known, _)| *known == id.get()))
+        .collect();
+    cards::delete_unreviewed(tx, &created)?;
+    for (id, snapshot) in &before.0 {
+        snapshot.restore(tx, CardId::new(*id))?;
+    }
+    Ok(())
 }

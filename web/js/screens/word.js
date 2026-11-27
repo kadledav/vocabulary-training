@@ -480,7 +480,7 @@ export async function renderWord(root, id, isCurrent) {
     const remove = async (item) => {
       problem.textContent = '';
       const failed = await change(
-        () => /** @type {Promise<DetailAnswer>} */ (deleteJson(`${url}/items/${kind}/${encodeURIComponent(item.key)}`)),
+        () => /** @type {Promise<DetailAnswer>} */ (deleteJson(`${url}/items`, { kind, key: item.key })),
         {
           done: `Removed “${text(item)}”.`,
           focusId: inputId,
@@ -508,7 +508,7 @@ export async function renderWord(root, id, isCurrent) {
           undo: (before, after) => {
             const old = new Set(/** @type {(Item | FormItem)[]} */ (before.items[prop]).map((i) => i.key));
             const added = /** @type {(Item | FormItem)[]} */ (after.items[prop]).find((i) => !old.has(i.key));
-            return added ? () => /** @type {Promise<DetailAnswer>} */ (deleteJson(`${url}/items/${kind}/${encodeURIComponent(added.key)}`)) : null;
+            return added ? () => /** @type {Promise<DetailAnswer>} */ (deleteJson(`${url}/items`, { kind, key: added.key })) : null;
           },
         },
       );

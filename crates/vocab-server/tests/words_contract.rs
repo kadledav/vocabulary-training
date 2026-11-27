@@ -252,22 +252,54 @@ async fn r04_items_actions_and_conflicts_check_their_input() {
         .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     assert_eq!(body["error"]["code"], "too_many_items");
-    for (uri, status) in [
+    for (uri, body, status) in [
         (
-            format!("/api/words/{id}/items/czech/nothing"),
+            format!("/api/words/{id}/items"),
+            json!({ "kind": "czech", "key": "nothing" }),
             StatusCode::NOT_FOUND,
         ),
         (
-            format!("/api/words/{id}/items/bogus/x"),
-            StatusCode::NOT_FOUND,
+            format!("/api/words/{id}/items"),
+            json!({ "kind": "bogus", "key": "x" }),
+            StatusCode::UNPROCESSABLE_ENTITY,
         ),
         (
-            "/api/words/99999/items/czech/x".to_owned(),
+            format!("/api/words/{id}/items"),
+            json!({ "kind": "czech" }),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/api/words/99999/items".to_owned(),
+            json!({ "kind": "czech", "key": "x" }),
             StatusCode::NOT_FOUND,
         ),
     ] {
-        let (got, body) = env.request("DELETE", &uri, Some(&json!({}))).await;
-        assert_eq!(got, status, "{uri}: {body}");
+        let (got, answer) = env.request("DELETE", &uri, Some(&body)).await;
+        assert_eq!(got, status, "{uri} {body}: {answer}");
+    }
+    // Finding: keys that URL normalisation would mangle (`.`, `..`, a
+    // slash) are addressed in the body and removed like any other.
+    for value in [".", "..", "a/b", "%2e"] {
+        let (status, _) = env
+            .post(&items, &json!({ "kind": "czech", "value": value }))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let (status, view) = env
+            .request(
+                "DELETE",
+                &items,
+                Some(&json!({ "kind": "czech", "key": value })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{value}: {view}");
+        assert!(
+            view["items"]["czech"]
+                .as_array()
+                .expect("czech")
+                .iter()
+                .all(|i| i["key"] != value),
+            "{value}"
+        );
     }
 
     let actions = format!("/api/words/{id}/actions");

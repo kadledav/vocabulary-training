@@ -18,5 +18,6 @@ pub mod scheduler;
 pub mod session;
 pub mod settings;
 pub mod stats;
+pub mod undo;
 pub mod web_assets;
 pub mod workflows;

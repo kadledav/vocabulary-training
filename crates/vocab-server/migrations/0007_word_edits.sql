@@ -51,3 +51,15 @@ END;
 CREATE TRIGGER field_conflict_id_floor AFTER DELETE ON field_conflict BEGIN
   UPDATE id_floor SET last_id = MAX(last_id, OLD.id) WHERE name = 'field_conflict';
 END;
+
+-- 5. `word_undo`: the Undo of the owner's latest change to a word (design
+--    §8 `POST /api/words/{id}/undo`): the word's state before and after the
+--    change. Valid for a short time, once, and only while the word is
+--    still exactly as the change left it; a newer change replaces it.
+CREATE TABLE word_undo (
+  word_id     INTEGER PRIMARY KEY REFERENCES word(id) ON DELETE CASCADE,
+  token       TEXT NOT NULL,                              -- 128 random bits, hex
+  expires_at  TEXT NOT NULL,
+  before_json TEXT NOT NULL,
+  after_json  TEXT NOT NULL
+) STRICT;
