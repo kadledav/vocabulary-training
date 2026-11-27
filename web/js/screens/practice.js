@@ -34,6 +34,7 @@ import { keyAction, keyTarget } from '../keys.js';
 import { answerView, checkResult, criterion, produceQuestion, questionView, revealLabel, typedHint } from '../practice/card.js';
 import {
   TYPED_MAX,
+  answersFor,
   canAddAccepted,
   checkTyped,
   checkable,
@@ -55,6 +56,7 @@ import {
   progress,
   wordSpeech,
 } from '../practice/model.js';
+import { clearDraft, loadDraft, saveDraft } from '../practice/draft.js';
 import { legend, legendLine, ratingBar, suggestionLine } from '../practice/rating-bar.js';
 import {
   INPUT_GUARD_MS,
@@ -101,55 +103,14 @@ const SHORTCUTS = [
   ['?', 'this help'],
 ];
 
+/** Below this visible height with the keyboard open, the bottom bar is compact. */
+const KEYBOARD_TIGHT_PX = 300;
 /** "Saving…" appears only when a request takes longer than this. */
 const SAVING_DELAY_MS = 150;
 /** The "already saved" toast stays longer: it asks for a check. */
 const ALREADY_SAVED_TOAST_MS = 8000;
 /** The silent-switch hint has been dismissed on this device. */
 const SILENT_HINT_KEY = 'vocab.silent-hint-seen';
-/** What is being typed for a Produce card, kept across a reload (this tab only). */
-const DRAFT_KEY = 'vocab.typed-draft';
-
-/**
- * The typed draft of item `itemId`, if this tab has one.
- *
- * @param {number} itemId
- * @returns {{ typed: string, hint: boolean } | null}
- */
-function loadDraft(itemId) {
-  try {
-    const raw = sessionStorage.getItem(DRAFT_KEY);
-    const draft = raw ? JSON.parse(raw) : null;
-    if (draft && draft.itemId === itemId && typeof draft.typed === 'string') {
-      return { typed: draft.typed.slice(0, TYPED_MAX), hint: draft.hint === true };
-    }
-  } catch {
-    // No storage or a damaged entry: no draft.
-  }
-  return null;
-}
-
-/**
- * @param {number} itemId
- * @param {string} typed
- * @param {boolean} hintShown
- */
-function saveDraft(itemId, typed, hintShown) {
-  try {
-    sessionStorage.setItem(DRAFT_KEY, JSON.stringify({ itemId, typed, hint: hintShown }));
-  } catch {
-    // No storage: the draft lives only on screen.
-  }
-}
-
-function clearDraft() {
-  try {
-    sessionStorage.removeItem(DRAFT_KEY);
-  } catch {
-    // Nothing stored.
-  }
-}
-
 /** Is this a touch device (where the phone's silent switch may mute speech)? */
 function touchDevice() {
   return typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
@@ -278,6 +239,13 @@ export function renderPractice(root, isCurrent) {
   /** Items whose typed answer was added to the accepted answers. */
   /** @type {Set<number>} */
   const acceptedItems = new Set();
+  /**
+   * Answers accepted with "Also accept" in this visit, by word id: every
+   * later item of the word (a repeat in this block) accepts them at once.
+   *
+   * @type {Map<number, string[]>}
+   */
+  const alsoAccepted = new Map();
   const speechOk = speechAvailable();
   prepareSpeech();
   /** Recorded-clip info per word id, as far as it has arrived (M6). */
@@ -328,6 +296,21 @@ export function renderPractice(root, isCurrent) {
     const inset = Math.max(0, Math.round(window.innerHeight - viewport.height - viewport.offsetTop));
     screen.style.setProperty('--keyboard-inset', `${inset}px`);
     screen.classList.toggle('keyboard-open', inset > 0);
+    // Little room left (a phone in landscape with the keyboard open): the
+    // bar shrinks to the answer field so the sentence with the blank stays
+    // in view above it.
+    const tight = inset > 0 && viewport.height < KEYBOARD_TIGHT_PX;
+    screen.classList.toggle('keyboard-tight', tight);
+    if (tight) keepClozeInView();
+  };
+  /** Scroll the blanked sentence into the room above the bottom bar. */
+  const keepClozeInView = () => {
+    const cloze = body.querySelector('[data-testid="cloze"]');
+    if (!(cloze instanceof HTMLElement)) return;
+    const room = bottom.getBoundingClientRect().top;
+    const box = cloze.getBoundingClientRect();
+    if (box.bottom > room) window.scrollBy(0, Math.min(box.top, box.bottom - room + 4));
+    else if (box.top < 0) window.scrollBy(0, box.top - 4);
   };
   viewport?.addEventListener('resize', onViewport);
   viewport?.addEventListener('scroll', onViewport);
@@ -354,7 +337,7 @@ export function renderPractice(root, isCurrent) {
   });
   answerInput.addEventListener('input', () => {
     state.typed = answerInput.value;
-    if (state.item) saveDraft(state.item.item_id, state.typed, state.hintShown);
+    if (state.item) saveDraft(state.item.item_id, { typed: state.typed, hint: state.hintShown, check: null });
   });
   answerInput.addEventListener('keydown', (event) => {
     if (event.key !== 'Enter' || event.isComposing) return;
@@ -769,13 +752,13 @@ export function renderPractice(root, isCurrent) {
 
   /**
    * A fresh question side for `item`: nothing typed — or what this tab
-   * typed for it before a reload — no hint, no check.
+   * typed for it before a reload — no hint, no check. Drafts of other
+   * items stay.
    *
    * @param {Item | null} item
    */
   const resetTyped = (item) => {
     const draft = item && isTyped(item) ? loadDraft(item.item_id) : null;
-    if (!draft) clearDraft();
     state.typed = draft?.typed ?? '';
     state.hintShown = draft?.hint ?? false;
     state.check = null;
@@ -818,14 +801,24 @@ export function renderPractice(root, isCurrent) {
     state.moreOpen = check ? moreOpenAfterCheck(item, check.match) : moreOpenOnReveal(item);
   };
 
-  /** Show the next unanswered item (or the "complete" state). */
+  /**
+   * Show the next unanswered item (or the "complete" state). A Produce
+   * card checked before a reload returns to its checked answer side.
+   */
   const advance = () => {
     const session = state.session;
     if (!session) return;
-    state.item = currentItem(session);
-    resetTyped(state.item);
-    setPhase(state.item ? 'question' : 'complete');
-    state.moreOpen = false;
+    const item = currentItem(session);
+    const stored = item && isTyped(item) ? loadDraft(item.item_id)?.check ?? null : null;
+    if (item && stored) {
+      checks.set(item.item_id, stored);
+      reopen(item);
+    } else {
+      state.item = item;
+      resetTyped(item);
+      setPhase(item ? 'question' : 'complete');
+      state.moreOpen = false;
+    }
     state.shownAt = now();
     stopClip();
     render({ focus: true, scroll: true });
@@ -891,7 +884,8 @@ export function renderPractice(root, isCurrent) {
     checks.set(item.item_id, check);
     state.accept = acceptStateFor(item, check);
     state.typedNote = '';
-    clearDraft();
+    // A reload now returns to this answer side, not to an empty question.
+    saveDraft(item.item_id, { typed: check.typed ?? state.typed, hint: check.hintUsed, check });
     setPhase('answer');
     state.revealedAt = state.phaseAt;
     state.moreOpen = moreOpenAfterCheck(item, check.match);
@@ -899,7 +893,9 @@ export function renderPractice(root, isCurrent) {
     answerInput.blur();
     render({ focus: true, scroll: true });
     const answer = expectedAnswer(item);
-    if (check.match === 'exact') announce('Correct: ', h('span', { lang: 'en' }, answer), '.');
+    if (check.verdict === 'correct') announce('Correct: ', h('span', { lang: 'en' }, answer), '.');
+    else if (check.verdict === 'right_word') announce('Right word. Here it is: ', h('span', { lang: 'en' }, answer), '.');
+    else if (check.verdict === 'alternative') announce('Accepted. This sentence has ', h('span', { lang: 'en' }, answer), '.');
     else if (check.match === 'none') announce('Not quite. You typed ', h('span', { lang: 'en' }, check.typed ?? ''), '; the answer is ', h('span', { lang: 'en' }, answer), '.');
     else announce('The answer: ', h('span', { lang: 'en' }, answer), '.');
   };
@@ -918,7 +914,7 @@ export function renderPractice(root, isCurrent) {
       announce(state.typedNote);
       return;
     }
-    showChecked(checkTyped(typed, item.accept, state.hintShown));
+    showChecked(checkTyped(typed, answersFor(item, alsoAccepted.get(item.word.id)), state.hintShown));
   };
 
   const giveUp = () => {
@@ -934,7 +930,7 @@ export function renderPractice(root, isCurrent) {
     const item = state.item;
     if (state.phase !== 'question' || !item || !isTyped(item) || state.hintShown) return;
     state.hintShown = true;
-    saveDraft(item.item_id, answerInput.value, true);
+    saveDraft(item.item_id, { typed: answerInput.value, hint: true, check: null });
     renderBody();
     renderBottom();
     answerInput.focus({ preventScroll: true });
@@ -959,11 +955,16 @@ export function renderPractice(root, isCurrent) {
     renderBody();
     const answer = await acceptAnswer(item.word.id, check.typed);
     if (!isCurrent()) return;
-    if (answer.ok) acceptedItems.add(item.item_id);
+    // Already on the list (added elsewhere meanwhile): just as good.
+    const added = answer.ok || answer.code === 'item_exists';
+    if (added) {
+      acceptedItems.add(item.item_id);
+      alsoAccepted.set(item.word.id, [...(alsoAccepted.get(item.word.id) ?? []), check.typed]);
+    }
     // Still on that card: show the outcome there.
     if (state.item?.item_id !== item.item_id || state.phase === 'question' || state.phase === 'complete') return;
-    state.accept = answer.ok ? 'saved' : 'failed';
-    if (answer.ok) clearError();
+    state.accept = added ? 'saved' : 'failed';
+    if (added) clearError();
     else showError(`“${check.typed}” was not added because ${reason(answer)}. Try again.`);
     renderBody();
   };
@@ -1036,6 +1037,7 @@ export function renderPractice(root, isCurrent) {
    * @param {number} itemId
    */
   const showAlreadySaved = (itemId) => {
+    clearDraft(itemId);
     const grade = storedGrade(itemId);
     const item = state.session?.items.find((i) => i.item_id === itemId) ?? null;
     if (!grade || !item) {
@@ -1098,6 +1100,7 @@ export function renderPractice(root, isCurrent) {
       return;
     }
     clearError();
+    clearDraft(pending.itemId);
     state.pending = null;
     state.unsure = null;
     state.chosen = null;

@@ -359,3 +359,178 @@ test('R-52 Today counts the Produce cards waiting and the daily limit is a setti
   await expect(page).toHaveURL(/#\/practice$/);
   await expect(page.getByTestId('progress')).toHaveText('1 / 3');
 });
+
+/** A word whose sentence wants a form other than the headword. */
+const FORMS_PACK = {
+  format: 'vocab-pack',
+  format_version: 1,
+  pack_id: 'test-e2e-forms--2026-11-01--1',
+  exported_at: '2026-11-01',
+  source: { id: 'test-e2e-forms', type: 'article', title: 'An E2E Forms Article' },
+  words: [
+    {
+      headword: 'plindle',
+      meaning: 'To coil a rope neatly.',
+      czech: ['smotat'],
+      usefulness: 10,
+      goal: 'active',
+      forms: [
+        { form: 'plindles', common: true },
+        { form: 'plindled', common: true },
+      ],
+      accepted: ['plindle', 'plindled'],
+      sentences: [{ en: 'She [[plindled]] the rope on the deck.', cs: 'Na palubě [[smotala]] lano.', origin: 'example', location: null }],
+    },
+  ],
+};
+
+test('R-56 another form is the right word (3); "also accept" reaches the repeat, an existing entry is fine', async ({ page, app, pageErrors }, info) => {
+  test.skip(info.project.name !== 'chromium-desktop', 'one flow is enough');
+  const report = await app.api('POST', '/api/import/commit', { text: JSON.stringify(FORMS_PACK) });
+  expect(report.packs[0].status).toBe('imported');
+  await waitingProduce(app, ['plindle', 'brontle']);
+  await startProduceBlock(page, app);
+
+  // 1 · plindle: the headword where the sentence needs "plindled".
+  await input(page).fill('plindle');
+  await page.getByTestId('check').click();
+  await expect(page.getByTestId('check-result')).toHaveAttribute('data-match', 'right_word');
+  await expect(page.getByTestId('check-result')).toHaveText('Right word — here it is “plindled”');
+  await expect(page.getByTestId('check-result')).not.toContainText('Correct');
+  await expect(page.getByTestId('suggestion')).toContainText('Suggested: 3');
+  await expect(page.getByTestId('accept-typed')).toHaveCount(0);
+  await advanceClock(page, 650);
+  await page.keyboard.press('Enter');
+  await expect(page.getByTestId('toast')).toContainText('Rated 3');
+
+  // 2 · brontle: a miss; the answer is meanwhile added elsewhere (409).
+  await expectQuestion(page, 'brontle');
+  await advanceClock(page, 300);
+  await input(page).fill('brontel');
+  await page.getByTestId('check').click();
+  await expect(page.getByTestId('check-result')).toHaveAttribute('data-match', 'none');
+  await app.api('POST', `/api/words/${await wordId(app, 'brontle')}/items`, { kind: 'accepted', value: 'brontel' });
+  await page.getByTestId('accept-typed').click();
+  await expect(page.getByTestId('accepted-note')).toHaveText('“brontel” will be accepted next time.');
+  await expect(page.getByTestId('practice-error')).toBeEmpty();
+  await advanceClock(page, 650);
+  await page.getByRole('button', { name: /^Rate 4,/ }).click();
+  await expect(page.getByTestId('toast')).toContainText('Rated 4');
+  await advanceClock(page, 700);
+  await page.getByTestId('next').click();
+
+  // 3 · the repeat of brontle in the same block accepts it at once.
+  await expectQuestion(page, 'brontle');
+  await advanceClock(page, 300);
+  await input(page).fill('brontel');
+  await page.getByTestId('check').click();
+  await expect(page.getByTestId('check-result')).not.toHaveAttribute('data-match', 'none');
+  await expect(page.getByTestId('suggestion')).toContainText('Suggested: 3');
+  await advanceClock(page, 650);
+  await page.keyboard.press('Enter');
+  await expect(page.getByRole('heading', { name: 'Block complete' })).toBeVisible();
+  // The 409 of the entry added meanwhile is the one failure the page logs.
+  for (let i = pageErrors.length - 1; i >= 0; i -= 1) if (/409/.test(pageErrors[i] ?? '')) pageErrors.splice(i, 1);
+
+  expect(storedReviews(app).map((r) => [r.headword, r.raw_grade, r.suggested_grade, r.typed_answer, r.answer_match])).toEqual([
+    ['plindle', 3, 3, 'plindle', 'exact'],
+    ['brontle', 4, 4, 'brontel', 'none'],
+    ['brontle', 3, 3, 'brontel', 'exact'],
+  ]);
+});
+
+test('R-56 a reload after Check returns to the checked answer; Undo after a reload keeps the next draft', async ({ page, app, pageErrors }) => {
+  void pageErrors;
+  await waitingProduce(app, ['glimmerous', 'brontle']);
+  await startProduceBlock(page, app);
+
+  await input(page).fill('glimmerus');
+  await page.getByTestId('hint-button').click();
+  await page.getByTestId('check').click();
+  await expect(page.getByTestId('check-result')).toHaveAttribute('data-match', 'none');
+  await page.reload();
+  await freezeClock(page);
+  await advanceClock(page, 700);
+  // The checked side, not an empty question to retype the answer.
+  await expect(page.getByTestId('check-result')).toHaveAttribute('data-match', 'none');
+  await expect(page.getByTestId('typed')).toHaveText('glimmerus');
+  await expect(page.getByTestId('suggestion')).toContainText('Suggested: 4');
+  await page.getByRole('button', { name: /^Rate 3,/ }).click();
+  await expect(page.getByTestId('toast')).toContainText('Rated 3');
+
+  // brontle: half typed, reload, Undo the previous card.
+  await expectQuestion(page, 'brontle');
+  await advanceClock(page, 300);
+  await input(page).fill('bront');
+  await page.reload();
+  await freezeClock(page);
+  await advanceClock(page, 300);
+  await expect(input(page)).toHaveValue('bront');
+  await page.getByTestId('undo').click();
+  await expect(page.getByTestId('toast')).toContainText('Rating undone');
+  await expect(page.getByTestId('cloze')).toBeVisible();
+  await advanceClock(page, 300);
+  await input(page).fill('glimmerous');
+  await page.getByTestId('check').click();
+  await advanceClock(page, 650);
+  await page.getByRole('button', { name: /^Rate 2,/ }).click();
+  // Back on brontle: the draft is still there.
+  await expectQuestionWithDraft(page, 'bront');
+  expect(storedReviews(app).map((r) => [r.headword, r.raw_grade, r.hint_used])).toEqual([['glimmerous', 2, 0]]);
+});
+
+/**
+ * @param {import('@playwright/test').Page} page
+ * @param {string} draft
+ */
+async function expectQuestionWithDraft(page, draft) {
+  await expect(page.getByTestId('cloze')).toBeVisible();
+  await expect(input(page)).toHaveValue(draft);
+}
+
+test('R-56 "also accept" is not offered for an answer longer than the list takes', async ({ page, app, pageErrors }, info) => {
+  test.skip(info.project.name !== 'chromium-desktop', 'one flow is enough');
+  void pageErrors;
+  await waitingProduce(app, ['glimmerous']);
+  await startProduceBlock(page, app);
+  await input(page).fill('g'.repeat(250));
+  await page.getByTestId('check').click();
+  await expect(page.getByTestId('check-result')).toHaveAttribute('data-match', 'none');
+  await expect(page.getByTestId('accept-typed')).toHaveCount(0);
+});
+
+test('R-70 phone in landscape with the keyboard open: the sentence with the blank stays visible', async ({ page, app, pageErrors }, info) => {
+  test.skip(info.project.name !== 'webkit-phone', 'the on-screen keyboard is a phone matter');
+  void pageErrors;
+  await page.setViewportSize({ width: 812, height: 375 });
+  await waitingProduce(app, ['glimmerous']);
+  await startProduceBlock(page, app, { touch: true });
+  await page.getByTestId('hint-button').tap();
+  await input(page).tap();
+  // The keyboard leaves about 180 px.
+  await page.evaluate(() => {
+    const vv = /** @type {VisualViewport} */ (window.visualViewport);
+    Object.defineProperty(vv, 'height', { configurable: true, get: () => 180 });
+    Object.defineProperty(vv, 'offsetTop', { configurable: true, get: () => 0 });
+    vv.dispatchEvent(new Event('resize'));
+  });
+  const box = async (/** @type {string} */ id) => {
+    const b = await page.getByTestId(id).boundingBox();
+    expect(b, id).not.toBeNull();
+    return /** @type {{ x: number, y: number, width: number, height: number }} */ (b);
+  };
+  const cloze = await box('cloze');
+  const field = await box('answer-input');
+  expect(cloze.y, 'sentence below the top').toBeGreaterThanOrEqual(0);
+  expect(cloze.y + cloze.height, 'sentence above the answer field').toBeLessThanOrEqual(field.y);
+  expect(field.y + field.height, 'answer field above the keyboard').toBeLessThanOrEqual(180);
+  await expect(page.getByTestId('hint')).toBeVisible();
+  await expect(page.getByTestId('dont-know')).toBeHidden();
+  // The keyboard goes away: the full bar is back.
+  await page.evaluate(() => {
+    const vv = /** @type {VisualViewport} */ (window.visualViewport);
+    Object.defineProperty(vv, 'height', { configurable: true, get: () => window.innerHeight });
+    vv.dispatchEvent(new Event('resize'));
+  });
+  await expect(page.getByTestId('dont-know')).toBeVisible();
+});

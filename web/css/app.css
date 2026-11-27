@@ -1664,6 +1664,32 @@ button.danger.primary {
   bottom: var(--keyboard-inset, 0px);
 }
 
+/* Little room above the keyboard (phone in landscape): only the hint and
+   the answer row stay in the bar; the other actions come back with the
+   space. Portrait keeps the full bar. */
+.keyboard-tight .practice-bottom {
+  padding: 0.25rem 0;
+  max-height: none;
+}
+
+.keyboard-tight .typed-actions {
+  display: none;
+}
+
+.keyboard-tight .typed-hint {
+  margin-bottom: 0.2rem;
+  font-size: 1rem;
+}
+
+.keyboard-tight input.answer-input,
+.keyboard-tight button.check-button {
+  min-height: 2.5rem;
+}
+
+.keyboard-tight .practice-top {
+  padding: 0.125rem 0;
+}
+
 /* …and the page grows by as much, so the card above the bar can still be
    scrolled into view. */
 .practice {
@@ -1757,6 +1783,11 @@ button.check-button {
 
 .check-miss {
   border-left-color: var(--rate-4);
+}
+
+/* The right word in another form: friendly, neither an error nor a full pass. */
+.check-near {
+  border-left-color: var(--rate-3);
 }
 
 .check-title {

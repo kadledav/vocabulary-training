@@ -175,7 +175,9 @@ export function typedHint(hint) {
 
 /**
  * What the check found, above the answer of a typed card (wireframe 4b):
- * ✓ Correct; ✗ Not quite with the typed answer right above the expected
+ * ✓ Correct; "Right word — here it is …" for another form of the word
+ * (and "Accepted — this sentence has …" for another accepted answer)
+ * while a sentence is shown — friendly, never an error; ✗ Not quite with the typed answer right above the expected
  * one in the same monospace layout (a one-letter slip is easy to see) and
  * "Just a typo? Choose 3."; the answer after "I don't know"; nothing
  * after "I'll just rate myself". A missed typed answer can be added to the
@@ -188,6 +190,18 @@ export function typedHint(hint) {
 export function checkResult(item, check, accept) {
   const answer = expectedAnswer(item);
   if (check.match === 'skipped') return null;
+  if (check.verdict === 'right_word' || check.verdict === 'alternative') {
+    return h(
+      'div',
+      { class: 'check check-near', 'data-testid': 'check-result', 'data-match': check.verdict },
+      h(
+        'p',
+        { class: 'check-title' },
+        check.verdict === 'right_word' ? 'Right word — here it is ' : 'Accepted — this sentence has ',
+        h('span', { class: 'mono', lang: 'en', 'data-testid': 'expected' }, `“${answer}”`),
+      ),
+    );
+  }
   if (check.match === 'exact') {
     return h(
       'div',
