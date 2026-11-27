@@ -21,7 +21,8 @@ fsrs.workspace = true
 getrandom.workspace = true
 hex.workspace = true
 httparse.workspace = true
-http-body-util.workspace = true
+# channel: the full export streams its rows through a body channel.
+http-body-util = { workspace = true, features = ["channel"] }
 hyper.workspace = true
 hyper-util.workspace = true
 include_dir.workspace = true

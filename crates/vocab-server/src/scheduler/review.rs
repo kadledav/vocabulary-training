@@ -27,6 +27,51 @@ const LEECH_LAPSES: u32 = 4;
 /// "Previously mature": stability before the first of two 5s (design §6.5).
 const LEECH_MATURE_STABILITY: f64 = 21.0;
 
+/// Why a card is a problem card (design §6.5), as the Progress screen and
+/// the leech screen explain it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LeechReason {
+    /// Failed on `lapses` different study days since it was last
+    /// acknowledged (4 or more flag it).
+    Lapses { lapses: u32 },
+    /// Rated 5 (No idea) on two study days in a row although it had been
+    /// remembered for three weeks or more before.
+    ForgotWhenKnown,
+    /// Flagged before; the owner chose what to do on its leech screen.
+    /// It stays a problem card until it is remembered for three weeks
+    /// (stability ≥ 21 days), and four further lapses flag it again.
+    Acknowledged,
+}
+
+impl Card {
+    /// Why this card is a problem card (`None`: it is not one).
+    pub fn leech_reason(&self) -> Option<LeechReason> {
+        match self.leech {
+            LeechState::None => None,
+            LeechState::Acknowledged => Some(LeechReason::Acknowledged),
+            LeechState::Flagged => {
+                let lapses = self.lapses.saturating_sub(self.leech_lapses_at_ack);
+                Some(if lapses >= LEECH_LAPSES {
+                    LeechReason::Lapses { lapses }
+                } else {
+                    LeechReason::ForgotWhenKnown
+                })
+            }
+        }
+    }
+
+    /// Is the card still a problem card (design §6.5: a flagged card, or an
+    /// acknowledged one not yet remembered for three weeks)?
+    pub fn is_problem(&self) -> bool {
+        match self.leech {
+            LeechState::None => false,
+            LeechState::Flagged => true,
+            LeechState::Acknowledged => self.stability.unwrap_or(0.0) < LEECH_MATURE_STABILITY,
+        }
+    }
+}
+
 /// The owner's grade, 1 (Instantly) … 5 (No idea) (R-60).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]

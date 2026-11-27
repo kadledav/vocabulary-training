@@ -130,6 +130,11 @@ pub fn scheduled_cards(conn: &Connection) -> rusqlite::Result<Vec<Card>> {
     cards_where(conn, "due_day IS NOT NULL AND suspended = 0", [])
 }
 
+/// Cards with a leech flag, flagged or acknowledged (design §6.5).
+pub fn leech_cards(conn: &Connection) -> rusqlite::Result<Vec<Card>> {
+    cards_where(conn, "leech != 'none'", [])
+}
+
 /// Understand cards that were never reviewed (new-word candidates).
 pub fn new_cards(conn: &Connection) -> rusqlite::Result<Vec<Card>> {
     cards_where(

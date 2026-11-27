@@ -67,6 +67,7 @@ use crate::catalog::{self, EditError, ListKind, SourceId, WordId, WordQuery};
 use crate::clock::{Clock, DayRule, Moment, SystemClock};
 use crate::config::Limits;
 use crate::db::{Db, DbError};
+use crate::exports::{self, ExportError};
 use crate::importer::Via;
 use crate::keep_alive;
 use crate::rate_limit::RateLimit;
@@ -76,7 +77,7 @@ use crate::settings::{self, SettingsError, SettingsPatch};
 use crate::stats::{self, StatsError, WordListQuery};
 use crate::undo::UndoToken;
 use crate::web_assets;
-use crate::workflows::{self, WordAction, WorkflowError};
+use crate::workflows::{self, LeechAction, WordAction, WorkflowError};
 
 const HEALTHZ_PATH: &str = "/healthz";
 
@@ -158,6 +159,9 @@ pub struct AppState {
     body_read_timeout: Duration,
     /// Neural audio; `None` without `VOCAB_TTS_URL` (browser speech only).
     audio: Option<Audio>,
+    /// One full export at a time (it streams after its request slot is
+    /// given back, design §8.1).
+    export_turn: Arc<Semaphore>,
 }
 
 impl AppState {
@@ -178,6 +182,7 @@ impl AppState {
             import_wait: limits.slot_wait(),
             body_read_timeout: limits.request_timeout(),
             audio: None,
+            export_turn: Arc::new(Semaphore::new(1)),
         }
     }
 
@@ -428,6 +433,15 @@ fn endpoints() -> Vec<Endpoint> {
             hide_sentence,
         ),
         endpoint(Standard, Session, Get, "/api/today", today),
+        endpoint(Standard, Session, Get, "/api/progress", progress),
+        endpoint(
+            Standard,
+            Session,
+            Get,
+            "/api/export/feedback",
+            export_feedback,
+        ),
+        endpoint(Standard, Session, Get, "/api/export/full", export_full),
         endpoint(Standard, Session, Post, "/api/sessions", start_session),
         endpoint(
             Standard,
@@ -1437,16 +1451,27 @@ async fn undo_word_change(
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ActionBody {
-    /// `suspend`, `unsuspend`, `include`, `exclude`, `reset_card`.
+    /// `suspend`, `unsuspend`, `include`, `exclude`, `reset_card`, and the
+    /// leech screen's `leech_keep`, `leech_recognise`, `leech_usefulness`,
+    /// `leech_suspend` (design §6.5).
     action: String,
     /// `reset_card` only: `understand`, `produce` or `spelling`.
     kind: Option<String>,
+    /// `leech_usefulness` only: the new, lower usefulness.
+    usefulness: Option<i64>,
 }
 
 impl ActionBody {
     fn action(&self) -> Option<WordAction> {
         let kind = self.kind.as_deref();
+        if let Some(value) = self.usefulness {
+            return (self.action == "leech_usefulness" && kind.is_none())
+                .then_some(WordAction::Leech(LeechAction::LowerUsefulness(value)));
+        }
         match (self.action.as_str(), kind) {
+            ("leech_keep", None) => Some(WordAction::Leech(LeechAction::Keep)),
+            ("leech_recognise", None) => Some(WordAction::Leech(LeechAction::RecogniseOnly)),
+            ("leech_suspend", None) => Some(WordAction::Leech(LeechAction::Suspend)),
             ("suspend", None) => Some(WordAction::Suspend),
             ("unsuspend", None) => Some(WordAction::Unsuspend),
             ("include", None) => Some(WordAction::Include),
@@ -1466,7 +1491,10 @@ async fn word_action(
     body: Result<Json<ActionBody>, JsonRejection>,
 ) -> Response {
     const SHAPE: &str = "The body must be {\"action\": \"suspend\"|\"unsuspend\"|\"include\"|\
-                         \"exclude\"|\"reset_card\", \"kind\"?: \"understand\"|\"produce\"|\"spelling\"}.";
+                         \"exclude\"|\"reset_card\"|\"leech_keep\"|\"leech_recognise\"|\
+                         \"leech_usefulness\"|\"leech_suspend\", \"kind\"?: \"understand\"|\
+                         \"produce\"|\"spelling\" (reset_card only), \"usefulness\"?: a number \
+                         (leech_usefulness only)}.";
     let Ok(Path(id)) = id else {
         return not_found().await;
     };
@@ -1738,6 +1766,8 @@ enum ApiError {
     Settings(#[from] SettingsError),
     #[error(transparent)]
     Stats(#[from] StatsError),
+    #[error(transparent)]
+    Export(#[from] ExportError),
 }
 
 impl From<rusqlite::Error> for ApiError {
@@ -1800,7 +1830,9 @@ fn api_error(err: &ApiError) -> Response {
             "unknown_source",
             &err.to_string(),
         ),
-        ApiError::Db(_) | ApiError::Settings(_) | ApiError::Stats(_) => internal_error(err),
+        ApiError::Db(_) | ApiError::Settings(_) | ApiError::Stats(_) | ApiError::Export(_) => {
+            internal_error(err)
+        }
     }
 }
 
@@ -1832,6 +1864,182 @@ async fn today(
             .read(move |conn| Ok::<_, ApiError>(stats::today(conn, day, scope)?))
             .await,
     )
+}
+
+/// `GET /api/progress`: the Progress view (R-72, design §7.1 screen 9).
+async fn progress(State(state): State<AppState>) -> Response {
+    let day = state.moment().day;
+    respond(
+        state
+            .db
+            .read(move |conn| Ok::<_, ApiError>(stats::progress(conn, day)?))
+            .await,
+    )
+}
+
+/// Headers of an export download: a file to save (never shown inline,
+/// never cached: it holds the owner's data).
+fn download_headers(response: &mut Response, file_name: &str) {
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json; charset=utf-8"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    if let Ok(value) = HeaderValue::from_str(&format!("attachment; filename=\"{file_name}\"")) {
+        headers.insert(header::CONTENT_DISPOSITION, value);
+    }
+}
+
+/// `GET /api/export/feedback`: the feedback for Claude (R-57, design §8.1)
+/// as a JSON download (`vocab-feedback-<study day>.json`).
+async fn export_feedback(State(state): State<AppState>) -> Response {
+    let day = state.moment().day;
+    let result = state
+        .db
+        .read(move |conn| Ok::<_, ApiError>(exports::feedback(conn, day)?))
+        .await;
+    match result.and_then(|export| {
+        serde_json::to_vec_pretty(&export).map_err(|e| ApiError::Export(e.into()))
+    }) {
+        Ok(mut bytes) => {
+            bytes.push(b'\n');
+            let mut response = Body::from(bytes).into_response();
+            download_headers(&mut response, &format!("vocab-feedback-{day}.json"));
+            response
+        }
+        Err(err) => api_error(&err),
+    }
+}
+
+/// Bytes of the full export sent to the client at a time.
+const EXPORT_CHUNK_BYTES: usize = 64 * 1024;
+/// Chunks waiting for a slow client (memory per export: about this many
+/// chunks, whatever the export's size).
+const EXPORT_CHUNKS_QUEUED: usize = 4;
+/// A full export that takes longer (a client reading very slowly) is cut
+/// off: its own database connection and the export turn are given back.
+const EXPORT_DEADLINE: Duration = Duration::from_secs(600);
+
+/// Sends what the full export writes to the response body, chunk by chunk,
+/// from the blocking thread that reads the database.
+struct ChunkWriter {
+    sender: Option<http_body_util::channel::Sender<axum::body::Bytes, std::io::Error>>,
+    buffer: Vec<u8>,
+    runtime: tokio::runtime::Handle,
+    deadline: tokio::time::Instant,
+}
+
+impl std::fmt::Debug for ChunkWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChunkWriter")
+            .field("buffered", &self.buffer.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ChunkWriter {
+    fn send(&mut self) -> std::io::Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let chunk = axum::body::Bytes::from(std::mem::replace(
+            &mut self.buffer,
+            Vec::with_capacity(EXPORT_CHUNK_BYTES),
+        ));
+        let Some(sender) = self.sender.as_mut() else {
+            return Err(std::io::ErrorKind::BrokenPipe.into());
+        };
+        let deadline = self.deadline;
+        match self
+            .runtime
+            .block_on(tokio::time::timeout_at(deadline, sender.send_data(chunk)))
+        {
+            Ok(Ok(())) => Ok(()),
+            // The client went away.
+            Ok(Err(_)) => Err(std::io::ErrorKind::BrokenPipe.into()),
+            Err(_) => Err(std::io::ErrorKind::TimedOut.into()),
+        }
+    }
+
+    /// End the body with an error: the client sees a broken download, never
+    /// a complete-looking file.
+    fn abort(&mut self, err: std::io::Error) {
+        if let Some(sender) = self.sender.take() {
+            sender.abort(err);
+        }
+    }
+
+    /// The export is complete: end the body normally.
+    fn finish(&mut self) {
+        self.sender = None;
+    }
+}
+
+impl Drop for ChunkWriter {
+    /// Dropped before [`ChunkWriter::finish`] (the export never ran, or
+    /// panicked): the download fails instead of ending cleanly.
+    fn drop(&mut self) {
+        self.abort(std::io::Error::other("the export did not complete"));
+    }
+}
+
+impl Write for ChunkWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.buffer.extend_from_slice(data);
+        if self.buffer.len() >= EXPORT_CHUNK_BYTES {
+            self.send()?;
+        }
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.send()
+    }
+}
+
+/// `GET /api/export/full`: everything as one JSON download (R-86, design
+/// §8.1), streamed: a separate read-only connection reads one consistent
+/// snapshot row by row while the client downloads, so neither the export
+/// nor the shared connection is held by a slow download. One export at a
+/// time (`503 busy` otherwise); cut off after 10 minutes.
+async fn export_full(State(state): State<AppState>) -> Response {
+    let Ok(turn) = Arc::clone(&state.export_turn).try_acquire_owned() else {
+        return busy(
+            "busy",
+            "An export is already running. Try again when it has finished.",
+        );
+    };
+    let now = state.moment();
+    let (sender, body) = http_body_util::channel::Channel::<axum::body::Bytes, std::io::Error>::new(
+        EXPORT_CHUNKS_QUEUED,
+    );
+    let mut writer = ChunkWriter {
+        sender: Some(sender),
+        buffer: Vec::with_capacity(EXPORT_CHUNK_BYTES),
+        runtime: tokio::runtime::Handle::current(),
+        deadline: tokio::time::Instant::now() + EXPORT_DEADLINE,
+    };
+    let db = state.db.clone();
+    tokio::spawn(async move {
+        let _turn = turn;
+        let result = db
+            .read_detached(move |conn| {
+                let written = exports::write_full(conn, &mut writer, &now);
+                match &written {
+                    Ok(()) => writer.finish(),
+                    Err(err) => writer.abort(std::io::Error::other(err.to_string())),
+                }
+                written
+            })
+            .await;
+        if let Err(err) = result {
+            tracing::warn!(error = %err, "full export stopped");
+        }
+    });
+    let mut response = Body::new(body).into_response();
+    download_headers(&mut response, &format!("vocab-export-{}.json", now.day));
+    response
 }
 
 /// Body of `POST /api/sessions`.

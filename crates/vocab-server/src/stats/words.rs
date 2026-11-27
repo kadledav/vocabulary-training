@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use super::StatsError;
 use crate::catalog::{self, WordId, WordQuery, WordRow, WordView};
 use crate::clock::StudyDay;
-use crate::scheduler::{self, Card, CardKind, CardState, HistoryRow, LeechState};
+use crate::scheduler::{self, Card, CardKind, CardState, HistoryRow};
 
 /// Understand stability (days) from which a word counts as familiar (the
 /// Produce card unlocks there too, design §6.4).
@@ -54,11 +54,8 @@ impl WordStatus {
 /// The status of a word from its cards (the Understand card's memory; a
 /// leech flag on any card).
 pub fn word_status(cards: &[&Card]) -> WordStatus {
-    let leech = cards.iter().any(|c| {
-        c.leech == LeechState::Flagged
-            || (c.leech == LeechState::Acknowledged && c.stability.unwrap_or(0.0) < KNOWN_DAYS)
-    });
-    if leech {
+    // The scheduler owns the leech rule (design §6.5).
+    if cards.iter().any(|c| c.is_problem()) {
         return WordStatus::Leech;
     }
     let Some(understand) = cards.iter().find(|c| c.kind == CardKind::Understand) else {
@@ -72,6 +69,16 @@ pub fn word_status(cards: &[&Card]) -> WordStatus {
         CardState::Review if stability < KNOWN_DAYS => WordStatus::Familiar,
         CardState::Review => WordStatus::Known,
     }
+}
+
+/// Can the owner produce the word: its Produce card has been passed and
+/// is remembered for a week or more (stability ≥ 7 days)?
+pub fn can_produce(cards: &[&Card]) -> bool {
+    cards.iter().any(|c| {
+        c.kind == CardKind::Produce
+            && c.state == CardState::Review
+            && c.stability.unwrap_or(0.0) >= FAMILIAR_DAYS
+    })
 }
 
 /// The earliest due day of the word's cards that are practised (none
@@ -251,7 +258,7 @@ pub fn word_detail(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scheduler::CardId;
+    use crate::scheduler::{CardId, LeechState};
 
     fn card(kind: CardKind, state: CardState, stability: Option<f64>) -> Card {
         Card {

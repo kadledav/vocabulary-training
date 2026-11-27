@@ -16,6 +16,7 @@
 //! transaction that is always rolled back (`workflows`).
 
 mod edit;
+mod feedback;
 mod identity;
 mod ids;
 mod merge;
@@ -32,6 +33,10 @@ pub use edit::{
     EditError, ListKind, add_item, delete_word, remove_item, remove_pack_spelling,
     resolve_conflict, set_included, set_sentence_hidden, set_suspended, update_sentence,
     update_word,
+};
+pub use feedback::{
+    CatalogFeedback, FeedbackAccepted, FeedbackConflict, FeedbackOverride, FeedbackSentence,
+    ProblemWord, export, feedback_items, problem_words, word_source_links,
 };
 pub use identity::PackSpelling;
 pub use merge::{ConflictReport, ImportLink, ItemsAdded, MergeOutcome, WordMerge, merge_word};

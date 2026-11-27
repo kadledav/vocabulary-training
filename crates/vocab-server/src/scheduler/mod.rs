@@ -12,6 +12,7 @@
 mod cards;
 mod model;
 mod owner;
+mod progress;
 mod review;
 
 use std::fmt;
@@ -20,16 +21,20 @@ use serde::Serialize;
 
 pub use cards::{
     Card, all_cards, card, cards_of_word, ensure_cards, first_typed_reviews_on,
-    introduced_words_on, latest_grades_on, new_cards, normal_load, reviewed_cards_on,
+    introduced_words_on, latest_grades_on, leech_cards, new_cards, normal_load, reviewed_cards_on,
     scheduled_cards, sentence_last_shown,
 };
 pub use model::{Model, Rating, desired_retention, model};
 pub use owner::{
     CardsSnapshot, HistoryRow, cards_snapshot, delete_cards, history, reset_card, restore_cards,
 };
+pub use progress::{
+    DayActivity, RecallTally, acknowledge_leech, activity, export, leech_flagged, recall_tallies,
+};
 pub use review::{
-    AnswerMatch, RawGrade, ReviewInput, ReviewOutcome, StoredReview, UndoOutcome, UnlockedCard,
-    card_as_rated, find_review, raw_grade, record_review, review_outcome, undo_review,
+    AnswerMatch, LeechReason, RawGrade, ReviewInput, ReviewOutcome, StoredReview, UndoOutcome,
+    UnlockedCard, card_as_rated, find_review, raw_grade, record_review, review_outcome,
+    undo_review,
 };
 
 use crate::catalog::WordTraits;
