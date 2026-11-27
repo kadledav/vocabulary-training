@@ -231,3 +231,139 @@ export function canAddAccepted(check) {
     [...check.typed.trim()].length <= ACCEPTED_MAX
   );
 }
+
+// ── Spelling (R-58, design §6.8) ────────────────────────────────────────────
+
+/**
+ * Apostrophe look-alikes a phone keyboard types for the apostrophe key
+ * (smart punctuation: ’ ‘ ʼ ′).
+ */
+const APOSTROPHE_GLYPHS = /[‘’ʼ′]/gu;
+
+/**
+ * A spelling as it is compared letter by letter: Unicode NFC (the same
+ * letters in another encoding are the same text), surrounding white space
+ * trimmed, a run of white space as one space and typographic apostrophes
+ * as `'` (what the keyboard typed for the apostrophe key). Nothing else
+ * changes — diacritics, hyphens, apostrophes and spaces are part of a
+ * spelling. Case is compared per letter ([`spellingDiff`]), not changed
+ * here, so the diff shows the letters as they were typed.
+ *
+ * @param {string} text
+ */
+export function spellingText(text) {
+  return text.normalize('NFC').replace(APOSTROPHE_GLYPHS, "'").replace(/\s+/gu, ' ').trim();
+}
+
+/**
+ * One column of a spelling diff:
+ * - `same`: the right letter (case does not count);
+ * - `wrong`: another letter typed in its place;
+ * - `missing`: a letter of the word that was not typed;
+ * - `extra`: a typed letter the word does not have.
+ *
+ * @typedef {'same' | 'wrong' | 'missing' | 'extra'} DiffMark
+ * @typedef {{ mark: DiffMark, typed: string | null, correct: string | null }} DiffColumn
+ */
+
+/** @param {string} ch */
+function letterKey(ch) {
+  return ch.toLowerCase();
+}
+
+/**
+ * The letter-by-letter comparison of what was typed with the correct
+ * spelling (design §6.8): a Levenshtein alignment of the two (after
+ * [`spellingText`]; letters compared without case) as columns in reading
+ * order. Of the alignments with the fewest edits it takes the one that
+ * keeps the most letters matched (“dessicated” → one extra s and one
+ * missing c, not two wrong letters; a swapped pair → one letter extra and
+ * one missing on either side of the letter it jumped); among those,
+ * reading from the end, a matching or substituted letter first, then a
+ * missing one. Pure and deterministic.
+ *
+ * @param {string} typed
+ * @param {string} correct
+ * @returns {DiffColumn[]}
+ */
+export function spellingDiff(typed, correct) {
+  const a = [...spellingText(typed)];
+  const b = [...spellingText(correct)];
+  const ka = a.map(letterKey);
+  const kb = b.map(letterKey);
+  const cols = b.length + 1;
+  // Cost of an edit, plus one for a substitution: fewest edits first, then
+  // the fewest substitutions (= the most letters matched).
+  const edit = a.length + b.length + 1;
+  /** @param {boolean} same */
+  const step = (same) => (same ? 0 : edit + 1);
+  // cost[i * cols + j]: between the first i typed and j correct letters.
+  const cost = new Float64Array((a.length + 1) * cols);
+  for (let i = 0; i <= a.length; i++) cost[i * cols] = i * edit;
+  for (let j = 0; j <= b.length; j++) cost[j] = j * edit;
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      const diagonal = cost[(i - 1) * cols + j - 1] + step(ka[i - 1] === kb[j - 1]);
+      cost[i * cols + j] = Math.min(diagonal, cost[(i - 1) * cols + j] + edit, cost[i * cols + j - 1] + edit);
+    }
+  }
+  /** @type {DiffColumn[]} */
+  const out = [];
+  let i = a.length;
+  let j = b.length;
+  while (i > 0 || j > 0) {
+    const here = cost[i * cols + j];
+    const same = i > 0 && j > 0 && ka[i - 1] === kb[j - 1];
+    if (i > 0 && j > 0 && here === cost[(i - 1) * cols + j - 1] + step(same)) {
+      out.push({ mark: same ? 'same' : 'wrong', typed: a[i - 1], correct: b[j - 1] });
+      i--;
+      j--;
+    } else if (j > 0 && here === cost[i * cols + j - 1] + edit) {
+      out.push({ mark: 'missing', typed: null, correct: b[j - 1] });
+      j--;
+    } else {
+      out.push({ mark: 'extra', typed: a[i - 1], correct: null });
+      i--;
+    }
+  }
+  return out.reverse();
+}
+
+/**
+ * Check a typed spelling (design §6.8): strict — exactly the spelling
+ * (only case and the [`spellingText`] form do not count) suggests 2;
+ * anything else, a one-letter slip included, suggests 4. No hint and no
+ * list of accepted answers: the spelling is the point.
+ *
+ * @param {string} typed what the owner typed
+ * @param {string} correct the word's spelling (its headword)
+ * @returns {Check}
+ */
+export function checkSpelling(typed, correct) {
+  const exact = spellingText(typed) !== '' && spellingDiff(typed, correct).every((column) => column.mark === 'same');
+  return exact
+    ? { match: 'exact', verdict: 'correct', suggested: 2, typed, hintUsed: false }
+    : { match: 'none', verdict: 'miss', suggested: 4, typed, hintUsed: false };
+}
+
+/**
+ * The differences of a spelling diff in words, for a screen reader (the
+ * grid of letters is hidden from it): "letter 4: you typed “i”, the word
+ * has “e”; letter 6 missing: “n”". Empty when there is none.
+ *
+ * @param {readonly DiffColumn[]} diff
+ */
+export function diffSummary(diff) {
+  /** @param {string | null} ch */
+  const say = (ch) => (ch === ' ' ? 'a space' : `“${ch ?? ''}”`);
+  /** @type {string[]} */
+  const parts = [];
+  let position = 0;
+  for (const column of diff) {
+    if (column.correct !== null) position++;
+    if (column.mark === 'wrong') parts.push(`letter ${position}: you typed ${say(column.typed)}, the word has ${say(column.correct)}`);
+    else if (column.mark === 'missing') parts.push(`letter ${position} missing: ${say(column.correct)}`);
+    else if (column.mark === 'extra') parts.push(`extra ${say(column.typed)} ${position === 0 ? 'at the start' : `after letter ${position}`}`);
+  }
+  return parts.join('; ');
+}
