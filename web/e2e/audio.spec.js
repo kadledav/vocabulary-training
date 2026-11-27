@@ -85,12 +85,18 @@ test.describe('with a TTS service', () => {
 function installEndlessSound() {
   /** @type {string[]} */
   const events = [];
+  /** @type {WeakSet<HTMLMediaElement>} */
+  const sounding = new WeakSet();
   HTMLMediaElement.prototype.play = function play() {
+    // The muted play of the first tap only unlocks the element (iOS): no sound.
+    if (this.muted) return Promise.resolve();
+    sounding.add(this);
     events.push('clip');
     this.dispatchEvent(new Event('playing'));
     return Promise.resolve();
   };
   HTMLMediaElement.prototype.pause = function pause() {
+    if (!sounding.delete(this)) return;
     events.push('clip stopped');
   };
   const synth = /** @type {any} */ (window).speechSynthesis;
