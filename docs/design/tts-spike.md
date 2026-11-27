@@ -205,12 +205,15 @@ and with every further chunk a session runs: hence the fresh session).
 
 ### Final setup
 
-int8 model, 1 thread (`cpus: 1`), chunks of ≤ 100 symbols, a fresh session
-per chunk, an engine process that ends 180 s after the last request,
-`mem_limit` 512 MB (peak 415 MiB + 23 %; no swap). Above the limit the
-kernel kills only the engine process: that clip fails as a crash
-(`500 engine_crashed`, three of them and the app marks it "crashed the
-audio service"), the service stays up.
+int8 model, 1 thread (`cpus: 1`), chunks of ≤ 100 symbols (a pause counts
+as three; fewer for slower speech), a fresh session per chunk, an engine
+process that ends 180 s after the last request, `mem_limit` 640 MB (no
+swap; see "After the review" below: anonymous peak ≤ 432 MiB plus 181 MiB
+of the model's file cache). Above the limit the kernel kills only the
+engine process: that clip fails as a crash (`500 engine_crashed`, three of
+them and the app marks it "crashed the audio service"), the service stays
+up. (The table below is from before the review; the peaks there are
+anonymous memory plus whatever file cache the limit left.)
 
 | Container memory (cgroup) | 0.2.0 (fp32, 2 threads) | 0.2.1 |
 |---|---|---|
@@ -265,3 +268,93 @@ later), never a crash; the engine process gets 120 s to load; a crash is
 only an engine process that died (`engine_crashed`) or a connection that
 broke. The 2 GiB clip cache cap, input limits, long-token and crash-loop
 protections are unchanged.
+
+### After the review (2026-11-27)
+
+An independent review ran the container (arm64 Podman, 512m, 1 CPU) and
+found that accepted input could still exceed the limits, and that stops,
+engine start failures and the file cache were handled badly. Same setup as
+above; "anon" is `anon` of `memory.stat` sampled every 20 ms, "file" the
+file cache, refaults `workingset_refault_file`; the page cache was dropped
+before every run.
+
+**Speed and length.** The 100-symbol chunk and the 900-symbol cap ignored
+the speed: at `speed` 0.5 every chunk makes twice the audio, and the
+engine's memory grows with a chunk's audio. Now the chunk limit is divided
+by the stretch (1/speed for speeds below 1), a pause counts as three
+symbols (a chunk of "a, a, a, …" made 7.5 s of audio, one of words 5.5 s),
+and a text whose audio is estimated (58 ms per weighted symbol + 400 ms per
+chunk, divided by the speed; above every measured text by 6–60 %) at more
+than 50 s is refused with 422 before the engine starts; audio beyond 50 s
+while speaking stops the engine the same way.
+
+| Worst texts (600 characters, or the longest prefix accepted after the fix) | before: anon / clip | after: anon / clip |
+|---|---|---|
+| speed 1.0: compounds, long text with and without punctuation, numbers, years, commas, ellipses, dashes, one-word sentences | ≤ 448 MiB / up to 80 s ("Oh. Oh. …"), 44 s ("a, a, …") | ≤ 418 MiB / ≤ 42 s |
+| speed 0.5: the same | ≤ 636 MiB / up to 184 s (61–72 s for ordinary long texts; 509 MiB anon killed the engine at 512m) | ≤ 432 MiB / ≤ 47 s (the 600-character texts are 422) |
+
+**Memory limit and file cache.** A fresh session per chunk opens the model
+again, so the model file (114 MB) is read for every chunk. Its pages stay
+in the page cache only if the limit leaves room next to the anonymous
+peak; at 512m they were dropped whenever anon peaked and read from disk
+again. Measured with 50 mixed clips (15 words, 30 sentences, 5 texts of
+~550 characters):
+
+| Limit | anon peak | file cache | memory.peak | file pages read again | OOM kills |
+|---|---|---|---|---|---|
+| 512m (before; review) | 422 MiB | squeezed | 512 MiB | 328 000 | 0 |
+| 512m (after the other fixes) | 416 MiB | ≤ 181 MiB, squeezed | 512 MiB | 255 116 | 0 |
+| **640m** | 413–422 MiB | 181 MiB | 603–606 MiB | **0** | 0 |
+
+Keeping the model in anonymous memory instead is not possible with the
+pinned sherpa-onnx (it takes a path; it reads the file into a buffer
+itself), and one session per text instead of per chunk costs ~60 MiB more
+anon. So the limit is 640m: the worst anonymous peak after the speed fix
+(432 MiB) has a margin of 48 % to it, and the model's file cache (181 MiB)
+fits next to it. The real RAM the service holds is the anonymous memory
+(≤ 432 MiB while it works, a few MiB idle); the file cache is reclaimable:
+under host memory pressure the kernel drops it and the next chunk reads the
+model from disk again (slower, not failing). The smoke test checks the
+sampled anonymous peak (≤ limit / 1.15), `oom_kill` = 0 and the refaults.
+
+**Joins.** Where a text without punctuation is cut between words (no pause
+within 100 symbols), each chunk ended like a sentence: 110–220 ms of
+silence at the join (the reviewer's unpunctuated texts and a text of long
+numbers). Now the silence on both sides of such a cut is trimmed (at
+−40 dB under the chunk's peak, keeping 10 ms) and a 40 ms gap is put
+between with 5 ms fades; a cut falls between two words of the text rather
+than inside a number read digit by digit or a compound when that fits.
+Measured on the same texts: silences at the joins 50–60 ms, the same as
+the gaps between words inside a chunk (50–80 ms); no gap ≥ 80 ms left at a
+join. What remains: the level and pitch fall at the end of each chunk
+(4–10 dB in the last 300 ms before a join), because the model speaks each
+chunk as a whole utterance. Only longer chunks would remove that, and they
+cost memory, so it stays (a cut falls only in texts of more than ~17 words
+without a comma).
+
+**Peaks and loudness.** The limiter held −1.5 dBTP before encoding, and MP3
+encoding raised the true peak by up to 0.9 dB (3 of 37 clips over the
+ceiling, up to −0.8 dBTP). Now it keeps 1.5 dB of headroom (−3.0 dBTP
+before encoding), aims lower and runs again when the true peak between
+samples is still above it (instead of scaling the whole clip down), and
+its make-up gain is no longer counted in the ±20 dB gain clamp (a quiet
+long text ended at −17.1 LUFS). On 87 decoded MP3s (16 words, 16
+sentences, 3 unpunctuated texts, numbers, abbreviations, and the 50 mixed
+clips): true peak −5.0 … −1.9 dBTP (median −3.1, none above −1.5),
+loudness −16.1 … −16.6 LUFS for everything but single words (ffmpeg
+measures short words with their padding at −16.4 … −17.1, as before; the
+service's own measure is −16.0 … −16.1).
+
+**Engine start failures, stops, hangs.** A start that fails (also an
+engine process killed while loading) is `503 engine_unavailable` with
+`Retry-After`; the app waits 60 s without spending an attempt and does not
+send the rest of its queue. `SIGTERM` (also during the start self-test)
+kills the engine process, answers the request in progress with `503
+shutting_down` and exits in about a second (`stop_grace_period: 30s` in the
+Compose example is a backstop). The engine process writes a line after
+every chunk; one that is silent for 180 s is stopped (the slowest chunk
+seen, at a quarter of a CPU, took ~15 s). Its stdout carries only the
+protocol: anything else, also a partial line glued to the answer (which
+used to be skipped, so the request waited for the 600 s timeout), is an
+error at once.
+
