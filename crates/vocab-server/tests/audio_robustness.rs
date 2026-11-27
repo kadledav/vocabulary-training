@@ -6,7 +6,7 @@
 
 mod common;
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use common::{START, env_with_audio, word};
@@ -23,6 +23,13 @@ enum Answer {
     /// Read the request, then close the connection without an answer (the
     /// service died on it).
     Crash,
+    /// Read the request, close the connection and go down (the service was
+    /// stopped or redeployed while it worked on the text).
+    Vanish,
+    /// `503` with this error code (the service is up but cannot work).
+    Unavailable(&'static str),
+    /// `500 engine_crashed` (the engine process died on the text).
+    EngineCrashed,
 }
 
 struct Fake {
@@ -31,10 +38,17 @@ struct Fake {
     special: Mutex<Vec<(String, Answer)>>,
     spoken: Mutex<Vec<String>>,
     connections: AtomicUsize,
+    /// Every connection is closed at once (the service is gone).
+    down: AtomicBool,
+    /// Every text gets this answer (else [`Fake::special`] decides).
+    all: Mutex<Option<Answer>>,
 }
 
 impl Fake {
     fn answer(&self, text: &str) -> Answer {
+        if let Some(answer) = *self.all.lock().expect("lock") {
+            return answer;
+        }
         self.special
             .lock()
             .expect("lock")
@@ -62,6 +76,9 @@ fn mp3(text: &str) -> Vec<u8> {
 
 async fn handle(fake: Arc<Fake>, mut stream: tokio::net::TcpStream) {
     fake.connections.fetch_add(1, Ordering::SeqCst);
+    if fake.down.load(Ordering::SeqCst) {
+        return;
+    }
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 4096];
     let (head_len, length) = loop {
@@ -108,6 +125,23 @@ async fn handle(fake: Arc<Fake>, mut stream: tokio::net::TcpStream) {
         fake.spoken.lock().expect("lock").push(text.clone());
         match fake.answer(&text) {
             Answer::Crash => return, // dropped without a word
+            Answer::Vanish => {
+                fake.down.store(true, Ordering::SeqCst);
+                return;
+            }
+            Answer::Unavailable(code) => (
+                "503 Service Unavailable",
+                "application/json",
+                "Retry-After: 60\r\n".to_owned(),
+                format!(r#"{{"error": {{"code": "{code}", "message": "retry later"}}}}"#)
+                    .into_bytes(),
+            ),
+            Answer::EngineCrashed => (
+                "500 Internal Server Error",
+                "application/json",
+                String::new(),
+                br#"{"error": {"code": "engine_crashed", "message": "died"}}"#.to_vec(),
+            ),
             Answer::Clip { duration_ms } => (
                 "200 OK",
                 "audio/mpeg",
@@ -130,6 +164,8 @@ async fn fake_tts() -> (Arc<Fake>, TtsEndpoint) {
         special: Mutex::new(Vec::new()),
         spoken: Mutex::new(Vec::new()),
         connections: AtomicUsize::new(0),
+        down: AtomicBool::new(false),
+        all: Mutex::new(None),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -368,4 +404,96 @@ async fn r40_after_a_version_change_old_clips_play_until_replaced_one_by_one() {
     assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
     // A later sync keeps nothing old either.
     assert_eq!(audio.sync().await.expect("sync"), (0, 0));
+}
+
+/// Attempts and crashes of every clip, by text.
+fn tries(env: &common::Env) -> Vec<(String, i64, i64)> {
+    let conn = env.sql();
+    let mut statement = conn
+        .prepare("SELECT text, attempts, crashes FROM audio_clip ORDER BY text")
+        .expect("query");
+    statement
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .expect("rows")
+        .collect::<Result<_, _>>()
+        .expect("rows")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r83_a_service_that_cannot_work_costs_no_attempts_and_is_not_flooded() {
+    for code in ["engine_unavailable", "shutting_down"] {
+        let (fake, endpoint) = fake_tts().await;
+        *fake.all.lock().expect("lock") = Some(Answer::Unavailable(code));
+        let env = env_with_audio(tempfile::tempdir().expect("tempdir"), START, Some(endpoint));
+        let audio = env.audio.clone().expect("audio");
+        env.import("test-audio-book", words()).await;
+        audio.sync().await.expect("sync");
+        // One request, then the worker waits: not the whole queue.
+        for _ in 0..3 {
+            assert_eq!(audio.work_one().await.expect("work"), Step::Unavailable);
+        }
+        assert_eq!(fake.spoken.lock().expect("lock").len(), 3, "{code}");
+        assert!(
+            tries(&env).iter().all(|(_, a, c)| (*a, *c) == (0, 0)),
+            "{code}: {:?}",
+            tries(&env)
+        );
+        // The service recovers: every clip is made, none was charged.
+        *fake.all.lock().expect("lock") = None;
+        assert_eq!(drain_now(&audio).await, 4);
+        assert_eq!(
+            env.int("SELECT COUNT(*) FROM audio_clip WHERE status = 'ready' AND attempts = 0 AND crashes = 0"),
+            4,
+            "{code}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r83_a_service_stopped_while_it_speaks_does_not_charge_the_clip() {
+    let (fake, endpoint) = fake_tts().await;
+    let env = env_with_audio(tempfile::tempdir().expect("tempdir"), START, Some(endpoint));
+    let audio = env.audio.clone().expect("audio");
+    env.import("test-audio-book", words()).await;
+    audio.sync().await.expect("sync");
+    // Three times: the connection drops and the service is gone (a
+    // redeploy that killed it), then it is back.
+    for _ in 0..3 {
+        *fake.all.lock().expect("lock") = Some(Answer::Vanish);
+        assert_eq!(audio.work_one().await.expect("work"), Step::Unreachable);
+        fake.down.store(false, Ordering::SeqCst);
+    }
+    assert!(
+        tries(&env).iter().all(|(_, a, c)| (*a, *c) == (0, 0)),
+        "{:?}",
+        tries(&env)
+    );
+    *fake.all.lock().expect("lock") = None;
+    assert_eq!(drain_now(&audio).await, 4);
+    assert_eq!(
+        env.int("SELECT COUNT(*) FROM audio_clip WHERE status = 'ready' AND attempts = 0 AND crashes = 0"),
+        4
+    );
+    // A drop while the service stays up is still a crash of that text, as
+    // is the service's own `engine_crashed`.
+    for (answer, text) in [
+        (Answer::Crash, "thornquill"),
+        (Answer::EngineCrashed, "mossberry"),
+    ] {
+        env.exec(&format!(
+            "UPDATE audio_clip SET status = 'pending', attempts = 0 WHERE text = '{text}'"
+        ));
+        fake.special
+            .lock()
+            .expect("lock")
+            .push((text.into(), answer));
+        assert_eq!(audio.work_one().await.expect("work"), Step::Worked);
+        assert_eq!(
+            env.int(&format!(
+                "SELECT crashes FROM audio_clip WHERE text = '{text}'"
+            )),
+            1,
+            "{answer:?}"
+        );
+    }
 }
