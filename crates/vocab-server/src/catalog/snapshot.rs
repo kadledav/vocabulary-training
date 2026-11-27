@@ -74,7 +74,7 @@ fn rows(conn: &Connection, table: &str, column: &str, id: i64) -> rusqlite::Resu
     let mut stmt = conn.prepare(&format!(
         "SELECT * FROM {table} WHERE {column} = ?1 ORDER BY rowid"
     ))?;
-    let columns: Vec<String> = stmt.column_names().into_iter().map(str::to_owned).collect();
+    let columns: Vec<String> = stmt.column_names().map(str::to_owned).collect();
     let n = columns.len();
     let rows = stmt
         .query_map([id], |row| {
