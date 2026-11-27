@@ -103,8 +103,9 @@ class TtsService(unittest.TestCase):
             r"(?m)^    cap_drop: \[ALL\]$",
             r'(?m)^    security_opt: \["no-new-privileges:true"\]$',
             # The smoke test runs under the same limit (tools/tts-smoke.py).
-            r"(?m)^    mem_limit: 512m$",
-            r"(?m)^    memswap_limit: 512m$",
+            r"(?m)^    mem_limit: 640m$",
+            r"(?m)^    memswap_limit: 640m$",
+            r"(?m)^    stop_grace_period: 30s$",
             r"(?m)^    cpus: 1\.0$",
             r"(?m)^      - VOCAB_TTS_THREADS=1$",
             r"(?m)^      - VOCAB_TTS_IDLE_SECONDS=\d+$",

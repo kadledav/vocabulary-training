@@ -88,13 +88,21 @@ services:
       # the last clip.
       - VOCAB_TTS_IDLE_SECONDS=180
       - VOCAB_TTS_LOG_LEVEL=info
-    # Measured peak 415 MiB for the worst texts the service accepts (a
-    # sentence: ~345 MiB; idle: a few MiB); docs/design/tts-spike.md,
-    # "Small memory". Above the limit only that clip fails, the service stays.
-    mem_limit: 512m
-    memswap_limit: 512m
+    # A cap, not a reservation. While clips are made: at most ~435 MiB of
+    # anonymous memory (the worst texts the service accepts; a sentence
+    # ~350 MiB; idle a few MiB) plus ~180 MiB of file cache (the model is
+    # read for every chunk; the kernel can drop it when the host needs the
+    # RAM). The limit keeps both, so the model is not read from disk again
+    # and again; docs/design/tts-spike.md, "Small memory". Above the limit
+    # only that clip fails, the service stays.
+    mem_limit: 640m
+    memswap_limit: 640m
     cpus: 1.0
     pids_limit: 64
+    # On stop it kills its engine process, answers the clip in progress
+    # "shutting down" (the app retries it later at no cost) and exits within
+    # seconds; the grace period only covers a stuck connection.
+    stop_grace_period: 30s
     healthcheck:
       test: ["CMD", "/vocab-tts", "healthcheck"]
       interval: 30s

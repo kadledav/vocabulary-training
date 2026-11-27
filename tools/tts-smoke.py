@@ -25,21 +25,30 @@ Checks:
   layer III frames, 24 kHz mono, duration from the frames matching
   `X-Duration-Ms` and plausible for the text, loudness reported at about
   −16 LUFS, a bitrate that is speech, not silence), the UK voice works, the
-  longest allowed text (the engine's memory peak) works, the worst texts
-  the API accepts (long hyphenated compounds, long numbers, long unknown
-  words spelled out, each up to its limit) are spoken or refused with 422
-  and never kill the service, overlong words and numbers are refused with
-  422, oversize/invalid/markup/non-JSON input is refused with 4xx, the process
-  runs as UID 65532, the container's memory stays under the limit (not
-  OOM-killed) and the log never contains the spoken text;
+  longest allowed text works, half of it at the slowest speed works, the
+  worst texts the API accepts (long hyphenated compounds, long numbers,
+  long unknown words spelled out, texts dense with pauses, each up to its
+  limit, at normal and at the slowest speed) are spoken as clips the app
+  keeps (≤ 60 s) or refused with 422 and never kill the service, overlong
+  words and numbers are refused with 422, oversize/invalid/markup/non-JSON
+  input is refused with 4xx, the process runs as UID 65532 and the log
+  never contains the spoken text;
 * memory (the model is loaded only while there is work, in an engine
   process that ends when idle): after the start self-test and again after
   the idle time (VOCAB_TTS_IDLE_SECONDS, short here) `/healthz` says the
   engine is stopped and the container's anonymous memory (cgroup
-  `memory.stat`) is under IDLE_ANON_LIMIT; all of the above runs under
-  MEMORY_LIMIT. The cgroup numbers (current, peak, anon, file) are printed
-  at each step; where the cgroup cannot be read (not Linux, not Docker or
-  Podman) the memory checks are skipped, not failed.
+  `memory.stat`) is under IDLE_ANON_LIMIT. While the requests run, the
+  anonymous memory is sampled: its peak must leave at least ANON_MARGIN to
+  MEMORY_LIMIT; the kernel's `memory.events` must show no OOM kill (the
+  engine process is a child: Docker's `OOMKilled` stays false when only it
+  dies); the model's file cache must stay in memory (`memory.stat`
+  `workingset_refault_file`: at most REFAULT_LIMIT pages read again). The
+  cgroup numbers (current, peak, anon, file, refaults) are printed at each
+  step; where the cgroup cannot be read (not Linux, not Docker or Podman)
+  the memory checks are skipped, not failed;
+* stopping (`docker stop`) during the start self-test and during a
+  synthesis ends the container within STOP_LIMIT seconds with exit code 0,
+  and the request in progress is answered `503 shutting_down`.
 
 Every check runs even after a failure; dependents of a failed check are
 reported as skipped. Exit status non-zero if any check failed. Never pulls
@@ -58,6 +67,7 @@ import secrets
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -69,8 +79,19 @@ PORT = "8090"
 SECURITY = ["--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--user", f"{UID}:{UID}"]
 # The Compose limits (deploy/docker-compose.example.yml; measured peak and
 # margin in docs/design/tts-spike.md, "Small memory").
-MEMORY_LIMIT = "512m"
-MEMORY_LIMIT_BYTES = 512 * 1024 * 1024
+MEMORY_LIMIT = "640m"
+MEMORY_LIMIT_BYTES = 640 * 1024 * 1024
+# The sampled anonymous memory must stay this far under the limit (the
+# kernel kills the engine process when anonymous memory and the file cache
+# it cannot drop reach the limit).
+ANON_MARGIN = 1.15
+# Pages of files read again after the kernel dropped them from the cache:
+# the model is 114 MB (~28 000 pages) and is read for every chunk, so this
+# is far below one full re-read during the whole run.
+REFAULT_LIMIT = 4000
+# `docker stop` must end the container this fast (the Compose grace period
+# is longer).
+STOP_LIMIT = 10
 LIMITS = ["--memory", MEMORY_LIMIT, "--memory-swap", MEMORY_LIMIT, "--cpus", "1", "--pids-limit", "64"]
 # The engine process ends after this long without work (the default is
 # minutes; short here so the test sees it).
@@ -85,6 +106,10 @@ SENTENCE = "The purple lighthouse hums quietly above the sleeping harbour."
 SECRET_WORD = "lighthouse"
 WORD = "Wonderful"
 LONG_TEXT = ("The quiet river wandered past the old mill, and the miller watched it from his window every evening. " * 6)[:600].strip()
+# The slowest speed the API accepts.
+SLOWEST = 0.5
+# The longest clip the app keeps (vocab-server `MAX_CLIP_MS`).
+MAX_CLIP_MS = 60_000
 
 
 def up_to_600(token: str) -> str:
@@ -103,6 +128,8 @@ WORST_TEXTS = [
     ("15-digit numbers up to 600 characters", up_to_600("999999999999999")),
     ("one 64-letter unknown word", SPELLED),
     ("64-letter unknown words up to 600 characters", up_to_600(SPELLED)),
+    ("a comma after every word, 600 characters", up_to_600("a,")),
+    ("one-word sentences, 600 characters", up_to_600("Oh.")),
 ]
 FORBIDDEN_PATHS = frozenset([
     "bin/sh", "bin/bash", "bin/dash", "bin/ash", "bin/busybox", "usr/bin/busybox",
@@ -244,22 +271,12 @@ def mp3_frames(data: bytes) -> tuple[int, int, int]:
     return frames, rate, frames * 576 * 1000 // rate
 
 
-def memory_bytes(text: str) -> int | None:
-    """Bytes of the first size in a `stats` MemUsage cell such as
-    "812.3MiB / 1.25GiB" or "812.3MB / 1.342GB"."""
-    m = re.match(r"\s*([0-9.]+)\s*([kKMGT]?i?B)", text)
-    if not m:
-        return None
-    units = {"B": 1, "KB": 10**3, "MB": 10**6, "GB": 10**9, "TB": 10**12,
-             "KiB": 2**10, "MiB": 2**20, "GiB": 2**30, "TiB": 2**40, "kB": 10**3}
-    unit = units.get(m.group(2))
-    return int(float(m.group(1)) * unit) if unit else None
-
-
-def cgroup_numbers(current: str, peak: str | None, stat: str) -> dict[str, int]:
-    """Bytes from a cgroup v2 memory controller: `memory.current`,
-    `memory.peak` (when the kernel has it) and `anon` / `file` of
-    `memory.stat`."""
+def cgroup_numbers(current: str, peak: str | None, stat: str, events: str | None = None) -> dict[str, int]:
+    """Numbers of a cgroup v2 memory controller: bytes of `memory.current`,
+    `memory.peak` (when the kernel has it), `anon` / `file` of
+    `memory.stat`; counts of `workingset_refault_file` (pages read again
+    after they were dropped from the cache) and `oom_kill` of
+    `memory.events` (when given)."""
     numbers = {"current": int(current.strip())}
     if peak is not None and peak.strip():
         numbers["peak"] = int(peak.strip())
@@ -267,11 +284,18 @@ def cgroup_numbers(current: str, peak: str | None, stat: str) -> dict[str, int]:
         key, _, value = line.partition(" ")
         if key in ("anon", "file"):
             numbers[key] = int(value)
+        elif key == "workingset_refault_file":
+            numbers["refaults"] = int(value)
+    for line in (events or "").splitlines():
+        key, _, value = line.partition(" ")
+        if key == "oom_kill":
+            numbers["oom_kill"] = int(value)
     return numbers
 
 
 def mib(numbers: dict[str, int]) -> str:
-    return ", ".join(f"{key} {value / 2**20:.0f} MiB" for key, value in numbers.items())
+    return ", ".join(f"{key} {value}" if key in ("refaults", "oom_kill") else f"{key} {value / 2**20:.0f} MiB"
+                     for key, value in numbers.items())
 
 
 # ── HTTP ─────────────────────────────────────────────────────────────────────
@@ -323,7 +347,7 @@ def read_cgroup(container: str) -> dict[str, int] | None:
         return None
     for template in CGROUP_DIRS:
         path = template.format(id=cid)
-        files = [f"{path}/memory.current", f"{path}/memory.stat", f"{path}/memory.peak"]
+        files = [f"{path}/memory.current", f"{path}/memory.stat", f"{path}/memory.peak", f"{path}/memory.events"]
         if sys.platform == "linux":
             if not os.path.isfile(files[0]):
                 continue
@@ -332,7 +356,10 @@ def read_cgroup(container: str) -> dict[str, int] | None:
             except OSError:
                 continue
         elif engine() == "podman":
-            script = f"cat {files[0]} && echo === && cat {files[1]} && echo === && (cat {files[2]} 2>/dev/null || true)"
+            # memory.current must exist (this is the container's cgroup); the
+            # others may be missing on older kernels.
+            script = f"cat {files[0]} && echo === && " + " && echo === && ".join(
+                f"(cat {f} 2>/dev/null || true)" for f in files[1:])
             result = docker("machine", "ssh", script, check=False, timeout=60)
             if result.returncode != 0 or "===" not in result.stdout:
                 continue
@@ -340,8 +367,9 @@ def read_cgroup(container: str) -> dict[str, int] | None:
         else:
             return None
         try:
-            return cgroup_numbers(texts[0], texts[2] if len(texts) > 2 else None, texts[1])
-        except (ValueError, TypeError, IndexError):
+            texts += [None] * (4 - len(texts))
+            return cgroup_numbers(texts[0], texts[2], texts[1], texts[3])
+        except (ValueError, TypeError, IndexError, AttributeError):
             return None
     return None
 
@@ -369,6 +397,37 @@ def memory_check(name: str, when: str, idle: bool) -> None:
     if idle:
         check(numbers.get("anon", IDLE_ANON_LIMIT) < IDLE_ANON_LIMIT,
               f"memory {when}: anonymous memory under {IDLE_ANON_LIMIT >> 20} MiB", mib(numbers))
+
+
+class MemorySampler:
+    """Samples the container's cgroup in the background (as often as it can
+    be read): the highest anonymous memory and file cache seen."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.max_anon = 0
+        self.max_file = 0
+        self.samples = 0
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            numbers = read_cgroup(self.name)
+            if numbers is None:
+                return
+            self.samples += 1
+            self.max_anon = max(self.max_anon, numbers.get("anon", 0))
+            self.max_file = max(self.max_file, numbers.get("file", 0))
+            self._stop.wait(0.1)
+
+    def start(self) -> "MemorySampler":
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=120)
 
 
 def container_log(name: str) -> str:
@@ -469,6 +528,8 @@ def api_checks(image: str, name: str) -> None:
         state = engine_state(base)
         check(state == "stopped", "after the start self-test the engine process is stopped", state)
         memory_check(name, "after the start (idle)", idle=True)
+        at_start = read_cgroup(name) or {}
+        sampler = MemorySampler(name).start()
 
         for label, payload, min_ms, max_ms in [
             ("a sentence (US voice)", {"text": SENTENCE}, 2500, 8000),
@@ -476,6 +537,9 @@ def api_checks(image: str, name: str) -> None:
             ("a sentence (UK voice)", {"text": SENTENCE, "voice": "bf_emma"}, 2500, 8000),
             # The longest text there is: the memory peak of the engine.
             ("the longest text (600 characters)", {"text": LONG_TEXT}, 20000, 60000),
+            # Slower speech makes more audio per chunk: the chunks are shorter.
+            ("half the longest text at the slowest speed", {"text": LONG_TEXT[:300].strip(), "speed": SLOWEST},
+             20000, 55000),
         ]:
             status, headers, body = speak(base, payload)
             if not check(status == 200 and headers.get("content-type") == "audio/mpeg",
@@ -497,20 +561,24 @@ def api_checks(image: str, name: str) -> None:
             kbps = len(body) * 8 / max(stated, 1)
             check(16 <= kbps <= 128, f"{label}: bitrate of speech, not silence", f"{kbps:.1f} kbit/s")
 
-        for label, text in WORST_TEXTS:
-            started = time.monotonic()
-            status, headers, body = speak(base, {"text": text})
-            took = time.monotonic() - started
-            code = ""
-            if status == 422:
-                code = json.loads(body).get("error", {}).get("code", "")
-            check(status == 200 and headers.get("content-type") == "audio/mpeg" or code == "too_long_to_speak",
-                  f"worst case: {label} -> audio or 422 too_long_to_speak",
-                  f"{status} {code} {body[:200] if status != 200 else ''!r}")
-            print(f"worst case: {label}: {status} {code} {headers.get('x-duration-ms', '-')} ms of audio "
-                  f"in {took:.1f} s")
-            status, _, _ = http("GET", f"{base}/healthz")
-            check(status == 200, f"worst case: {label}: the service is still up", f"/healthz {status}")
+        for speed in (1.0, SLOWEST):
+            for label, text in WORST_TEXTS:
+                label = f"{label} at speed {speed:g}"
+                started = time.monotonic()
+                status, headers, body = speak(base, {"text": text, "speed": speed})
+                took = time.monotonic() - started
+                code = ""
+                if status == 422:
+                    code = json.loads(body).get("error", {}).get("code", "")
+                audio_ms = int(headers.get("x-duration-ms", "0") or 0)
+                check(status == 200 and headers.get("content-type") == "audio/mpeg" and 0 < audio_ms <= MAX_CLIP_MS
+                      or code == "too_long_to_speak",
+                      f"worst case: {label} -> a clip of at most {MAX_CLIP_MS // 1000} s or 422 too_long_to_speak",
+                      f"{status} {code} {audio_ms} ms {body[:200] if status != 200 else ''!r}")
+                print(f"worst case: {label}: {status} {code} {headers.get('x-duration-ms', '-')} ms of audio "
+                      f"in {took:.1f} s")
+                status, _, _ = http("GET", f"{base}/healthz")
+                check(status == 200, f"worst case: {label}: the service is still up", f"/healthz {status}")
 
         refused = [
             ("oversize body", speak(base, {"text": "a" * 5000}), 413),
@@ -528,7 +596,9 @@ def api_checks(image: str, name: str) -> None:
         for label, (status, _, body), expected in refused:
             check(status == expected, f"refused: {label} ({expected})", f"{status} {body[:200]!r}")
 
+        sampler.stop()
         memory_check(name, "after all requests", idle=False)
+        peak_checks(name, sampler, at_start)
         deadline = time.monotonic() + IDLE_SECONDS + 30
         while (state := engine_state(base)) != "stopped" and time.monotonic() < deadline:
             time.sleep(1)
@@ -542,10 +612,6 @@ def api_checks(image: str, name: str) -> None:
         check(state["HostConfig"].get("ReadonlyRootfs") is True, "the root filesystem is read-only")
         check(state["State"].get("Running") is True and not state["State"].get("OOMKilled"),
               f"still running, not OOM-killed under {MEMORY_LIMIT}", repr(state["State"]))
-        usage = docker("stats", "--no-stream", "--format", "{{.MemUsage}}", name, check=False).stdout.strip()
-        used = memory_bytes(usage)
-        check(used is not None and used < MEMORY_LIMIT_BYTES, f"memory use under {MEMORY_LIMIT}", usage)
-        print(f"memory use: {usage}")
         logs = container_log(name)
         check(SECRET_WORD not in logs.lower() and "spoke" in logs, "the log has the speak lines but never the text",
               one_line(logs)[-300:])
@@ -558,6 +624,88 @@ def api_checks(image: str, name: str) -> None:
         docker("rm", "-f", name, check=False)
 
 
+def peak_checks(name: str, sampler: MemorySampler, at_start: dict[str, int]) -> None:
+    """The memory of the requests, from the cgroup: sampled anonymous peak,
+    OOM kills, file pages read again."""
+    names = [f"memory: anonymous peak at most 1/{ANON_MARGIN:g} of {MEMORY_LIMIT}",
+             "memory: no OOM kill (memory.events oom_kill)",
+             f"memory: the model stays in the file cache (at most {REFAULT_LIMIT} pages read again)"]
+    numbers = read_cgroup(name)
+    if numbers is None or sampler.samples == 0:
+        skip(names, "cgroup not readable here")
+        return
+    print(f"memory while speaking: {sampler.samples} samples, anon peak {sampler.max_anon / 2**20:.0f} MiB, "
+          f"file cache peak {sampler.max_file / 2**20:.0f} MiB, memory.peak "
+          f"{numbers.get('peak', 0) / 2**20:.0f} MiB, limit {MEMORY_LIMIT}")
+    check(sampler.max_anon * ANON_MARGIN <= MEMORY_LIMIT_BYTES, names[0],
+          f"anon peak {sampler.max_anon / 2**20:.0f} MiB")
+    if "oom_kill" in numbers:
+        check(numbers["oom_kill"] == 0, names[1], f"oom_kill {numbers['oom_kill']}")
+    else:
+        skip(names[1:2], "memory.events not readable here")
+    if "refaults" in numbers and "refaults" in at_start:
+        refaults = numbers["refaults"] - at_start["refaults"]
+        check(refaults <= REFAULT_LIMIT, names[2], f"{refaults} pages read again")
+    else:
+        skip(names[2:], "workingset_refault_file not readable here")
+
+
+def stop_checks(image: str, name: str) -> None:
+    """`docker stop` during the start self-test, and during a synthesis."""
+    def stop_timed() -> tuple[float, str]:
+        started = time.monotonic()
+        docker("stop", "-t", "30", name, timeout=60)
+        took = time.monotonic() - started
+        code = docker("inspect", "--format", "{{.State.ExitCode}}", name, check=False).stdout.strip()
+        return took, code
+
+    def during_start() -> None:
+        docker("run", "-d", "--pull=never", "--name", name, *SECURITY, *LIMITS, image)
+        time.sleep(0.5)
+        took, code = stop_timed()
+        check(took < STOP_LIMIT and code == "0", "docker stop during the start self-test: exits promptly with 0",
+              f"{took:.1f} s, exit {code} | {one_line(container_log(name))[-300:]}")
+
+    def during_synthesis() -> None:
+        docker("run", "-d", "--pull=never", "--name", name, "-p", f"127.0.0.1::{PORT}", *SECURITY, *LIMITS, image)
+        mapped = docker("port", name, f"{PORT}/tcp").stdout.strip().splitlines()
+        base = f"http://127.0.0.1:{mapped[0].rsplit(':', 1)[1]}"
+        if wait_healthy(base, name) != 200:
+            raise SmokeFailure("stop during a synthesis", "the container did not get healthy")
+        answer: list[object] = []
+        request = threading.Thread(target=lambda: answer.append(_speak_or_error(base, {"text": LONG_TEXT})))
+        request.start()
+        time.sleep(3)
+        took, code = stop_timed()
+        request.join(timeout=60)
+        status, error_code = answer[0] if answer else (0, "no answer")
+        check(took < STOP_LIMIT and code == "0", "docker stop during a synthesis: exits promptly with 0",
+              f"{took:.1f} s, exit {code}")
+        check((status, error_code) == (503, "shutting_down"),
+              "docker stop during a synthesis: the request is answered 503 shutting_down", f"{status} {error_code}")
+
+    for section in (during_start, during_synthesis):
+        try:
+            guarded("stop", section)
+        finally:
+            docker("rm", "-f", name, check=False)
+
+
+def _speak_or_error(base: str, payload: object) -> tuple[int, str]:
+    """Status and error code of a speak request (0 and the error when the
+    connection failed)."""
+    try:
+        status, _, body = speak(base, payload)
+    except (urllib.error.URLError, ConnectionError, OSError) as err:
+        return 0, str(err)
+    if status == 200:
+        return status, ""
+    try:
+        return status, json.loads(body).get("error", {}).get("code", "")
+    except ValueError:
+        return status, "not JSON"
+
+
 def smoke(argv: list[str]) -> int:
     if len(argv) != 1:
         print(__doc__)
@@ -568,6 +716,7 @@ def smoke(argv: list[str]) -> int:
     guarded("refusal", lambda: refusal_checks(image))
     offline_checks(image, f"tts-smoke-offline-{run_id}")
     api_checks(image, f"tts-smoke-{run_id}")
+    stop_checks(image, f"tts-smoke-stop-{run_id}")
     if failures():
         print(f"TTS image smoke tests FAILED: {failures()} failed check(s)")
         return 1
