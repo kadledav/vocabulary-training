@@ -315,6 +315,148 @@ async fn r52_first_time_cards_do_not_push_ahead_of_overdue_reviews() {
     );
 }
 
+/// "word:kind" of every item of a block.
+fn order(session: &Value) -> Vec<String> {
+    items(session)
+        .iter()
+        .map(|i| {
+            format!(
+                "{}:{}",
+                i["word"]["headword"].as_str().expect("hw"),
+                i["card"]["kind"].as_str().expect("k")
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn r52_first_time_cards_never_go_ahead_of_on_time_or_overdue_reviews() {
+    let env = env();
+    let mut list = words("rv", 6);
+    list.extend(words("fp", 10));
+    env.import("test-novel", list).await;
+    waiting_produce(&env, "2026-12-30", "2026-11-19");
+    settings(&env, json!({ "block_size": 5 })).await;
+    // rv01–rv03 are due exactly today with memory to spare (retrievability
+    // above the target: a negative priority); rv04–rv06 are overdue. Their
+    // own Produce cards are not unlocked; fp01–fp10 have only a waiting
+    // Produce card.
+    env.exec(
+        "DELETE FROM card WHERE kind = 'produce' AND word_id IN (SELECT id FROM word WHERE headword LIKE 'rv%'); \
+         UPDATE card SET due_day = '2026-11-20', last_review_day = '2026-11-12', stability = 30.0 \
+         WHERE kind = 'understand' AND word_id IN (SELECT id FROM word WHERE headword IN ('rv01', 'rv02', 'rv03')); \
+         UPDATE card SET due_day = '2026-11-10', last_review_day = '2026-10-01', stability = 20.0 \
+         WHERE kind = 'understand' AND word_id IN (SELECT id FROM word WHERE headword IN ('rv04', 'rv05', 'rv06'));",
+    );
+    let t = today(&env).await;
+    assert_eq!(t["due_now"], 16, "6 reviews + 10 first-time cards: {t}");
+    let first = start_block(&env).await;
+    assert!(
+        order(&first).iter().all(|o| o.ends_with(":understand")),
+        "the reviews come first: {:?}",
+        order(&first)
+    );
+    rate_all(&env, first, 2).await;
+    let second = start(&env, json!({ "kind": "continue" })).await["session"].clone();
+    let second = order(&second);
+    assert_eq!(second.len(), 5);
+    assert!(second[0].ends_with(":understand"), "{second:?}");
+    assert!(
+        second[1..].iter().all(|o| o.ends_with(":produce")),
+        "first-time cards fill what is left: {second:?}"
+    );
+}
+
+#[tokio::test]
+async fn r52_today_never_offers_a_start_that_yields_nothing() {
+    let env = env();
+    env.import("test-novel", words("pd", 2)).await;
+    waiting_produce(&env, "2026-12-30", "2026-11-19");
+    // pd01: Understand due today and a waiting Produce card (blocked today
+    // by the sibling rule); pd02: known, nothing due.
+    env.exec(
+        "UPDATE card SET due_day = '2026-11-20', last_review_day = '2026-10-21' \
+         WHERE kind = 'understand' AND word_id = (SELECT id FROM word WHERE headword = 'pd01'); \
+         DELETE FROM card WHERE kind = 'produce' AND word_id = (SELECT id FROM word WHERE headword = 'pd02');",
+    );
+    let t = today(&env).await;
+    assert_eq!(t["due_now"], 1, "only the review comes today: {t}");
+    assert_eq!(t["typed_today"], 0, "{t}");
+    assert_eq!(t["next_block"], json!({ "due": 1, "new": 0 }), "{t}");
+    let block = start_block(&env).await;
+    assert_eq!(order(&block), ["pd01:understand"]);
+    rate_all(&env, block, 2).await;
+
+    let t = today(&env).await;
+    assert_eq!(t["due_now"], 0, "{t}");
+    assert_eq!(t["typed_waiting"], 1, "the card still waits: {t}");
+    assert_eq!(t["typed_today"], 0, "{t}");
+    assert_eq!(t["next_block"], json!({ "due": 0, "new": 0 }), "{t}");
+    let result = start(&env, json!({ "kind": "continue" })).await;
+    assert!(result["session"].is_null(), "{result}");
+    // The day is done, so extra practice is there.
+    assert!(t["extra_available"].as_u64().expect("extra") > 0, "{t}");
+    let extra = start(&env, json!({ "kind": "extra" })).await;
+    assert!(!extra["session"].is_null(), "{extra}");
+
+    // Tomorrow the Produce card comes.
+    env.set_day("2026-11-21");
+    let t = today(&env).await;
+    assert_eq!(t["typed_today"], 1, "{t}");
+    let block = start_block(&env).await;
+    assert!(order(&block).contains(&"pd01:produce".to_owned()));
+}
+
+#[tokio::test]
+async fn r52_two_due_cards_of_one_word_count_once() {
+    let env = env();
+    env.import("test-novel", words("tw", 1)).await;
+    // Both cards of tw01 are due reviews today: one comes, the other waits
+    // for another day (one card per word per day).
+    env.exec(
+        "UPDATE card SET state = 'review', stability = 30.0, difficulty = 5.0, due_day = '2026-11-20', \
+         last_review_day = '2026-10-21', introduced_day = '2026-10-01', reps = 4, format = 'sentence'; \
+         INSERT INTO card (word_id, kind, state, stability, difficulty, due_day, last_review_day, \
+         introduced_day, reps, format, created_at) SELECT id, 'produce', 'review', 30.0, 5.0, \
+         '2026-11-20', '2026-10-21', '2026-10-21', 3, 'cloze', '2026-11-01T00:00:00Z' FROM word;",
+    );
+    let t = today(&env).await;
+    assert_eq!(t["due_now"], 1, "{t}");
+    let block = start_block(&env).await;
+    assert_eq!(items(&block).len(), 1);
+    rate_all(&env, block, 2).await;
+    let t = today(&env).await;
+    assert_eq!(t["due_now"], 0, "{t}");
+    assert_eq!(t["next_block"]["due"], 0, "{t}");
+}
+
+#[tokio::test]
+async fn r54_resetting_a_produce_card_reviewed_today_keeps_its_slot_used() {
+    let env = env();
+    env.import("test-novel", words("tr", 3)).await;
+    waiting_produce(&env, "2026-12-30", "2026-11-20");
+    settings(&env, json!({ "new_typed_per_day": 1 })).await;
+    let block = start_block(&env).await;
+    let first = headwords(&block)[0].clone();
+    rate_all(&env, block, 2).await;
+    let id = env.word_id(&first).await.get();
+    let (status, body) = env
+        .post(
+            &format!("/api/words/{id}/actions"),
+            &json!({ "action": "reset_card", "kind": "produce" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let t = today(&env).await;
+    assert_eq!(t["new_typed"]["introduced_today"], 1, "{t}");
+    assert_eq!(t["new_typed"]["left_today"], 0, "{t}");
+    let result = start(&env, json!({ "kind": "continue" })).await;
+    assert!(
+        result["session"].is_null(),
+        "no second first-time card today: {result}"
+    );
+}
+
 #[tokio::test]
 async fn r54_the_backlog_pause_holds_first_time_cards_too_until_added_anyway() {
     let env = env();

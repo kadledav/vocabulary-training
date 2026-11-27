@@ -24,8 +24,9 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 pub use build::{
-    NewAllowance, TypedAllowance, choose_sentence, extra_available, new_candidate_count,
-    new_word_allowance, reviews_in_scope, start_block, typed_allowance, typed_waiting,
+    BlockPreview, DueToday, NewAllowance, TypedAllowance, choose_sentence, due_today,
+    extra_available, new_candidate_count, new_word_allowance, reviews_in_scope, start_block,
+    typed_allowance, typed_waiting,
 };
 pub use queue::{finish, rate, undo_last};
 pub use view::{

@@ -51,12 +51,17 @@ export function blockPreview({ due, fresh, blockSize }) {
 }
 
 /**
- * The block a Start would build today.
+ * The block a Start would build today: the server's own plan when it sends
+ * one (it applies every rule of the block builder), else an estimate from
+ * the counts (older servers).
  *
  * @param {Today} today
  * @param {number} blockSize
+ * @returns {BlockPreview}
  */
 export function nextBlock(today, blockSize) {
+  const plan = today.next_block;
+  if (plan) return { total: plan.due + plan.new, due: plan.due, fresh: plan.new };
   return blockPreview({ due: today.due_now, fresh: Math.min(today.new_words.quota, today.new_available), blockSize });
 }
 
@@ -121,9 +126,11 @@ export function dayDone(today, blockSize) {
 
 /**
  * What Today says about Produce cards waiting for their first time (design
- * §17 M8): how many wait, how many today's limit lets in, or that they are
- * held back with new words while reviews pile up. `null` when there is
- * nothing to say (or an older server sent no counts).
+ * §17 M8): how many wait, how many come today, or why they do not — held
+ * back with new words while reviews pile up, switched off in Settings,
+ * today's limit used up, or their words already practised today (one card
+ * per word a day). `null` when there is nothing to say (or an older server
+ * sent no counts).
  *
  * @param {Today} today
  * @returns {string | null}
@@ -138,10 +145,16 @@ export function typedLine(today) {
   const cards = plural(waiting, 'Produce card');
   const verb = waiting === 1 ? 'waits' : 'wait';
   if (typed.paused) return `${cards} ${verb} for the first time — held back until you catch up on reviews.`;
-  const comingToday = Math.min(waiting, typed.quota);
+  if (typed.per_day === 0) {
+    return `${cards} ${verb} for the first time — new Produce cards are switched off (New Produce cards per day in Settings).`;
+  }
+  const comingToday = today.typed_today ?? Math.min(waiting, typed.quota);
   if (comingToday === waiting) return `${cards} ${verb} for the first time — ${waiting === 1 ? 'it comes' : 'all come'} today.`;
   if (comingToday === 0) {
-    return `${cards} ${verb} for the first time — today’s ${typed.per_day} are done (limit in Settings); more tomorrow.`;
+    if (typed.quota === 0) {
+      return `${cards} ${verb} for the first time — today’s ${typed.per_day} are done (limit in Settings); more tomorrow.`;
+    }
+    return `${cards} ${verb} for the first time — ${waiting === 1 ? 'its word has' : 'their words have'} a card today already, so ${waiting === 1 ? 'it comes' : 'they come'} on a later day.`;
   }
   return `${cards} ${verb} for the first time — ${comingToday} today (limit ${typed.per_day} a day), the rest on later days.`;
 }

@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { busyAnswer, busyWaitMs } from '../js/api.js';
-import { blockLabel, blockPreview, dayDone, dueTomorrow, moreNewCount, newWaiting, pausedForBacklog, typedLine } from '../js/day-plan.js';
+import { blockLabel, blockPreview, dayDone, dueTomorrow, moreNewCount, newWaiting, nextBlock, pausedForBacklog, typedLine } from '../js/day-plan.js';
 import { describePointer } from '../js/import-issues.js';
 import { RATING_GUARD_MS, ratingGuardOpen, sameSpotTap } from '../js/rating.js';
 
@@ -121,4 +121,41 @@ test('R-52 Today says how many Produce cards wait for their first time and how m
   );
   assert.equal(line(5, { paused: true, quota: 0 }), '5 Produce cards wait for the first time — held back until you catch up on reviews.');
   assert.equal(typedLine(today()), null, 'an older server without the counts');
+});
+
+test('R-52 cap 0 says first-time Produce cards are switched off and where to change it', () => {
+  const t = today({
+    typed_waiting: 4,
+    typed_today: 0,
+    new_typed: { per_day: 0, introduced_today: 0, left_today: 0, quota: 0, paused: false },
+  });
+  assert.equal(
+    typedLine(t),
+    '4 Produce cards wait for the first time — new Produce cards are switched off (New Produce cards per day in Settings).',
+  );
+});
+
+test('R-52 Produce cards whose words already have a card today come on a later day, and the day is done', () => {
+  const t = today({
+    due_now: 0,
+    typed_waiting: 1,
+    typed_today: 0,
+    next_block: { due: 0, new: 0 },
+    new_typed: { per_day: 10, introduced_today: 0, left_today: 10, quota: 10, paused: false },
+  });
+  assert.equal(typedLine(t), '1 Produce card waits for the first time — its word has a card today already, so it comes on a later day.');
+  assert.equal(dayDone(t, 20), true, 'no Start that yields nothing');
+  const some = today({
+    typed_waiting: 5,
+    typed_today: 3,
+    new_typed: { per_day: 10, introduced_today: 0, left_today: 10, quota: 10, paused: false },
+  });
+  assert.equal(typedLine(some), '5 Produce cards wait for the first time — 3 today (limit 10 a day), the rest on later days.');
+});
+
+test('R-52 the Start label is the server\'s own plan when it sends one', () => {
+  // Counts alone would promise a card (due_now 1); the server's plan is empty.
+  assert.deepEqual(nextBlock(today({ due_now: 1, next_block: { due: 0, new: 0 } }), 20), { total: 0, due: 0, fresh: 0 });
+  assert.deepEqual(nextBlock(today({ due_now: 9, next_block: { due: 4, new: 1 } }), 5), { total: 5, due: 4, fresh: 1 });
+  assert.deepEqual(nextBlock(today({ due_now: 2 }), 20), { total: 2, due: 2, fresh: 0 }, 'older server');
 });

@@ -273,32 +273,36 @@ struct Planned {
     origin: ItemOrigin,
 }
 
-/// A due card ranked for the block: relearning first, then priority
-/// (highest first), then `rank` (the waiting order of first-time cards),
-/// then card id.
+/// A due card ranked for the block: relearning first, then reviews before
+/// first-time cards, then priority (highest first), then `rank` (the
+/// waiting order of first-time cards), then card id.
 struct Ranked {
     relearning: bool,
+    first_time: bool,
     priority: f64,
     rank: usize,
     card: Card,
 }
 
-/// Steps 1–3: due cards of `kinds` in priority order, one per word, sibling
-/// rule and Spelling cap applied.
+/// Steps 1–3 without the per-block Spelling cap: every card of `kinds`
+/// that today's blocks still serve, in block order, one per word. The one
+/// place that applies the exclusions (sibling rule, daily cap of first-time
+/// cards); block plans, Today's counts and the "nothing due" check of
+/// extra practice all come from it.
 ///
 /// Produce/Spelling cards waiting for their first review (design §17 M8)
 /// join only up to `typed_quota`, those waiting longest first (then
-/// usefulness, then card id), with the neutral priority 0, and never in
-/// place of a due review of the same word: a review put off costs memory,
-/// a first-time card loses nothing by waiting a day.
-fn plan_due(
+/// usefulness, then card id), after every due review, and never in place
+/// of a due review of the same word: a review put off costs memory, a
+/// first-time card loses nothing by waiting a day.
+fn due_cards(
     conn: &Connection,
     day: StudyDay,
     kinds: &[CardKind],
     words: &HashMap<WordId, PracticeWord>,
     reviewed_today: &HashMap<WordId, HashSet<CardId>>,
     typed_quota: u32,
-) -> rusqlite::Result<Vec<Planned>> {
+) -> rusqlite::Result<Vec<Card>> {
     let model = scheduler::model(conn)?;
     let (mut first_time, reviews): (Vec<Card>, Vec<Card>) = scheduled_of(conn, words, kinds)?
         .into_iter()
@@ -317,6 +321,7 @@ fn plan_due(
         if let Some(word) = words.get(&card.word_id) {
             due.push(Ranked {
                 relearning: card.state == CardState::Relearning,
+                first_time: false,
                 priority: model.priority(&card, &word.traits, day),
                 rank: 0,
                 card,
@@ -337,29 +342,42 @@ fn plan_due(
         .filter(|c| !review_words.contains(&c.word_id) && typed_words.insert(c.word_id))
         .take(typed_quota as usize);
     for (rank, card) in admitted.enumerate() {
-        if let Some(word) = words.get(&card.word_id) {
-            due.push(Ranked {
-                relearning: false,
-                priority: model.priority(&card, &word.traits, day),
-                rank,
-                card,
-            });
-        }
+        due.push(Ranked {
+            relearning: false,
+            first_time: true,
+            priority: 0.0,
+            rank,
+            card,
+        });
     }
     due.sort_by(|a, b| {
         b.relearning
             .cmp(&a.relearning)
+            .then(a.first_time.cmp(&b.first_time))
             .then(b.priority.total_cmp(&a.priority))
             .then(a.rank.cmp(&b.rank))
             .then(a.card.id.cmp(&b.card.id))
     });
     let mut seen_words = HashSet::new();
+    Ok(due
+        .into_iter()
+        .map(|r| r.card)
+        .filter(|card| seen_words.insert(card.word_id))
+        .collect())
+}
+
+/// Steps 1–3: [`due_cards`] with the Spelling cap of one block.
+fn plan_due(
+    conn: &Connection,
+    day: StudyDay,
+    kinds: &[CardKind],
+    words: &HashMap<WordId, PracticeWord>,
+    reviewed_today: &HashMap<WordId, HashSet<CardId>>,
+    typed_quota: u32,
+) -> rusqlite::Result<Vec<Planned>> {
     let mut spelling = 0;
     let mut planned = Vec::new();
-    for Ranked { card, .. } in due {
-        if !seen_words.insert(card.word_id) {
-            continue;
-        }
+    for card in due_cards(conn, day, kinds, words, reviewed_today, typed_quota)? {
         if card.kind == CardKind::Spelling {
             if spelling == SPELLING_CAP {
                 continue;
@@ -443,6 +461,71 @@ fn interleave(due: Vec<Planned>, new: Vec<Planned>, block_size: usize) -> Vec<Pl
     out
 }
 
+/// What every count and plan of a regular block on one day starts from.
+struct DayInputs {
+    words: HashMap<WordId, PracticeWord>,
+    reviewed_today: HashMap<WordId, HashSet<CardId>>,
+    new: NewAllowance,
+    typed: TypedAllowance,
+}
+
+impl DayInputs {
+    fn read(
+        conn: &Connection,
+        day: StudyDay,
+        scope: Option<SourceId>,
+        settings: &Settings,
+    ) -> rusqlite::Result<Self> {
+        let new = new_word_allowance(conn, day, settings)?;
+        let typed = typed_allowance(conn, day, settings, &new)?;
+        Ok(Self {
+            words: catalog::practice_words(conn, scope)?,
+            reviewed_today: scheduler::reviewed_cards_on(conn, day)?,
+            new,
+            typed,
+        })
+    }
+
+    /// Every card today's regular blocks still serve as due ([`due_cards`]).
+    fn due_cards(&self, conn: &Connection, day: StudyDay) -> rusqlite::Result<Vec<Card>> {
+        due_cards(
+            conn,
+            day,
+            SERVED_KINDS,
+            &self.words,
+            &self.reviewed_today,
+            self.typed.quota,
+        )
+    }
+
+    /// The items of the next regular block (steps 1–5), without sentences.
+    fn plan_block(
+        &self,
+        conn: &Connection,
+        day: StudyDay,
+        settings: &Settings,
+    ) -> rusqlite::Result<Vec<Planned>> {
+        let due = plan_due(
+            conn,
+            day,
+            SERVED_KINDS,
+            &self.words,
+            &self.reviewed_today,
+            self.typed.quota,
+        )?;
+        let due_words: HashSet<WordId> = due.iter().map(|p| p.word).collect();
+        let new = plan_new(
+            conn,
+            day,
+            self.new.quota,
+            &self.words,
+            &self.reviewed_today,
+            &due_words,
+        )?;
+        Ok(interleave(due, new, settings.block_size as usize))
+    }
+}
+
 /// The items of a new block (steps 1–5), without sentences.
 fn plan_block(
     conn: &Connection,
@@ -450,52 +533,80 @@ fn plan_block(
     scope: Option<SourceId>,
     settings: &Settings,
 ) -> rusqlite::Result<Vec<Planned>> {
-    let words = catalog::practice_words(conn, scope)?;
-    let reviewed_today = scheduler::reviewed_cards_on(conn, day)?;
-    let allowance = new_word_allowance(conn, day, settings)?;
-    let typed = typed_allowance(conn, day, settings, &allowance)?;
-    let due = plan_due(
-        conn,
-        day,
-        SERVED_KINDS,
-        &words,
-        &reviewed_today,
-        typed.quota,
-    )?;
-    let due_words: HashSet<WordId> = due.iter().map(|p| p.word).collect();
-    let new = plan_new(
-        conn,
-        day,
-        allowance.quota,
-        &words,
-        &reviewed_today,
-        &due_words,
-    )?;
-    Ok(interleave(due, new, settings.block_size as usize))
+    DayInputs::read(conn, day, scope, settings)?.plan_block(conn, day, settings)
 }
 
-/// Is anything left for a regular block in `scope` on `day`: a due review,
-/// or a first-time Produce/Spelling card that today's cap still lets in?
+/// What a regular block started now would hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct BlockPreview {
+    /// Due items (reviews and first-time Produce/Spelling cards).
+    pub due: u32,
+    /// New words.
+    pub new: u32,
+}
+
+/// What regular practice in a scope still serves today (Today's counts):
+/// exactly what the block builder will serve, so Today never offers a
+/// block that comes out empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DueToday {
+    /// Cards today's blocks serve as due: due reviews, one per word, minus
+    /// words that already had a card today, plus the first-time
+    /// Produce/Spelling cards today's cap lets in.
+    pub due: u32,
+    /// Of those, cards rated 4/5 earlier (repeated first).
+    pub relearning: u32,
+    /// Of those, first-time Produce/Spelling cards.
+    pub first_time: u32,
+    /// The next regular block (`Start`/`Continue` without an active block).
+    pub next_block: BlockPreview,
+}
+
+/// What regular practice in `scope` serves on `day` (see [`DueToday`]).
+pub fn due_today(
+    conn: &Connection,
+    day: StudyDay,
+    scope: Option<SourceId>,
+    settings: &Settings,
+) -> rusqlite::Result<DueToday> {
+    let inputs = DayInputs::read(conn, day, scope, settings)?;
+    let cards = inputs.due_cards(conn, day)?;
+    let block = inputs.plan_block(conn, day, settings)?;
+    let of_origin = |origin: ItemOrigin| count(block.iter().filter(|p| p.origin == origin).count());
+    Ok(DueToday {
+        due: count(cards.len()),
+        relearning: count(
+            cards
+                .iter()
+                .filter(|c| c.state == CardState::Relearning)
+                .count(),
+        ),
+        first_time: count(cards.iter().filter(|c| c.awaits_first_review()).count()),
+        next_block: BlockPreview {
+            due: of_origin(ItemOrigin::Due),
+            new: of_origin(ItemOrigin::New),
+        },
+    })
+}
+
+/// Is anything left for a regular block in `scope` on `day` as due: a due
+/// review or a first-time Produce/Spelling card that today's blocks still
+/// serve?
 fn anything_due(
     conn: &Connection,
     day: StudyDay,
     scope: Option<SourceId>,
     settings: &Settings,
 ) -> rusqlite::Result<bool> {
-    if reviews_in_scope(conn, scope)?
-        .iter()
-        .any(|c| c.is_due_on(day))
-    {
-        return Ok(true);
-    }
-    let new = new_word_allowance(conn, day, settings)?;
-    Ok(typed_allowance(conn, day, settings, &new)?.quota > 0
-        && typed_waiting(conn, day, scope)? > 0)
+    Ok(!DayInputs::read(conn, day, scope, settings)?
+        .due_cards(conn, day)?
+        .is_empty())
 }
 
 /// Extra practice (R-63, design §6.9), offered only while nothing is due
 /// in `scope` (due cards come first; an empty plan otherwise — first-time
-/// Produce/Spelling cards count as due while today's cap lets them in):
+/// Produce/Spelling cards count as due while today's blocks still serve
+/// them):
 /// cards already seen (at least one review) of the served kinds in
 /// `scope`, one per word.
 /// Cards whose latest rating today was 1–2 are left out (just shown, known);
