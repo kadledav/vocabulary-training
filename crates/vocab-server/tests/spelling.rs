@@ -7,6 +7,8 @@
 
 mod common;
 
+use std::collections::HashSet;
+
 use axum::http::StatusCode;
 use common::{Env, env, word};
 use serde_json::{Value, json};
@@ -248,6 +250,59 @@ async fn r58_extra_practice_keeps_the_cap_too() {
     let extra = start(&env, "extra").await;
     assert_eq!(items(&extra).len(), 5);
     assert_eq!(count_kind(&extra, "spelling"), 3, "{extra}");
+}
+
+#[tokio::test]
+async fn r58_extra_practice_spends_the_cap_on_cards_it_serves() {
+    let env = env();
+    env.import("test-novel", spelling_words("sz", 6)).await;
+    spelling_cards(&env, "2026-12-30", "2026-12-10", false);
+    // Three words rank their Understand card first (least well recalled):
+    // their Spelling cards are not served, so they must not use up the cap.
+    env.exec(
+        "UPDATE card SET stability = 0.5, last_review_day = '2026-10-01' WHERE kind = 'understand' \
+         AND word_id IN (SELECT id FROM word WHERE headword IN ('sz01', 'sz02', 'sz03'))",
+    );
+    let t = today(&env).await;
+    assert_eq!(t["due_now"], 0, "{t}");
+    let extra = start(&env, "extra").await;
+    let served: Vec<(String, String)> = items(&extra)
+        .iter()
+        .map(|i| {
+            (
+                i["word"]["headword"].as_str().expect("headword").to_owned(),
+                i["card"]["kind"].as_str().expect("kind").to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(count_kind(&extra, "spelling"), 3, "{served:?}");
+    assert_eq!(count_kind(&extra, "understand"), 3, "{served:?}");
+    for (headword, kind) in &served {
+        let spelling = ["sz04", "sz05", "sz06"].contains(&headword.as_str());
+        assert_eq!(kind == "spelling", spelling, "{served:?}");
+    }
+    assert_eq!(t["extra_available"], 6, "{t}");
+}
+
+#[tokio::test]
+async fn r58_a_regular_block_counts_the_cap_on_the_cards_it_serves_too() {
+    let env = env();
+    env.import("test-novel", spelling_words("sy", 6)).await;
+    spelling_cards(&env, "2026-12-30", "2026-11-19", false);
+    // Three words have their Understand card due as well, long overdue:
+    // one card per word, so at most one of each pair is served.
+    env.exec(
+        "UPDATE card SET due_day = '2026-10-01', stability = 0.5, last_review_day = '2026-09-25' \
+         WHERE kind = 'understand' \
+         AND word_id IN (SELECT id FROM word WHERE headword IN ('sy01', 'sy02', 'sy03'))",
+    );
+    let block = start_block(&env).await;
+    assert_eq!(count_kind(&block, "spelling"), 3, "{:?}", kinds(&block));
+    let words: HashSet<String> = items(&block)
+        .iter()
+        .map(|i| i["word"]["headword"].as_str().expect("headword").to_owned())
+        .collect();
+    assert_eq!(words.len(), items(&block).len(), "one card per word");
 }
 
 // ── the item (design §7.1 screen 3b) ────────────────────────────────────────

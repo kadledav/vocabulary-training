@@ -678,20 +678,32 @@ fn plan_extra(
             .then(a.1.total_cmp(&b.1))
             .then(a.2.id.cmp(&b.2.id))
     });
-    // An extra block keeps the Spelling cap of a block too (R-58); a word
-    // whose Spelling card waits may come with another card.
+    // One card per word, and the Spelling cap of a block (R-58) counted on
+    // the cards served: a Spelling card over the cap leaves its word free
+    // for its next card; one whose word is already served costs nothing.
     let mut seen_words = HashSet::new();
-    Ok(
-        spelling_capped(cards.into_iter().map(|(_, _, card)| card).collect())
-            .into_iter()
-            .filter(|card| seen_words.insert(card.word_id))
-            .map(|card| Planned {
-                card: card.id,
-                word: card.word_id,
-                origin: ItemOrigin::Due,
-            })
-            .collect(),
-    )
+    let mut spelling = 0;
+    Ok(cards
+        .into_iter()
+        .map(|(_, _, card)| card)
+        .filter(|card| {
+            if seen_words.contains(&card.word_id) {
+                return false;
+            }
+            if card.kind == CardKind::Spelling {
+                if spelling == SPELLING_CAP {
+                    return false;
+                }
+                spelling += 1;
+            }
+            seen_words.insert(card.word_id)
+        })
+        .map(|card| Planned {
+            card: card.id,
+            word: card.word_id,
+            origin: ItemOrigin::Due,
+        })
+        .collect())
 }
 
 /// How many cards an extra-practice block (R-63) in `scope` would serve now
