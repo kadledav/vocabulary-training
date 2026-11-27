@@ -663,6 +663,7 @@ def stop_checks(image: str, name: str) -> None:
         docker("run", "-d", "--pull=never", "--name", name, *SECURITY, *LIMITS, image)
         time.sleep(0.5)
         took, code = stop_timed()
+        print(f"docker stop during the start self-test: {took:.1f} s, exit {code}")
         check(took < STOP_LIMIT and code == "0", "docker stop during the start self-test: exits promptly with 0",
               f"{took:.1f} s, exit {code} | {one_line(container_log(name))[-300:]}")
 
@@ -679,6 +680,7 @@ def stop_checks(image: str, name: str) -> None:
         took, code = stop_timed()
         request.join(timeout=60)
         status, error_code = answer[0] if answer else (0, "no answer")
+        print(f"docker stop during a synthesis: {took:.1f} s, exit {code}, the request got {status} {error_code}")
         check(took < STOP_LIMIT and code == "0", "docker stop during a synthesis: exits promptly with 0",
               f"{took:.1f} s, exit {code}")
         check((status, error_code) == (503, "shutting_down"),
