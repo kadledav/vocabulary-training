@@ -450,11 +450,13 @@ test('R-56 a reload after Check returns to the checked answer; Undo after a relo
   await expect(page.getByTestId('check-result')).toHaveAttribute('data-match', 'none');
   await page.reload();
   await freezeClock(page);
-  await advanceClock(page, 700);
   // The checked side, not an empty question to retype the answer.
   await expect(page.getByTestId('check-result')).toHaveAttribute('data-match', 'none');
   await expect(page.getByTestId('typed')).toHaveText('glimmerus');
   await expect(page.getByTestId('suggestion')).toContainText('Suggested: 4');
+  // Open the rating guard only once the side is drawn: on a slow load the
+  // side can appear after the clock was frozen and advanced.
+  await advanceClock(page, 700);
   await page.getByRole('button', { name: /^Rate 3,/ }).click();
   await expect(page.getByTestId('toast')).toContainText('Rated 3');
 
