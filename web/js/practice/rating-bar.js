@@ -6,7 +6,7 @@
  */
 
 import { h } from '../dom.js';
-import { RATINGS, ratingAriaLabel, ratingGroups } from '../rating.js';
+import { RATINGS, rating, ratingAriaLabel, ratingGroups } from '../rating.js';
 
 /**
  * @typedef {import('../rating.js').Grade} Grade
@@ -17,15 +17,18 @@ import { RATINGS, ratingAriaLabel, ratingGroups } from '../rating.js';
  * @param {Rating} r
  * @param {(grade: Grade) => void} onRate
  * @param {Grade | null} chosen
+ * @param {Grade | null} suggested
  */
-function rateButton(r, onRate, chosen) {
+function rateButton(r, onRate, chosen, suggested) {
+  const isSuggested = suggested === r.grade;
   return h(
     'button',
     {
       type: 'button',
-      class: `rate rate-${r.grade} ${r.pass ? 'filled' : 'outlined'}${chosen === r.grade ? ' chosen' : ''}`,
+      class: `rate rate-${r.grade} ${r.pass ? 'filled' : 'outlined'}${chosen === r.grade ? ' chosen' : ''}${isSuggested ? ' suggested' : ''}`,
       'data-grade': r.grade,
-      'aria-label': ratingAriaLabel(r.grade),
+      'data-suggested': isSuggested,
+      'aria-label': `${ratingAriaLabel(r.grade)}${isSuggested ? ' (suggested)' : ''}`,
       onclick: () => onRate(r.grade),
     },
     h('span', { class: 'rate-num', 'aria-hidden': 'true' }, String(r.grade)),
@@ -36,8 +39,9 @@ function rateButton(r, onRate, chosen) {
 /**
  * @param {(grade: Grade) => void} onRate
  * @param {Grade | null} [chosen] the grade being saved: shown pressed at once (U3)
+ * @param {Grade | null} [suggested] a typed card's suggested grade: ringed (R-56)
  */
-export function ratingBar(onRate, chosen = null) {
+export function ratingBar(onRate, chosen = null, suggested = null) {
   const { pass, fail } = ratingGroups();
   return h(
     'div',
@@ -51,10 +55,25 @@ export function ratingBar(onRate, chosen = null) {
     h(
       'div',
       { class: 'rating-bar', role: 'group', 'aria-label': 'Rate the word: 1 = best, 5 = no idea' },
-      pass.map((r) => rateButton(r, onRate, chosen)),
+      pass.map((r) => rateButton(r, onRate, chosen, suggested)),
       h('span', { class: 'rating-divider', 'aria-hidden': 'true', 'data-testid': 'rating-divider' }, '┆'),
-      fail.map((r) => rateButton(r, onRate, chosen)),
+      fail.map((r) => rateButton(r, onRate, chosen, suggested)),
     ),
+  );
+}
+
+/**
+ * The line above the rating bar of a typed card: what the check suggests
+ * and that the owner decides (R-56: the 1–5 rating is his).
+ *
+ * @param {Grade | null} suggested
+ */
+export function suggestionLine(suggested) {
+  if (suggested === null) return h('p', { class: 'criterion', 'data-testid': 'suggestion' }, 'Rate yourself: how well did you know the word?');
+  return h(
+    'p',
+    { class: 'criterion', 'data-testid': 'suggestion' },
+    `Suggested: ${suggested} · ${rating(suggested).label} — Enter or tap it, or choose another.`,
   );
 }
 

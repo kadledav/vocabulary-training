@@ -26,8 +26,12 @@
 
 /**
  * @typedef {{ key: string, code?: string, ctrlKey?: boolean, metaKey?: boolean, altKey?: boolean, repeat?: boolean }} KeyPress
+ * `accept`: Enter on the answer side takes a typed card's suggested grade
+ * (design §7.3; nothing on a card without a suggestion). `hint`: H on a
+ * typed card's question side (when the answer field has no focus).
+ *
  * @typedef {'reveal' | 'next' | 'undo' | 'more' | 'speak-sentence' | 'speak-word' | 'detail' | 'end' | 'help'
- *           | { rate: 1 | 2 | 3 | 4 | 5 }} Action
+ *           | 'accept' | 'hint' | { rate: 1 | 2 | 3 | 4 | 5 }} Action
  * @typedef {{ action: Action | null, preventDefault: boolean }} KeyResult
  */
 
@@ -104,6 +108,7 @@ export function keyAction(press, phase, target) {
     // Enter on a focused button activates that button (keyboard access).
     if (target === 'control' || target === 'rating') return NOTHING;
     if (press.repeat) return handled(null);
+    if (phase === 'answer') return handled('accept');
     const action = advance(phase);
     return action ? handled(action) : NOTHING;
   }
@@ -126,6 +131,8 @@ export function keyAction(press, phase, target) {
       return handled('speak-word');
     case 'e':
       return handled('detail');
+    case 'h':
+      return phase === 'question' ? handled('hint') : NOTHING;
     default:
       return NOTHING;
   }

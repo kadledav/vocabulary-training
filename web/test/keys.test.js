@@ -40,6 +40,22 @@ test('R-70 Enter on a focused button activates that button instead of a mapped a
   assert.deepEqual(keyAction({ key: ' ' }, 'question', 'control'), { action: null, preventDefault: false });
 });
 
+test('R-56 Enter on the answer side accepts the suggested grade; Space never rates', () => {
+  assert.equal(act('Enter', 'answer'), 'accept');
+  assert.equal(act('Enter', 'answer', 'page', { repeat: true }), null);
+  assert.equal(act(' ', 'answer'), null);
+  assert.equal(act('Enter', 'answer', 'text'), null, 'typing in a field is never a shortcut');
+});
+
+test('R-56 H asks for the hint on the question side only; typed letters are never shortcuts', () => {
+  assert.equal(act('h', 'question'), 'hint');
+  assert.equal(act('H', 'question'), 'hint');
+  assert.equal(act('h', 'answer'), null);
+  for (const key of ['h', 'u', 'e', '1', 'Enter', ' ', '?', 'Escape']) {
+    assert.deepEqual(keyAction({ key }, 'question', 'text'), { action: null, preventDefault: false }, key);
+  }
+});
+
 test('R-70 Space/Enter move on after a fail and from the finished block', () => {
   assert.equal(act(' ', 'feedback'), 'next');
   assert.equal(act('Enter', 'feedback'), 'next');

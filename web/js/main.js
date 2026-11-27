@@ -17,7 +17,8 @@ import { renderPractice } from './screens/practice.js';
 import { renderSettings } from './screens/settings.js';
 import { renderSummary } from './screens/summary.js';
 import { renderToday } from './screens/today.js';
-import { renderWord, renderWords } from './screens/words.js';
+import { renderWord } from './screens/word.js';
+import { renderWords } from './screens/words.js';
 import { loadSettings } from './settings.js';
 import { applyRememberedTheme } from './theme.js';
 

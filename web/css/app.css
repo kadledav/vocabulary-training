@@ -1384,3 +1384,458 @@ ul.issues.warning {
 .word-head {
   overflow-wrap: anywhere;
 }
+
+/* ── M7: Words list filters ─────────────────────────────────────────────── */
+
+.word-filters > summary {
+  color: var(--accent);
+}
+
+.filter-panel {
+  display: grid;
+  gap: 0.75rem;
+  padding-bottom: 0.5rem;
+}
+
+/* Choices sit side by side and wrap (a short panel on a phone). */
+fieldset.choices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 1rem;
+}
+
+fieldset.choices > legend {
+  width: 100%;
+}
+
+fieldset.choices .choice-option {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.range-part {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: 2.75rem;
+}
+
+input.small-number {
+  width: 5rem;
+}
+
+/* ── M7: word detail ────────────────────────────────────────────────────── */
+
+.word-detail {
+  overflow-wrap: anywhere;
+}
+
+.word-section {
+  margin-top: 2rem;
+}
+
+.word-section h3 {
+  margin: 1rem 0 0.25rem;
+}
+
+.value-text {
+  white-space: pre-wrap;
+}
+
+.conflict-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.conflict-list > li + li {
+  margin-top: 1rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--border);
+}
+
+.conflict-list p {
+  margin: 0.2rem 0;
+}
+
+.stepper {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.stepper-label {
+  flex: 1;
+}
+
+button.step {
+  width: 2.75rem;
+  padding: 0;
+  font-size: 1.25rem;
+  font-weight: 700;
+}
+
+.stepper-value {
+  min-width: 2ch;
+  text-align: center;
+  font-size: 1.25rem;
+  font-weight: 700;
+}
+
+/* One field per block: label above, value and Edit below (phone width). */
+dl.edit-fields {
+  display: block;
+}
+
+dl.edit-fields .field {
+  display: block;
+  padding: 0.5rem 0;
+  border-top: 1px solid var(--border);
+}
+
+dl.edit-fields dd {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+dl.edit-fields dd .value-text {
+  flex: 1;
+  min-width: 0;
+  padding-top: 0.6rem;
+}
+
+dl.edit-fields dd.editing {
+  display: block;
+}
+
+.field-editor {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.field-editor label {
+  font-weight: 600;
+}
+
+.field-editor .actions,
+.confirm .actions {
+  margin: 0;
+}
+
+.field-editor input[type="text"],
+.add-item input[type="text"] {
+  width: 100%;
+  min-height: 2.75rem;
+  font: inherit;
+  font-size: max(1rem, 16px);
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  padding: 0.5rem 0.75rem;
+}
+
+/* Sentences are edited in their own words, not in a code font. */
+.field-editor textarea {
+  font-family: inherit;
+}
+
+ul.chips {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  padding: 0;
+  margin: 0.25rem 0 0.5rem;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  max-width: 100%;
+  padding-left: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  overflow-wrap: anywhere;
+}
+
+button.chip-remove {
+  min-width: 2.75rem;
+  padding: 0;
+  border: none;
+  border-radius: 999px;
+  font-size: 1.25rem;
+  color: var(--muted);
+}
+
+form.add-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+form.add-item input[type="text"] {
+  flex: 1 1 10rem;
+  width: auto;
+  min-width: 0;
+}
+
+.rare-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  min-height: 2.75rem;
+}
+
+/* A hidden sentence is dimmed, its buttons are not. */
+.hidden-sentence {
+  opacity: 1;
+}
+
+.hidden-sentence > p {
+  opacity: 0.6;
+}
+
+.card-list,
+.history-list {
+  padding-left: 1.25rem;
+  margin: 0.25rem 0;
+}
+
+.card-list > li + li,
+.history-list > li + li {
+  margin-top: 0.5rem;
+}
+
+.history-sentence {
+  display: block;
+}
+
+button.danger {
+  border-color: var(--error);
+  color: var(--error);
+}
+
+button.danger.primary {
+  background: var(--error);
+  color: var(--bg);
+}
+
+.confirm {
+  padding: 0.75rem 1rem;
+  border-left: 0.25rem solid var(--error);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.confirm p {
+  margin: 0 0 0.75rem;
+}
+
+/* The word screen's toast floats above the bottom edge. */
+.word-toast {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: calc(1rem + env(safe-area-inset-bottom, 0px));
+  padding: 0 1rem;
+  pointer-events: none;
+  z-index: 10;
+}
+
+.word-toast .toast {
+  pointer-events: auto;
+}
+
+.danger-zone {
+  margin-bottom: 5rem;
+}
+
+/* ── Produce card (design §7.1 screen 3, research wireframes 4/4b) ─────── */
+
+/* The on-screen keyboard covers the bottom of the layout viewport; the bar
+   with the answer field moves up by that much (set from visualViewport). */
+.practice-bottom {
+  bottom: var(--keyboard-inset, 0px);
+}
+
+/* Little room above the keyboard (phone in landscape): only the hint and
+   the answer row stay in the bar; the other actions come back with the
+   space. Portrait keeps the full bar. */
+.keyboard-tight .practice-bottom {
+  padding: 0.25rem 0;
+  max-height: none;
+}
+
+.keyboard-tight .typed-actions {
+  display: none;
+}
+
+.keyboard-tight .typed-hint {
+  margin-bottom: 0.2rem;
+  font-size: 1rem;
+}
+
+.keyboard-tight input.answer-input,
+.keyboard-tight button.check-button {
+  min-height: 2.5rem;
+}
+
+.keyboard-tight .practice-top {
+  padding: 0.125rem 0;
+}
+
+/* …and the page grows by as much, so the card above the bar can still be
+   scrolled into view. */
+.practice {
+  padding-bottom: var(--keyboard-inset, 0px);
+}
+
+.mono {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+/* The blank in the sentence: a line the width of a short word. */
+.cloze .blank {
+  display: inline-block;
+  min-width: 4.5em;
+  margin: 0 0.15em;
+  border-bottom: 2px solid var(--accent);
+}
+
+.typed-hint {
+  margin: 0 0 0.4rem;
+  font-size: 1.125rem;
+}
+
+.typed-hint .mono {
+  letter-spacing: 0.05em;
+  white-space: pre-wrap;
+}
+
+.answer-row {
+  display: flex;
+  gap: 0.5rem;
+}
+
+/* 16 px at least, or iOS zooms the page when the field gets focus. */
+input.answer-input {
+  flex: 1;
+  min-width: 0;
+  min-height: 3rem;
+  font-size: max(1.125rem, 16px);
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  padding: 0.5rem 0.75rem;
+}
+
+button.check-button {
+  flex: none;
+  min-height: 3rem;
+  min-width: 5.5rem;
+  font-weight: 600;
+}
+
+.typed-note {
+  margin: 0.35rem 0 0;
+  font-size: 0.875rem;
+  color: var(--rate-3);
+}
+
+.typed-actions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.375rem;
+  margin-top: 0.5rem;
+}
+
+.typed-actions button {
+  min-width: 0;
+  padding: 0.25rem 0.375rem;
+  font-size: 0.875rem;
+  border-color: var(--border);
+  color: var(--text);
+}
+
+.typed-actions button[data-testid="hint-button"]:disabled {
+  color: var(--muted);
+}
+
+/* What the check found: colour, symbol and words (not colour alone). */
+.check {
+  margin: 0 0 0.75rem;
+  padding: 0.6rem 0.9rem;
+  border-radius: var(--radius);
+  background: var(--surface);
+  border-left: 0.3rem solid var(--border);
+}
+
+.check-ok {
+  border-left-color: var(--ok);
+}
+
+.check-miss {
+  border-left-color: var(--rate-4);
+}
+
+/* The right word in another form: friendly, neither an error nor a full pass. */
+.check-near {
+  border-left-color: var(--rate-3);
+}
+
+.check-title {
+  margin: 0;
+  font-size: 1.125rem;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.check-ok .check-title {
+  color: var(--ok);
+}
+
+/* "you typed" right above "answer", in the same monospace columns, so a
+   one-letter slip is easy to see. */
+dl.typed-vs {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 0.15rem 0.6rem;
+  margin: 0.4rem 0;
+  font-size: 1.125rem;
+}
+
+dl.typed-vs dt {
+  color: var(--muted);
+  font-size: 0.875rem;
+  align-self: center;
+}
+
+dl.typed-vs dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.check p.small {
+  margin: 0.25rem 0 0;
+}
+
+button.accept-typed {
+  margin-top: 0.4rem;
+  padding: 0.35rem 0.75rem;
+  min-height: 2.75rem;
+  text-align: left;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+/* The suggested grade of a typed card: a ring around the button. */
+button.rate.suggested {
+  box-shadow: 0 0 0 3px var(--bg), 0 0 0 5px var(--rate);
+}

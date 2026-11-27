@@ -6,7 +6,8 @@
 //! catalog tables (design §3.2).
 //!
 //! Owned tables: `source`, `word`, `word_source`, `word_item`, `word_form`,
-//! `sentence`, `word_override`, `field_conflict`. The `audio` module reads
+//! `sentence`, `word_override`, `field_conflict`, `word_pack_spelling`,
+//! `id_floor`. The `audio` module reads
 //! what can be spoken through [`speak_sources`]. All SQL touching them is in
 //! this module (R-92). Other modules use the functions re-exported here.
 //!
@@ -14,22 +15,37 @@
 //! application. The import preview runs the real [`merge_word`] inside a
 //! transaction that is always rolled back (`workflows`).
 
+mod edit;
+mod identity;
+mod ids;
 mod merge;
 mod practice;
 mod read;
+mod scalar;
+mod snapshot;
 mod source;
 mod speak;
 
 use serde::Serialize;
 
+pub use edit::{
+    EditError, ListKind, add_item, delete_word, remove_item, remove_pack_spelling,
+    resolve_conflict, set_included, set_sentence_hidden, set_suspended, update_sentence,
+    update_word,
+};
+pub use identity::PackSpelling;
 pub use merge::{ConflictReport, ImportLink, ItemsAdded, MergeOutcome, WordMerge, merge_word};
 pub use practice::{
     PracticeWord, WordTraits, all_traits, practice_words, source_exists, traits, word_traits,
 };
 pub use read::{
-    ConflictView, FormView, PresentedForm, PresentedSentence, PresentedTag, SentenceView,
-    SourceLinkView, SourceSummary, TextParts, WordPresentation, WordQuery, WordRow, WordView,
-    presentation, sources, word_view, words,
+    ConflictView, FormItemView, FormView, ItemLists, ItemView, PresentedForm, PresentedSentence,
+    PresentedTag, SentenceView, SourceLinkView, SourceSummary, TextParts, WordPresentation,
+    WordQuery, WordRow, WordView, presentation, sources, word_view, words,
+};
+pub use snapshot::{
+    WordSnapshot, restore as restore_word, snapshot as word_snapshot, word_of_conflict,
+    word_of_sentence,
 };
 pub use source::{ReadingUpdate, SourceUpsert, source_titles, upsert_source};
 pub use speak::{SpeakSource, speak_source, speak_sources};

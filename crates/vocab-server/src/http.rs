@@ -63,19 +63,20 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::audio::Audio;
 use crate::auth::{self, Auth, AuthError, CsrfRejection, SessionCheck};
-use crate::catalog::{self, SourceId, WordId, WordQuery};
+use crate::catalog::{self, EditError, ListKind, SourceId, WordId, WordQuery};
 use crate::clock::{Clock, DayRule, Moment, SystemClock};
 use crate::config::Limits;
 use crate::db::{Db, DbError};
 use crate::importer::Via;
 use crate::keep_alive;
 use crate::rate_limit::RateLimit;
-use crate::scheduler::{AnswerMatch, RawGrade};
+use crate::scheduler::{AnswerMatch, CardKind, RawGrade};
 use crate::session::{self, RateInput, SessionError, SessionId, StartKind, StartRequest};
 use crate::settings::{self, SettingsError, SettingsPatch};
-use crate::stats::{self, StatsError};
+use crate::stats::{self, StatsError, WordListQuery};
+use crate::undo::UndoToken;
 use crate::web_assets;
-use crate::workflows::{self, WorkflowError};
+use crate::workflows::{self, WordAction, WorkflowError};
 
 const HEALTHZ_PATH: &str = "/healthz";
 
@@ -237,6 +238,7 @@ enum Verb {
     Get,
     Post,
     Patch,
+    Delete,
 }
 
 impl Verb {
@@ -245,6 +247,7 @@ impl Verb {
             Self::Get => Method::GET,
             Self::Post => Method::POST,
             Self::Patch => Method::PATCH,
+            Self::Delete => Method::DELETE,
         }
     }
 
@@ -253,6 +256,7 @@ impl Verb {
             Self::Get => MethodFilter::GET,
             Self::Post => MethodFilter::POST,
             Self::Patch => MethodFilter::PATCH,
+            Self::Delete => MethodFilter::DELETE,
         }
     }
 }
@@ -315,7 +319,7 @@ where
 fn endpoints() -> Vec<Endpoint> {
     use Access::{ImportToken, Public, Session};
     use Group::{Connector, Health, ImportCommit, ImportPreview, Login, PublicLogin, Standard};
-    use Verb::{Get, Patch, Post};
+    use Verb::{Delete, Get, Patch, Post};
     vec![
         endpoint(Health, Public, Get, HEALTHZ_PATH, healthz),
         endpoint(
@@ -371,6 +375,58 @@ fn endpoints() -> Vec<Endpoint> {
         endpoint(Standard, Session, Get, "/api/sources", list_sources),
         endpoint(Standard, Session, Get, "/api/words", list_words),
         endpoint(Standard, Session, Get, "/api/words/{id}", show_word),
+        endpoint(Standard, Session, Patch, "/api/words/{id}", patch_word),
+        endpoint(Standard, Session, Delete, "/api/words/{id}", delete_word),
+        endpoint(
+            Standard,
+            Session,
+            Post,
+            "/api/words/{id}/actions",
+            word_action,
+        ),
+        endpoint(
+            Standard,
+            Session,
+            Post,
+            "/api/words/{id}/undo",
+            undo_word_change,
+        ),
+        endpoint(Standard, Session, Post, "/api/words/{id}/items", add_item),
+        endpoint(
+            Standard,
+            Session,
+            Delete,
+            "/api/words/{id}/items",
+            remove_item,
+        ),
+        endpoint(
+            Standard,
+            Session,
+            Delete,
+            "/api/words/{id}/spellings",
+            remove_spelling,
+        ),
+        endpoint(
+            Standard,
+            Session,
+            Post,
+            "/api/conflicts/{id}",
+            resolve_conflict,
+        ),
+        endpoint(
+            Standard,
+            Session,
+            Patch,
+            "/api/sentences/{id}",
+            patch_sentence,
+        ),
+        endpoint(
+            Standard,
+            Session,
+            Post,
+            "/api/sentences/{id}/hidden",
+            hide_sentence,
+        ),
         endpoint(Standard, Session, Get, "/api/today", today),
         endpoint(Standard, Session, Post, "/api/sessions", start_session),
         endpoint(
@@ -1092,38 +1148,120 @@ fn optional_number<'de, D: serde::Deserializer<'de>>(
     }
 }
 
+/// Longest search text of the word list.
+const WORD_SEARCH_MAX_CHARS: usize = 200;
+
 #[derive(Debug, Deserialize)]
 struct WordsParams {
     q: Option<String>,
     #[serde(default, deserialize_with = "optional_number")]
     source: Option<i64>,
+    #[serde(default, deserialize_with = "optional_number")]
+    min_u: Option<i64>,
+    #[serde(default, deserialize_with = "optional_number")]
+    max_u: Option<i64>,
+    /// `alpha`, `usefulness`, `added`, `due`, `status`, `source`.
+    sort: Option<String>,
+    /// `new`, `learning`, `familiar`, `known`, `leech`.
+    status: Option<String>,
+    /// Comma-separated: `conflicts`, `suspended`, `low_priority`.
+    flags: Option<String>,
 }
 
+/// A query value naming an enum variant (`None` when absent or empty).
+fn named<T: serde::de::DeserializeOwned>(text: Option<&str>) -> Result<Option<T>, ()> {
+    match text.map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(name) => serde_json::from_value(serde_json::Value::String(name.to_owned()))
+            .map(Some)
+            .map_err(|_| ()),
+    }
+}
+
+impl WordsParams {
+    fn into_query(self) -> Result<WordListQuery, &'static str> {
+        let usefulness = |u: Option<i64>| match u {
+            Some(n) if !(1..=10).contains(&n) => Err("min_u and max_u must be 1 to 10."),
+            other => Ok(other),
+        };
+        if self
+            .q
+            .as_ref()
+            .is_some_and(|q| q.chars().count() > WORD_SEARCH_MAX_CHARS)
+        {
+            return Err("The search text is too long (at most 200 characters).");
+        }
+        let mut filter = WordQuery {
+            text: self.q,
+            source: self.source,
+            min_usefulness: usefulness(self.min_u)?,
+            max_usefulness: usefulness(self.max_u)?,
+            ..WordQuery::default()
+        };
+        for flag in self.flags.as_deref().unwrap_or("").split(',') {
+            match flag.trim() {
+                "" => {}
+                "conflicts" => filter.with_conflicts = true,
+                "suspended" => filter.suspended = true,
+                "low_priority" => filter.low_priority = true,
+                _ => return Err("flags may be conflicts, suspended, low_priority."),
+            }
+        }
+        Ok(WordListQuery {
+            filter,
+            status: named(self.status.as_deref())
+                .map_err(|()| "status may be new, learning, familiar, known, leech.")?,
+            sort: named(self.sort.as_deref())
+                .map_err(|()| "sort may be alpha, usefulness, added, due, status, source.")?,
+        })
+    }
+}
+
+/// `GET /api/words`: the word list (design §7.1 screen 6, R-73).
 async fn list_words(
     State(state): State<AppState>,
     params: Result<Query<WordsParams>, QueryRejection>,
 ) -> Response {
     let Ok(Query(params)) = params else {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "bad_request",
-            "Invalid query parameters.",
-        );
+        return bad_request("Invalid query parameters.");
     };
-    let query = WordQuery {
-        text: params.q,
-        source: params.source,
+    let query = match params.into_query() {
+        Ok(query) => query,
+        Err(message) => return bad_request(message),
     };
+    respond(
+        state
+            .db
+            .read(move |conn| Ok::<_, ApiError>(stats::word_list(conn, &query)?))
+            .await,
+    )
+}
+
+/// The word's detail (design §7.1 screen 7), or 404. After an owner
+/// change, `undo` is the token of its Undo (`null`: nothing changed).
+async fn word_detail(state: &AppState, id: WordId, undo: Option<Option<UndoToken>>) -> Response {
+    let day = state.moment().day;
     match state
         .db
-        .read(move |conn| catalog::words(conn, &query).map_err(DbError::from))
+        .read(move |conn| Ok::<_, ApiError>(stats::word_detail(conn, day, id)?))
         .await
     {
-        Ok(rows) => Json(rows).into_response(),
-        Err(err) => internal_error(&err),
+        Ok(Some(detail)) => match undo {
+            None => Json(detail).into_response(),
+            Some(token) => match serde_json::to_value(&detail) {
+                Ok(mut value) => {
+                    value["undo"] = serde_json::json!(token);
+                    Json(value).into_response()
+                }
+                Err(err) => internal_error(&err),
+            },
+        },
+        Ok(None) => not_found().await,
+        Err(err) => api_error(&err),
     }
 }
 
+/// `GET /api/words/{id}`.
 async fn show_word(
     State(state): State<AppState>,
     id: Result<Path<i64>, PathRejection>,
@@ -1131,15 +1269,460 @@ async fn show_word(
     let Ok(Path(id)) = id else {
         return not_found().await;
     };
+    word_detail(&state, WordId::new(id), None).await
+}
+
+/// Answer for an owner edit that was refused.
+fn edit_error(err: &WorkflowError) -> Response {
+    let answer = |status: StatusCode, code: &str| error_response(status, code, &err.to_string());
+    match err {
+        WorkflowError::Edit(edit) => match edit {
+            EditError::WordNotFound
+            | EditError::SentenceNotFound
+            | EditError::ConflictNotFound
+            | EditError::ItemNotFound => answer(StatusCode::NOT_FOUND, "not_found"),
+            EditError::Invalid(_) => answer(StatusCode::UNPROCESSABLE_ENTITY, "invalid"),
+            EditError::LastCzech => answer(StatusCode::UNPROCESSABLE_ENTITY, "last_czech"),
+            EditError::TooManyItems => answer(StatusCode::UNPROCESSABLE_ENTITY, "too_many_items"),
+            EditError::ItemExists(_) => answer(StatusCode::CONFLICT, "item_exists"),
+            EditError::HeadwordTaken(_) | EditError::SpellingTaken { .. } => {
+                answer(StatusCode::CONFLICT, "headword_taken")
+            }
+            EditError::DuplicateSentence => answer(StatusCode::CONFLICT, "duplicate_sentence"),
+            EditError::ConflictClosed => answer(StatusCode::CONFLICT, "conflict_closed"),
+            EditError::Sqlite(_) => internal_error(err),
+        },
+        WorkflowError::NoSuchCard(_) => answer(StatusCode::UNPROCESSABLE_ENTITY, "no_such_card"),
+        WorkflowError::Undo(_) | WorkflowError::ChangedSince => {
+            answer(StatusCode::CONFLICT, "undo_unavailable")
+        }
+        other => internal_error(other),
+    }
+}
+
+/// What an owner edit did.
+struct Edited {
+    word: WordId,
+    /// Spoken text may have changed (the headword or `speak`).
+    spoken: bool,
+    /// `Some`: the change offers an Undo (`Some(None)`: nothing changed).
+    undo: Option<Option<UndoToken>>,
+}
+
+impl Edited {
+    /// A change with an Undo (see [`workflows::with_undo`]).
+    fn undoable(word: WordId, spoken: bool, undo: Option<UndoToken>) -> Self {
+        Self {
+            word,
+            spoken,
+            undo: Some(undo),
+        }
+    }
+}
+
+/// Run an owner edit in one transaction; then answer with the word's
+/// detail. `speech` = spoken text may have changed: the audio module syncs
+/// (new clips are queued, clips no text needs any more are dropped; a clip
+/// is named by its text, so an old one is never played for a new text).
+async fn edit_then_show<F>(state: &AppState, speech: bool, edit: F) -> Response
+where
+    F: FnOnce(&rusqlite::Transaction<'_>, &Moment) -> Result<Edited, WorkflowError>
+        + Send
+        + 'static,
+{
+    let now = state.moment();
+    match state.db.write(move |tx| edit(tx, &now)).await {
+        Ok(edited) => {
+            if (speech || edited.spoken)
+                && let Some(audio) = &state.audio
+            {
+                audio.wake();
+            }
+            word_detail(state, edited.word, edited.undo).await
+        }
+        Err(err) => edit_error(&err),
+    }
+}
+
+/// `PATCH /api/words/{id}` `{field: value, …}`: edit fields (R-04; the
+/// changed ones become the owner's, design §5.4 rule 4).
+async fn patch_word(
+    State(state): State<AppState>,
+    id: Result<Path<i64>, PathRejection>,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
+) -> Response {
+    let Ok(Path(id)) = id else {
+        return not_found().await;
+    };
+    let edit = match body {
+        Ok(Json(edit)) => edit,
+        Err(rejection) => {
+            return rejected_body(&rejection, "The body must be a JSON object of word fields.");
+        }
+    };
+    let id = WordId::new(id);
+    edit_then_show(&state, false, move |tx, now| {
+        let (changed, undo) =
+            workflows::with_undo(tx, id, now, |tx| workflows::edit_word(tx, id, &edit, now))?;
+        let spoken = changed.iter().any(|f| *f == "headword" || *f == "speak");
+        Ok(Edited::undoable(id, spoken, undo))
+    })
+    .await
+}
+
+/// `DELETE /api/words/{id}`: delete the word, its cards and history.
+async fn delete_word(
+    State(state): State<AppState>,
+    id: Result<Path<i64>, PathRejection>,
+) -> Response {
+    let Ok(Path(id)) = id else {
+        return not_found().await;
+    };
+    let id = WordId::new(id);
     match state
         .db
-        .read(move |conn| catalog::word_view(conn, WordId::new(id)).map_err(DbError::from))
+        .write(move |tx| workflows::delete_word(tx, id))
         .await
     {
-        Ok(Some(view)) => Json(view).into_response(),
-        Ok(None) => not_found().await,
-        Err(err) => internal_error(&err),
+        Ok(()) => {
+            if let Some(audio) = &state.audio {
+                audio.wake();
+            }
+            Json(serde_json::json!({ "deleted": id })).into_response()
+        }
+        Err(err) => edit_error(&err),
     }
+}
+
+/// Body of `POST /api/words/{id}/undo`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UndoBody {
+    /// The `undo` token of the change's answer.
+    token: String,
+}
+
+/// `POST /api/words/{id}/undo` `{token}`: undo the owner's latest change
+/// of the word, exactly (`409 undo_unavailable` when it is gone, too old,
+/// or the word changed since) → detail.
+async fn undo_word_change(
+    State(state): State<AppState>,
+    id: Result<Path<i64>, PathRejection>,
+    body: Result<Json<UndoBody>, JsonRejection>,
+) -> Response {
+    const SHAPE: &str = "The body must be {\"token\": \"…\"} with the undo token of the change.";
+    let Ok(Path(id)) = id else {
+        return not_found().await;
+    };
+    let token = match body {
+        Ok(Json(body)) => body.token,
+        Err(rejection) => return rejected_body(&rejection, SHAPE),
+    };
+    let Some(token) = UndoToken::parse(&token) else {
+        return error_response(StatusCode::UNPROCESSABLE_ENTITY, "invalid", SHAPE);
+    };
+    let id = WordId::new(id);
+    edit_then_show(&state, true, move |tx, now| {
+        workflows::undo_change(tx, id, &token, now)?;
+        Ok(Edited {
+            word: id,
+            spoken: true,
+            undo: None,
+        })
+    })
+    .await
+}
+
+/// Body of `POST /api/words/{id}/actions`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActionBody {
+    /// `suspend`, `unsuspend`, `include`, `exclude`, `reset_card`.
+    action: String,
+    /// `reset_card` only: `understand`, `produce` or `spelling`.
+    kind: Option<String>,
+}
+
+impl ActionBody {
+    fn action(&self) -> Option<WordAction> {
+        let kind = self.kind.as_deref();
+        match (self.action.as_str(), kind) {
+            ("suspend", None) => Some(WordAction::Suspend),
+            ("unsuspend", None) => Some(WordAction::Unsuspend),
+            ("include", None) => Some(WordAction::Include),
+            ("exclude", None) => Some(WordAction::Exclude),
+            ("reset_card", Some("understand")) => Some(WordAction::ResetCard(CardKind::Understand)),
+            ("reset_card", Some("produce")) => Some(WordAction::ResetCard(CardKind::Produce)),
+            ("reset_card", Some("spelling")) => Some(WordAction::ResetCard(CardKind::Spelling)),
+            _ => None,
+        }
+    }
+}
+
+/// `POST /api/words/{id}/actions`: suspend, include, reset a card.
+async fn word_action(
+    State(state): State<AppState>,
+    id: Result<Path<i64>, PathRejection>,
+    body: Result<Json<ActionBody>, JsonRejection>,
+) -> Response {
+    const SHAPE: &str = "The body must be {\"action\": \"suspend\"|\"unsuspend\"|\"include\"|\
+                         \"exclude\"|\"reset_card\", \"kind\"?: \"understand\"|\"produce\"|\"spelling\"}.";
+    let Ok(Path(id)) = id else {
+        return not_found().await;
+    };
+    let action = match body {
+        Ok(Json(body)) => match body.action() {
+            Some(action) => action,
+            None => return error_response(StatusCode::UNPROCESSABLE_ENTITY, "invalid", SHAPE),
+        },
+        Err(rejection) => return rejected_body(&rejection, SHAPE),
+    };
+    let id = WordId::new(id);
+    edit_then_show(&state, false, move |tx, now| {
+        // "Reset card" asks first and has no Undo.
+        if let WordAction::ResetCard(_) = action {
+            workflows::word_action(tx, id, action, now)?;
+            return Ok(Edited {
+                word: id,
+                spoken: false,
+                undo: None,
+            });
+        }
+        let ((), undo) = workflows::with_undo(tx, id, now, |tx| {
+            workflows::word_action(tx, id, action, now)
+        })?;
+        Ok(Edited::undoable(id, false, undo))
+    })
+    .await
+}
+
+/// Body of `POST /api/words/{id}/items`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ItemBody {
+    /// `czech`, `accepted`, `confusable`, `form`.
+    kind: String,
+    value: String,
+    /// Forms only (default true).
+    common: Option<bool>,
+}
+
+/// `POST /api/words/{id}/items`: add a Czech equivalent, an accepted
+/// answer (the owner's own), a confusable or a form.
+async fn add_item(
+    State(state): State<AppState>,
+    id: Result<Path<i64>, PathRejection>,
+    body: Result<Json<ItemBody>, JsonRejection>,
+) -> Response {
+    const SHAPE: &str = "The body must be {\"kind\": \"czech\"|\"accepted\"|\"confusable\"|\"form\", \
+                         \"value\": \"…\", \"common\"?: true|false}.";
+    let Ok(Path(id)) = id else {
+        return not_found().await;
+    };
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => return rejected_body(&rejection, SHAPE),
+    };
+    let Some(kind) = ListKind::parse(&body.kind) else {
+        return error_response(StatusCode::UNPROCESSABLE_ENTITY, "invalid", SHAPE);
+    };
+    let id = WordId::new(id);
+    edit_then_show(&state, false, move |tx, now| {
+        let ((), undo) = workflows::with_undo(tx, id, now, |tx| {
+            workflows::add_word_item(tx, id, kind, &body.value, body.common, now)
+        })?;
+        Ok(Edited::undoable(id, false, undo))
+    })
+    .await
+}
+
+/// Body of `DELETE /api/words/{id}/items`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoveItemBody {
+    /// `czech`, `accepted`, `confusable`, `form`.
+    kind: String,
+    /// The item's `key` from the word detail. Sent in the body, never in
+    /// the path: a key may be `.` or `..`, which URL normalisation removes.
+    key: String,
+}
+
+/// `DELETE /api/words/{id}/items` `{kind, key}`: remove a list item (by its
+/// key) for good: no later pack adds it again.
+async fn remove_item(
+    State(state): State<AppState>,
+    id: Result<Path<i64>, PathRejection>,
+    body: Result<Json<RemoveItemBody>, JsonRejection>,
+) -> Response {
+    const SHAPE: &str = "The body must be {\"kind\": \"czech\"|\"accepted\"|\"confusable\"|\"form\", \
+                         \"key\": \"…\"}.";
+    let Ok(Path(id)) = id else {
+        return not_found().await;
+    };
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => return rejected_body(&rejection, SHAPE),
+    };
+    let Some(kind) = ListKind::parse(&body.kind) else {
+        return error_response(StatusCode::UNPROCESSABLE_ENTITY, "invalid", SHAPE);
+    };
+    let id = WordId::new(id);
+    edit_then_show(&state, false, move |tx, now| {
+        let ((), undo) = workflows::with_undo(tx, id, now, |tx| {
+            workflows::remove_word_item(tx, id, kind, &body.key, now)
+        })?;
+        Ok(Edited::undoable(id, false, undo))
+    })
+    .await
+}
+
+/// Body of `DELETE /api/words/{id}/spellings`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpellingBody {
+    /// The spelling's `key` from the word detail's `pack_spellings`.
+    key: String,
+}
+
+/// `DELETE /api/words/{id}/spellings` `{key}`: forget a spelling a pack
+/// used for the word; a later pack with it adds a new word.
+async fn remove_spelling(
+    State(state): State<AppState>,
+    id: Result<Path<i64>, PathRejection>,
+    body: Result<Json<SpellingBody>, JsonRejection>,
+) -> Response {
+    let Ok(Path(id)) = id else {
+        return not_found().await;
+    };
+    let key = match body {
+        Ok(Json(body)) => body.key,
+        Err(rejection) => {
+            return rejected_body(&rejection, "The body must be {\"key\": \"…\"}.");
+        }
+    };
+    let id = WordId::new(id);
+    edit_then_show(&state, false, move |tx, now| {
+        let ((), undo) = workflows::with_undo(tx, id, now, |tx| {
+            workflows::remove_pack_spelling(tx, id, &key, now)
+        })?;
+        Ok(Edited::undoable(id, false, undo))
+    })
+    .await
+}
+
+/// Body of `POST /api/conflicts/{id}`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConflictBody {
+    #[serde(rename = "use")]
+    choice: ConflictChoice,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ConflictChoice {
+    /// *Use new*: the pack's value.
+    Incoming,
+    /// *Keep*: the stored value; the suggestion is dismissed.
+    Keep,
+}
+
+/// `POST /api/conflicts/{id}` `{use: "incoming"|"keep"}` (R-03).
+async fn resolve_conflict(
+    State(state): State<AppState>,
+    id: Result<Path<i64>, PathRejection>,
+    body: Result<Json<ConflictBody>, JsonRejection>,
+) -> Response {
+    let Ok(Path(id)) = id else {
+        return not_found().await;
+    };
+    let choice = match body {
+        Ok(Json(body)) => body.choice,
+        Err(rejection) => {
+            return rejected_body(
+                &rejection,
+                "The body must be {\"use\": \"incoming\"|\"keep\"}.",
+            );
+        }
+    };
+    edit_then_show(&state, true, move |tx, now| {
+        let word = workflows::conflict_word(tx, id)?;
+        let (_, undo) = workflows::with_undo(tx, word, now, |tx| {
+            workflows::resolve_conflict(tx, id, choice == ConflictChoice::Incoming, now)
+        })?;
+        Ok(Edited::undoable(word, false, undo))
+    })
+    .await
+}
+
+/// Body of `PATCH /api/sentences/{id}`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SentenceBody {
+    en: String,
+    cs: String,
+}
+
+/// `PATCH /api/sentences/{id}` `{en, cs}`: correct a sentence (R-25),
+/// checked with the `[[…]]` rule; its audio is made again.
+async fn patch_sentence(
+    State(state): State<AppState>,
+    id: Result<Path<i64>, PathRejection>,
+    body: Result<Json<SentenceBody>, JsonRejection>,
+) -> Response {
+    let Ok(Path(id)) = id else {
+        return not_found().await;
+    };
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => {
+            return rejected_body(
+                &rejection,
+                "The body must be {\"en\": \"… [[word]] …\", \"cs\": \"… [[slovo]] …\"}.",
+            );
+        }
+    };
+    edit_then_show(&state, true, move |tx, now| {
+        let word = workflows::sentence_word(tx, id)?;
+        let (_, undo) = workflows::with_undo(tx, word, now, |tx| {
+            workflows::edit_sentence(tx, id, &body.en, &body.cs, now)
+        })?;
+        Ok(Edited::undoable(word, false, undo))
+    })
+    .await
+}
+
+/// Body of `POST /api/sentences/{id}/hidden`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HiddenBody {
+    hidden: bool,
+}
+
+/// `POST /api/sentences/{id}/hidden` `{hidden}`: hide a sentence from
+/// practice, or show it again (R-25).
+async fn hide_sentence(
+    State(state): State<AppState>,
+    id: Result<Path<i64>, PathRejection>,
+    body: Result<Json<HiddenBody>, JsonRejection>,
+) -> Response {
+    let Ok(Path(id)) = id else {
+        return not_found().await;
+    };
+    let hidden = match body {
+        Ok(Json(body)) => body.hidden,
+        Err(rejection) => {
+            return rejected_body(&rejection, "The body must be {\"hidden\": true|false}.");
+        }
+    };
+    edit_then_show(&state, true, move |tx, now| {
+        let word = workflows::sentence_word(tx, id)?;
+        let (_, undo) = workflows::with_undo(tx, word, now, |tx| {
+            workflows::hide_sentence(tx, id, hidden, now)
+        })?;
+        Ok(Edited::undoable(word, false, undo))
+    })
+    .await
 }
 
 // ── practice API (design §8) ───────────────────────────────────────────────
@@ -1204,6 +1787,7 @@ fn api_error(err: &ApiError) -> Response {
             SessionError::ReviewIdReused => conflict("review_id_reused"),
             SessionError::ReviewUndone => conflict("review_undone"),
             SessionError::NothingToUndo => conflict("nothing_to_undo"),
+            SessionError::CardChangedSince => conflict("card_changed"),
             SessionError::Random(_) | SessionError::Scheduler(_) | SessionError::Sqlite(_) => {
                 internal_error(err)
             }

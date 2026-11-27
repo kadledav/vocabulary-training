@@ -6,7 +6,7 @@
 
 import path from 'node:path';
 
-import { expect, startBookBlock, test, waitGuard } from './fixtures.js';
+import { expect, startBookBlock, test, waitGuard, waitingProduce } from './fixtures.js';
 
 const dir = process.env.SCREENSHOT_DIR;
 
@@ -59,6 +59,65 @@ for (const theme of /** @type {const} */ (['dark', 'light'])) {
     await page.getByRole('button', { name: 'Log in' }).click();
     await expect(page.getByTestId('login-status')).toHaveText('Wrong password. Try again.');
     await shot('9-login');
+  });
+}
+
+/** M8: the Produce card's question and answer states, Today and Settings. */
+for (const theme of /** @type {const} */ (['dark', 'light'])) {
+  test(`M8 Produce screens, ${theme}`, async ({ page, app }, info) => {
+    test.skip(!dir, 'set SCREENSHOT_DIR to take screenshots');
+    const shot = (/** @type {string} */ name) =>
+      page.screenshot({ path: path.join(/** @type {string} */ (dir), `m8-${info.project.name}-${theme}-${name}.png`) });
+    await app.api('PATCH', '/api/settings', { theme, new_typed_per_day: 3 });
+    await waitingProduce(app, ['glimmerous', 'brontle', 'quabble', 'snorkish']);
+    await page.goto(`${app.url}/#/`);
+    await expect(page.getByTestId('typed-waiting')).toBeVisible();
+    await shot('1-today');
+    await page.getByTestId('start').click();
+    await expect(page.getByTestId('answer-input')).toBeVisible();
+    await shot('2-question');
+    await page.getByTestId('answer-input').fill('glimmerous');
+    await page.getByTestId('check').click();
+    await expect(page.getByTestId('check-result')).toBeVisible();
+    await shot('3-answer-correct');
+    await waitGuard();
+    await page.getByRole('button', { name: /^Rate 2,/ }).click();
+    await expect(page.getByTestId('cloze')).toBeVisible();
+    await page.waitForTimeout(300);
+    await page.getByTestId('hint-button').click();
+    await page.getByTestId('answer-input').fill('brontel');
+    await shot('4-question-hint-typed');
+    if (info.project.name === 'webkit-phone') {
+      // The on-screen keyboard (45 % of the screen): the bar sits above it.
+      await page.evaluate(() => {
+        const vv = /** @type {VisualViewport} */ (window.visualViewport);
+        Object.defineProperty(vv, 'height', { configurable: true, get: () => 450 });
+        vv.dispatchEvent(new Event('resize'));
+      });
+      await shot('4b-question-keyboard-450px');
+      await page.evaluate(() => {
+        const vv = /** @type {VisualViewport} */ (window.visualViewport);
+        Object.defineProperty(vv, 'height', { configurable: true, get: () => window.innerHeight });
+        vv.dispatchEvent(new Event('resize'));
+      });
+    }
+    await page.getByTestId('check').click();
+    await expect(page.getByTestId('typed')).toBeVisible();
+    await shot('5-answer-not-quite');
+    await page.getByTestId('accept-typed').click();
+    await expect(page.getByTestId('accepted-note')).toBeVisible();
+    await waitGuard();
+    await page.getByRole('button', { name: /^Rate 4,/ }).click();
+    await expect(page.getByTestId('next')).toBeVisible();
+    await shot('6-feedback-after-4');
+    await page.getByTestId('next').click();
+    await page.waitForTimeout(300);
+    await page.getByTestId('dont-know').click();
+    await shot('7-answer-dont-know');
+    await page.goto(`${app.url}/#/settings`);
+    await expect(page.getByLabel('New Produce cards per day')).toBeVisible();
+    await page.getByLabel('New Produce cards per day').scrollIntoViewIfNeeded();
+    await shot('8-settings');
   });
 }
 
@@ -128,4 +187,61 @@ for (const theme of /** @type {const} */ (['dark', 'light'])) {
       await shot('5-settings');
     });
   }
+}
+
+/** M7: the Words list and a word's screen, phone, both themes. */
+for (const theme of /** @type {const} */ (['dark', 'light'])) {
+  test(`M7 words screens, ${theme}`, async ({ page, app }, info) => {
+    test.skip(!dir || info.project.name !== 'webkit-phone', 'set SCREENSHOT_DIR; phone project only');
+    const shot = (/** @type {string} */ name, fullPage = false) =>
+      page.screenshot({ path: path.join(/** @type {string} */ (dir), `m7-${theme}-${name}.png`), fullPage });
+    await app.api('PATCH', '/api/settings', { theme });
+    const rows = await app.api('GET', '/api/words?q=glimmerous');
+    const id = rows[0].id;
+    // A suggestion from a later pack, and one review for the history.
+    await app.api('PATCH', `/api/words/${id}`, { meaning: 'Glowing on and off (my own words).' });
+    const { BOOK_PACK } = await import('./pack.js');
+    await app.api('POST', '/api/import/commit', {
+      text: JSON.stringify({ ...BOOK_PACK, pack_id: 'test-e2e-novel--2026-11-02--1' }),
+    });
+    const start = await app.api('POST', '/api/sessions', { kind: 'start' });
+    const item = start.session.items.find((/** @type {any} */ i) => i.word.headword === 'glimmerous');
+    await app.api('POST', `/api/sessions/${start.session.id}/reviews`, {
+      client_review_id: crypto.randomUUID(),
+      item_id: item.item_id,
+      raw_grade: 2,
+    });
+
+    await page.goto(`${app.url}/#/words`);
+    await expect(page.getByTestId('word-count')).toHaveText('5 words');
+    await shot('1-list');
+    await page.getByTestId('filters-summary').click();
+    await page.getByRole('radio', { name: 'Most useful' }).check();
+    await page.getByRole('radio', { name: 'New', exact: true }).check();
+    await expect(page.getByTestId('word-count')).toHaveText('4 words');
+    await shot('2-list-filters', true);
+    await page.goto(`${app.url}/#/words/${id}`);
+    await expect(page.getByTestId('conflicts')).toBeVisible();
+    await shot('3-word-top');
+    await shot('4-word-full', true);
+    await page.getByRole('button', { name: 'Edit meaning' }).click();
+    await shot('5-field-editor');
+    await page.getByRole('button', { name: 'Cancel' }).click();
+    await page.getByTestId('list-czech').scrollIntoViewIfNeeded();
+    await shot('6-lists');
+    const sentence = page.locator('ol.sentences li').first();
+    await sentence.getByRole('button', { name: 'Edit' }).click();
+    await sentence.scrollIntoViewIfNeeded();
+    await shot('7-sentence-editor');
+    await sentence.getByRole('button', { name: 'Cancel' }).click();
+    await page.getByTestId('reset-understand').click();
+    await page.getByTestId('card-understand').scrollIntoViewIfNeeded();
+    await shot('8-reset-confirm');
+    await page.getByTestId('delete-word').click();
+    await page.getByTestId('delete-word').or(page.getByTestId('delete-word-confirm')).scrollIntoViewIfNeeded();
+    await shot('9-delete-confirm');
+    await page.getByRole('button', { name: 'Raise usefulness' }).click();
+    await expect(page.getByTestId('toast')).toBeVisible();
+    await shot('10-toast-undo');
+  });
 }

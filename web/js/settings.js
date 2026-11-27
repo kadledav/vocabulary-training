@@ -9,7 +9,7 @@ import { getJson, patchJson } from './api.js';
 import { applyTheme } from './theme.js';
 
 /**
- * @typedef {{ new_per_day: number, block_size: number, voice: 'us' | 'uk', autoplay: boolean,
+ * @typedef {{ new_per_day: number, new_typed_per_day: number, block_size: number, voice: 'us' | 'uk', autoplay: boolean,
  *             speed: '1' | '0.75', theme: 'dark' | 'light' | 'system', legend: 'auto' | 'always' | 'off' }} Settings
  * @typedef {Partial<Settings>} SettingsPatch
  */
@@ -18,6 +18,7 @@ import { applyTheme } from './theme.js';
 /** @type {Settings} */
 export const DEFAULT_SETTINGS = Object.freeze({
   new_per_day: 5,
+  new_typed_per_day: 10,
   block_size: 20,
   voice: 'us',
   autoplay: false,

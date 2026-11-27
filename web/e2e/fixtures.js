@@ -7,6 +7,8 @@
  * logged no errors (CSP violations included).
  */
 
+import { DatabaseSync } from 'node:sqlite';
+
 import { test as base, expect } from '@playwright/test';
 
 import { ARTICLE_PACK, BOOK_PACK } from './pack.js';
@@ -159,6 +161,29 @@ export const test = base.extend(
 );
 
 export { expect };
+
+/**
+ * Make every word known on its Understand card (nothing due, no new word)
+ * and give `headwords` a Produce card that waits for its first review
+ * since today, as an unlock leaves it (design §6.4).
+ *
+ * @param {App} app
+ * @param {string[]} headwords
+ */
+export async function waitingProduce(app, headwords) {
+  const today = await app.api('GET', '/api/today');
+  const db = new DatabaseSync(app.dbPath);
+  db.prepare(
+    `UPDATE card SET state = 'review', stability = 40.0, difficulty = 5.0, due_day = '2099-01-01',
+     last_review_day = ?, introduced_day = '2026-10-01', reps = 4, format = 'word_only' WHERE kind = 'understand'`,
+  ).run(today.study_day);
+  const insert = db.prepare(
+    `INSERT INTO card (word_id, kind, state, due_day, created_at)
+     SELECT id, 'produce', 'new', ?, '2026-11-01T00:00:00Z' FROM word WHERE headword = ?`,
+  );
+  for (const headword of headwords) insert.run(today.study_day, headword);
+  db.close();
+}
 
 /**
  * Start a block in the book's scope from the Today screen.

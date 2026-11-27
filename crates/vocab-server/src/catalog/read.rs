@@ -7,10 +7,11 @@ use serde_json::Value;
 use vocab_pack::keys::item_key;
 use vocab_pack::marked;
 
-use super::{SourceId, WordId};
+use super::identity::{PackSpelling, pack_spellings};
+use super::{SourceId, WordId, scalar};
 
-/// Most rows returned by [`words`].
-const WORD_LIST_LIMIT: i64 = 5000;
+/// Most rows returned by [`words`]: the whole catalog.
+const WORD_LIST_LIMIT: i64 = super::MAX_WORDS;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SourceSummary {
@@ -55,7 +56,8 @@ pub fn sources(conn: &Connection) -> rusqlite::Result<Vec<SourceSummary>> {
     .collect()
 }
 
-/// Filter of the word list.
+/// Filter of the word list (design §7.1 screen 6). Every condition left
+/// out (`None`/`false`) does not filter.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WordQuery {
     /// Plain substring of the headword, a Czech equivalent or the meaning
@@ -64,6 +66,15 @@ pub struct WordQuery {
     /// Only words linked to this source, in source order (`seq`; equal
     /// values in the order the words were linked).
     pub source: Option<i64>,
+    /// Usefulness at least / at most.
+    pub min_usefulness: Option<i64>,
+    pub max_usefulness: Option<i64>,
+    /// Only words with an open pack conflict.
+    pub with_conflicts: bool,
+    /// Only suspended words.
+    pub suspended: bool,
+    /// Only low-priority words.
+    pub low_priority: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -74,13 +85,20 @@ pub struct WordRow {
     pub czech: Vec<String>,
     pub usefulness: i64,
     pub low_priority: bool,
+    /// The owner included this low-priority word (R-51).
+    pub included: bool,
+    pub suspended: bool,
     pub sentence_count: i64,
     pub open_conflicts: i64,
     /// Position within the filtered source.
     pub seq: Option<i64>,
+    /// When the word was first imported (RFC 3339).
+    pub created_at: String,
 }
 
-/// The word list, alphabetical (or in source order when filtered by source).
+/// The word list: alphabetical, or in source order when filtered by
+/// source. One statement: the counts and Czech lists come from grouped
+/// joins, not from a query per word.
 pub fn words(conn: &Connection, query: &WordQuery) -> rusqlite::Result<Vec<WordRow>> {
     let needle = query
         .text
@@ -89,35 +107,57 @@ pub fn words(conn: &Connection, query: &WordQuery) -> rusqlite::Result<Vec<WordR
         .filter(|t| !t.is_empty());
     let mut stmt = conn.prepare(
         "SELECT w.id, w.headword, w.meaning, w.usefulness, w.low_priority, \
-         (SELECT COUNT(*) FROM sentence s WHERE s.word_id = w.id AND s.hidden = 0), \
-         (SELECT COUNT(*) FROM field_conflict c WHERE c.word_id = w.id AND c.status = 'open'), \
-         ws.seq, \
-         (SELECT json_group_array(value) FROM (SELECT value FROM word_item i \
-            WHERE i.word_id = w.id AND i.kind = 'czech' AND i.removed = 0 ORDER BY position)) \
+         COALESCE(s.n, 0), COALESCE(c.n, 0), ws.seq, COALESCE(i.czech, '[]'), \
+         w.included, w.suspended, w.created_at \
          FROM word w \
          LEFT JOIN word_source ws ON ws.word_id = w.id AND ws.source_id = ?1 \
+         LEFT JOIN (SELECT word_id, COUNT(*) AS n FROM sentence WHERE hidden = 0 \
+                    GROUP BY word_id) s ON s.word_id = w.id \
+         LEFT JOIN (SELECT word_id, COUNT(*) AS n FROM field_conflict WHERE status = 'open' \
+                    GROUP BY word_id) c ON c.word_id = w.id \
+         LEFT JOIN (SELECT word_id, json_group_array(value) AS czech FROM \
+                      (SELECT word_id, value FROM word_item WHERE kind = 'czech' AND removed = 0 \
+                       ORDER BY word_id, position) GROUP BY word_id) i ON i.word_id = w.id \
          WHERE (?1 IS NULL OR ws.source_id IS NOT NULL) \
            AND (?2 IS NULL OR instr(w.headword_key, ?2) > 0 OR instr(lower(w.meaning), ?2) > 0 \
-                OR EXISTS (SELECT 1 FROM word_item i WHERE i.word_id = w.id AND i.kind = 'czech' \
-                           AND i.removed = 0 AND instr(i.value_key, ?2) > 0)) \
+                OR EXISTS (SELECT 1 FROM word_item x WHERE x.word_id = w.id AND x.kind = 'czech' \
+                           AND x.removed = 0 AND instr(x.value_key, ?2) > 0)) \
+           AND (?4 IS NULL OR w.usefulness >= ?4) AND (?5 IS NULL OR w.usefulness <= ?5) \
+           AND (?6 = 0 OR c.n > 0) AND (?7 = 0 OR w.suspended = 1) \
+           AND (?8 = 0 OR w.low_priority = 1) \
          ORDER BY CASE WHEN ?1 IS NULL THEN 0 ELSE ws.seq END, \
                   CASE WHEN ?1 IS NULL THEN 0 ELSE ws.rowid END, w.headword_key, w.id \
          LIMIT ?3",
     )?;
-    stmt.query_map(params![query.source, needle, WORD_LIST_LIMIT], |row| {
-        let czech: String = row.get(8)?;
-        Ok(WordRow {
-            id: WordId(row.get(0)?),
-            headword: row.get(1)?,
-            meaning: row.get(2)?,
-            usefulness: row.get(3)?,
-            low_priority: row.get(4)?,
-            sentence_count: row.get(5)?,
-            open_conflicts: row.get(6)?,
-            seq: row.get(7)?,
-            czech: serde_json::from_str(&czech).unwrap_or_default(),
-        })
-    })?
+    stmt.query_map(
+        params![
+            query.source,
+            needle,
+            WORD_LIST_LIMIT,
+            query.min_usefulness,
+            query.max_usefulness,
+            query.with_conflicts,
+            query.suspended,
+            query.low_priority,
+        ],
+        |row| {
+            let czech: String = row.get(8)?;
+            Ok(WordRow {
+                id: WordId(row.get(0)?),
+                headword: row.get(1)?,
+                meaning: row.get(2)?,
+                usefulness: row.get(3)?,
+                low_priority: row.get(4)?,
+                sentence_count: row.get(5)?,
+                open_conflicts: row.get(6)?,
+                seq: row.get(7)?,
+                czech: serde_json::from_str(&czech).unwrap_or_default(),
+                included: row.get(9)?,
+                suspended: row.get(10)?,
+                created_at: row.get(11)?,
+            })
+        },
+    )?
     .collect()
 }
 
@@ -157,6 +197,8 @@ pub struct SentenceView {
     pub location: Option<String>,
     pub source_title: Option<String>,
     pub hidden: bool,
+    /// The owner corrected it (R-25): a pack no longer changes it.
+    pub edited: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -178,9 +220,39 @@ pub struct FormView {
 pub struct ConflictView {
     pub id: i64,
     pub field: String,
+    /// The stored value when the pack disagreed.
     pub current: Value,
+    /// The stored value now (the owner may have edited it since).
+    pub now: Value,
     pub incoming: Value,
     pub created_at: String,
+}
+
+/// One item of a list field, for editing (design §7.1 screen 7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ItemView {
+    pub value: String,
+    /// `item_key`: names the item in `DELETE /api/words/{id}/items` `{kind, key}`.
+    pub key: String,
+    /// Added by the owner (for `accepted`: the owner's own answers).
+    pub mine: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FormItemView {
+    pub form: String,
+    pub key: String,
+    pub common: bool,
+}
+
+/// The list fields with what editing needs (removed items left out).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ItemLists {
+    pub czech: Vec<ItemView>,
+    /// The pack's accepted answers, then the owner's.
+    pub accepted: Vec<ItemView>,
+    pub confusables: Vec<ItemView>,
+    pub forms: Vec<FormItemView>,
 }
 
 /// Everything stored about one word.
@@ -200,7 +272,13 @@ pub struct WordView {
     pub note: String,
     pub icon: Option<String>,
     pub low_priority: bool,
+    /// The owner included this low-priority word (R-51).
+    pub included: bool,
     pub suspended: bool,
+    /// Fields the owner set in the app (`word_override`): a pack only
+    /// suggests other values for them (design §5.4 rule 4).
+    pub overridden: Vec<String>,
+    pub items: ItemLists,
     pub czech: Vec<String>,
     pub accepted: Vec<String>,
     pub confusables: Vec<String>,
@@ -208,6 +286,9 @@ pub struct WordView {
     pub sources: Vec<SourceLinkView>,
     pub sentences: Vec<SentenceView>,
     pub conflicts: Vec<ConflictView>,
+    /// Other spellings packs used for this word (its headword was changed
+    /// since): a pack with one of them still finds the word.
+    pub pack_spellings: Vec<PackSpelling>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -217,7 +298,7 @@ pub fn word_view(conn: &Connection, id: WordId) -> rusqlite::Result<Option<WordV
     let base = conn
         .query_row(
             "SELECT headword, grammar, pronunciation, speak, meaning, usefulness, goal, hint, spelling, \
-             spelling_note, note, icon, low_priority, suspended, created_at, updated_at \
+             spelling_note, note, icon, low_priority, suspended, created_at, updated_at, included \
              FROM word WHERE id = ?1",
             [id.0],
             |row| {
@@ -237,7 +318,10 @@ pub fn word_view(conn: &Connection, id: WordId) -> rusqlite::Result<Option<WordV
                     note: row.get(10)?,
                     icon: row.get(11)?,
                     low_priority: row.get(12)?,
+                    included: row.get(16)?,
                     suspended: row.get(13)?,
+                    overridden: Vec::new(),
+                    items: ItemLists::default(),
                     created_at: row.get(14)?,
                     updated_at: row.get(15)?,
                     czech: Vec::new(),
@@ -247,6 +331,7 @@ pub fn word_view(conn: &Connection, id: WordId) -> rusqlite::Result<Option<WordV
                     sources: Vec::new(),
                     sentences: Vec::new(),
                     conflicts: Vec::new(),
+                    pack_spellings: Vec::new(),
                 })
             },
         )
@@ -264,9 +349,17 @@ pub fn word_view(conn: &Connection, id: WordId) -> rusqlite::Result<Option<WordV
     view.czech = items("czech")?;
     view.accepted = items("accepted")?;
     view.confusables = items("confusable")?;
-
+    view.items = item_lists(conn, id)?;
+    view.pack_spellings = pack_spellings(conn, id)?;
     let mut stmt =
-        conn.prepare("SELECT form, common FROM word_form WHERE word_id = ?1 ORDER BY position")?;
+        conn.prepare("SELECT field FROM word_override WHERE word_id = ?1 ORDER BY field")?;
+    view.overridden = stmt
+        .query_map([id.0], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+
+    let mut stmt = conn.prepare(
+        "SELECT form, common FROM word_form WHERE word_id = ?1 AND removed = 0 ORDER BY position",
+    )?;
     view.forms = stmt
         .query_map([id.0], |row| {
             Ok(FormView {
@@ -293,8 +386,8 @@ pub fn word_view(conn: &Connection, id: WordId) -> rusqlite::Result<Option<WordV
         .collect::<Result<_, _>>()?;
 
     let mut stmt = conn.prepare(
-        "SELECT se.id, se.en_marked, se.cs_marked, se.origin, se.location, s.title, se.hidden \
-         FROM sentence se LEFT JOIN source s ON s.id = se.source_id \
+        "SELECT se.id, se.en_marked, se.cs_marked, se.origin, se.location, s.title, se.hidden, \
+         se.edited FROM sentence se LEFT JOIN source s ON s.id = se.source_id \
          WHERE se.word_id = ?1 ORDER BY se.position, se.id",
     )?;
     view.sentences = stmt
@@ -309,6 +402,7 @@ pub fn word_view(conn: &Connection, id: WordId) -> rusqlite::Result<Option<WordV
                 location: row.get(4)?,
                 source_title: row.get(5)?,
                 hidden: row.get(6)?,
+                edited: row.get(7)?,
             })
         })?
         .collect::<Result<_, _>>()?;
@@ -327,12 +421,64 @@ pub fn word_view(conn: &Connection, id: WordId) -> rusqlite::Result<Option<WordV
                 current: current
                     .and_then(|c| serde_json::from_str(&c).ok())
                     .unwrap_or(Value::Null),
+                now: Value::Null,
                 incoming: serde_json::from_str(&incoming).unwrap_or(Value::Null),
                 created_at: row.get(4)?,
             })
         })?
         .collect::<Result<_, _>>()?;
+    for conflict in &mut view.conflicts {
+        if let Some(field) = scalar::field(&conflict.field) {
+            conflict.now = scalar::current(conn, id, field)?;
+        }
+    }
     Ok(Some(view))
+}
+
+/// The word's list items (not removed), in order, for editing.
+fn item_lists(conn: &Connection, id: WordId) -> rusqlite::Result<ItemLists> {
+    let mut stmt = conn.prepare(
+        "SELECT kind, value, value_key, origin = 'owner' FROM word_item \
+         WHERE word_id = ?1 AND removed = 0 ORDER BY kind = 'owner_accepted', position",
+    )?;
+    let mut lists = ItemLists::default();
+    let rows = stmt.query_map([id.0], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            ItemView {
+                value: row.get(1)?,
+                key: row.get(2)?,
+                mine: row.get(3)?,
+            },
+        ))
+    })?;
+    for row in rows {
+        let (kind, item) = row?;
+        let list = match kind.as_str() {
+            "czech" => &mut lists.czech,
+            "confusable" => &mut lists.confusables,
+            _ => &mut lists.accepted,
+        };
+        // One entry per key: the pack's and the owner's accepted answers
+        // are one list (a pack row comes first).
+        if !list.iter().any(|known| known.key == item.key) {
+            list.push(item);
+        }
+    }
+    let mut stmt = conn.prepare(
+        "SELECT form, form_key, common FROM word_form WHERE word_id = ?1 AND removed = 0 \
+         ORDER BY position",
+    )?;
+    lists.forms = stmt
+        .query_map([id.0], |row| {
+            Ok(FormItemView {
+                form: row.get(0)?,
+                key: row.get(1)?,
+                common: row.get(2)?,
+            })
+        })?
+        .collect::<Result<_, _>>()?;
+    Ok(lists)
 }
 
 // ── practice view (design §8 item payload) ─────────────────────────────────
@@ -444,8 +590,9 @@ pub fn presentation(conn: &Connection, id: WordId) -> rusqlite::Result<Option<Wo
     view.accepted = list("accepted")?;
     view.owner_accepted = list("owner_accepted")?;
 
-    let mut stmt =
-        conn.prepare("SELECT form, common FROM word_form WHERE word_id = ?1 ORDER BY position")?;
+    let mut stmt = conn.prepare(
+        "SELECT form, common FROM word_form WHERE word_id = ?1 AND removed = 0 ORDER BY position",
+    )?;
     view.forms = stmt
         .query_map([id.0], |row| {
             Ok(PresentedForm {

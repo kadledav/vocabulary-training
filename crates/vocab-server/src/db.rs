@@ -63,6 +63,10 @@ const MIGRATIONS: &[Migration] = &[
         data_step: Some(rekey_sentences),
     },
     sql_only("0006_audio", include_str!("../migrations/0006_audio.sql")),
+    sql_only(
+        "0007_word_edits",
+        include_str!("../migrations/0007_word_edits.sql"),
+    ),
 ];
 
 #[derive(Debug, thiserror::Error)]

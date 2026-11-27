@@ -14,6 +14,8 @@ use crate::clock::StudyDay;
 
 /// Range of `new_per_day` (R-54, design §6.6).
 pub const NEW_PER_DAY_MAX: u32 = 100;
+/// Range of `new_typed_per_day` (design §17 M8).
+pub const NEW_TYPED_PER_DAY_MAX: u32 = 100;
 /// Range of `block_size`.
 pub const BLOCK_SIZE_MIN: u32 = 5;
 pub const BLOCK_SIZE_MAX: u32 = 50;
@@ -57,6 +59,10 @@ pub enum Speed {
 pub struct Settings {
     /// New Understand cards introduced per study day (0–100, default 5).
     pub new_per_day: u32,
+    /// Produce/Spelling cards that may get their first review per study day
+    /// (0–100, default 10): the cap that spreads cards unlocked at the same
+    /// time over several days (design §17 M8).
+    pub new_typed_per_day: u32,
     /// Items per practice block (default 20).
     pub block_size: u32,
     pub voice: Voice,
@@ -72,6 +78,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             new_per_day: 5,
+            new_typed_per_day: 10,
             block_size: 20,
             voice: Voice::Us,
             autoplay: false,
@@ -87,6 +94,7 @@ impl Default for Settings {
 #[serde(deny_unknown_fields)]
 pub struct SettingsPatch {
     pub new_per_day: Option<u32>,
+    pub new_typed_per_day: Option<u32>,
     pub block_size: Option<u32>,
     pub voice: Option<Voice>,
     pub autoplay: Option<bool>,
@@ -111,6 +119,14 @@ impl SettingsPatch {
             )));
         }
         if self
+            .new_typed_per_day
+            .is_some_and(|n| n > NEW_TYPED_PER_DAY_MAX)
+        {
+            return Err(SettingsError::Invalid(format!(
+                "new_typed_per_day must be 0-{NEW_TYPED_PER_DAY_MAX}"
+            )));
+        }
+        if self
             .block_size
             .is_some_and(|n| !(BLOCK_SIZE_MIN..=BLOCK_SIZE_MAX).contains(&n))
         {
@@ -129,6 +145,7 @@ impl SettingsPatch {
             }
         };
         put("new_per_day", self.new_per_day.map(Value::from));
+        put("new_typed_per_day", self.new_typed_per_day.map(Value::from));
         put("block_size", self.block_size.map(Value::from));
         put(
             "voice",
@@ -185,6 +202,9 @@ pub fn get(conn: &Connection) -> rusqlite::Result<Settings> {
         new_per_day: stored_as::<u32>(conn, "new_per_day")?
             .filter(|n| *n <= NEW_PER_DAY_MAX)
             .unwrap_or(d.new_per_day),
+        new_typed_per_day: stored_as::<u32>(conn, "new_typed_per_day")?
+            .filter(|n| *n <= NEW_TYPED_PER_DAY_MAX)
+            .unwrap_or(d.new_typed_per_day),
         block_size: stored_as::<u32>(conn, "block_size")?
             .filter(|n| (BLOCK_SIZE_MIN..=BLOCK_SIZE_MAX).contains(n))
             .unwrap_or(d.block_size),
@@ -242,6 +262,31 @@ mod tests {
         assert_eq!(s, Settings::default());
         assert_eq!(s.new_per_day, 5);
         assert_eq!(s.block_size, 20);
+        assert_eq!(s.new_typed_per_day, 10);
+    }
+
+    #[tokio::test]
+    async fn r52_new_typed_per_day_is_validated() {
+        let (_dir, db) = db();
+        let s = update_with(
+            &db,
+            SettingsPatch {
+                new_typed_per_day: Some(0),
+                ..SettingsPatch::default()
+            },
+        )
+        .await
+        .expect("0 is allowed");
+        assert_eq!(s.new_typed_per_day, 0);
+        let err = update_with(
+            &db,
+            SettingsPatch {
+                new_typed_per_day: Some(NEW_TYPED_PER_DAY_MAX + 1),
+                ..SettingsPatch::default()
+            },
+        )
+        .await;
+        assert!(matches!(err, Err(SettingsError::Invalid(_))));
     }
 
     #[tokio::test]

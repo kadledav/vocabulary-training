@@ -358,6 +358,15 @@ export function renderSettings(root, isCurrent) {
         100,
         (n) => void save({ new_per_day: n }),
       ),
+      numberField(
+        'new-typed-per-day',
+        'New Produce cards per day',
+        'A word you understand well gets a Produce card: you type the English word. This many come for the first time each day; the others wait for a later day.',
+        s.new_typed_per_day,
+        0,
+        100,
+        (n) => void save({ new_typed_per_day: n }),
+      ),
       numberField('block-size', 'Cards per block', '"Continue" adds another block of this size.', s.block_size, 5, 50, (n) =>
         void save({ block_size: n }),
       ),

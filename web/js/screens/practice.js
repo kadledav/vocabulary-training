@@ -1,7 +1,16 @@
 // @ts-check
 /**
- * Practice — Understand (design §7.1 screens 2/2b, §7.2–§7.5; research
- * wireframes 2, 3, 2b; R-52, R-53, R-54, R-60, R-62, R-70).
+ * Practice — Understand and Produce (design §7.1 screens 2/2b/3, §6.8,
+ * §7.2–§7.5; research wireframes 2, 3, 2b, 4, 4b; R-52, R-53, R-54, R-56,
+ * R-60, R-62, R-70).
+ *
+ * Produce: the owner types the English word for the blanked sentence (the
+ * answer field and its buttons sit in the bottom bar, which the on-screen
+ * keyboard never covers) → Check / I don't know / I'll just rate myself →
+ * the answer side shows what the mechanical check found and rings the
+ * suggested grade; his 1–5 rating is the final word. What he typed stays
+ * (also across a reload) until the card is checked, and goes with the
+ * rating, so a failed post never loses it.
  *
  * Question side → reveal → answer side → rate 1–5. Every rating is posted
  * at once (idempotent by its client UUID); a 4/5 keeps the answer on screen
@@ -22,18 +31,33 @@
 import { clipFor, clipsFor, playClip, preloadClips, stopClip } from '../clips.js';
 import { h, mount } from '../dom.js';
 import { keyAction, keyTarget } from '../keys.js';
-import { answerView, criterion, questionView, revealLabel } from '../practice/card.js';
+import { answerView, checkResult, criterion, produceQuestion, questionView, revealLabel, typedHint } from '../practice/card.js';
+import {
+  TYPED_MAX,
+  answersFor,
+  canAddAccepted,
+  checkTyped,
+  checkable,
+  dontKnow,
+  expectedAnswer,
+  hint,
+  selfRated,
+  typedText,
+} from '../grading.js';
 import {
   afterRating,
   currentItem,
   exampleSentence,
   hasMore,
+  isTyped,
+  moreOpenAfterCheck,
   moreOpenOnReveal,
   plainText,
   progress,
   wordSpeech,
 } from '../practice/model.js';
-import { legend, legendLine, ratingBar } from '../practice/rating-bar.js';
+import { clearDraft, loadDraft, saveDraft } from '../practice/draft.js';
+import { legend, legendLine, ratingBar, suggestionLine } from '../practice/rating-bar.js';
 import {
   INPUT_GUARD_MS,
   guardOpen,
@@ -46,7 +70,7 @@ import {
   toastText,
 } from '../rating.js';
 import { setNotice } from '../notice.js';
-import { fetchCurrent, fetchToday, finishBlock, postRating, takeStarted, undoRating } from '../session.js';
+import { acceptAnswer, fetchCurrent, fetchToday, finishBlock, postRating, takeStarted, undoRating } from '../session.js';
 import { DEFAULT_SETTINGS, loadSettings } from '../settings.js';
 import { prepareSpeech, speak, speechAvailable, stopSpeaking } from '../speech.js';
 import { setSummary } from '../summary-store.js';
@@ -58,13 +82,18 @@ import { Toast } from '../toast.js';
  * @typedef {import('../keys.js').Phase} Phase
  * @typedef {import('../keys.js').Action} Action
  * @typedef {import('../rating.js').Grade} Grade
- * @typedef {{ itemId: number, grade: Grade, id: string }} PendingRating
+ * @typedef {import('../grading.js').Check} Check
+ * @typedef {import('../practice/card.js').AcceptState} AcceptState
+ * @typedef {import('../session.js').AnswerDetails} AnswerDetails
+ * @typedef {{ itemId: number, grade: Grade, id: string, details: AnswerDetails | null }} PendingRating
  * @typedef {{ ok: false, status: number, code: string, message: string }} Failure
  */
 
 /** Keyboard shortcuts listed in the help panel (design §7.3). */
 const SHORTCUTS = [
   ['Space / Enter', 'show the answer · next'],
+  ['Enter', 'Produce: check · accept the suggested grade'],
+  ['H', 'Produce: hint (outside the answer field)'],
   ['1 – 5', 'rate (1 = best)'],
   ['U', 'undo the last rating'],
   ['M', 'more: note, forms, sentences'],
@@ -74,13 +103,14 @@ const SHORTCUTS = [
   ['?', 'this help'],
 ];
 
+/** Below this visible height with the keyboard open, the bottom bar is compact. */
+const KEYBOARD_TIGHT_PX = 300;
 /** "Saving…" appears only when a request takes longer than this. */
 const SAVING_DELAY_MS = 150;
 /** The "already saved" toast stays longer: it asks for a check. */
 const ALREADY_SAVED_TOAST_MS = 8000;
 /** The silent-switch hint has been dismissed on this device. */
 const SILENT_HINT_KEY = 'vocab.silent-hint-seen';
-
 /** Is this a touch device (where the phone's silent switch may mute speech)? */
 function touchDevice() {
   return typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
@@ -175,7 +205,8 @@ export function renderPractice(root, isCurrent) {
    *           shownAt: number, moreOpen: boolean, helpOpen: boolean, legendAlways: boolean, busy: boolean,
    *           phaseKey: string | null, pending: PendingRating | null, unsure: (PendingRating & { why: string }) | null,
    *           settings: import('../settings.js').Settings, revealTap: { x: number, y: number, t: number } | null,
-   *           chosen: Grade | null }} */
+   *           chosen: Grade | null, typed: string, hintShown: boolean, check: Check | null,
+   *           accept: AcceptState | null, typedNote: string }} */
   const state = {
     session: null,
     item: null,
@@ -194,7 +225,27 @@ export function renderPractice(root, isCurrent) {
     settings: DEFAULT_SETTINGS,
     revealTap: null,
     chosen: null,
+    // Produce: what is typed, whether the hint shows, the check result,
+    // the "also accept" offer and a note under the field.
+    typed: '',
+    hintShown: false,
+    check: null,
+    accept: null,
+    typedNote: '',
   };
+  /** Check results of this visit by item (undo returns to the checked answer). */
+  /** @type {Map<number, Check>} */
+  const checks = new Map();
+  /** Items whose typed answer was added to the accepted answers. */
+  /** @type {Set<number>} */
+  const acceptedItems = new Set();
+  /**
+   * Answers accepted with "Also accept" in this visit, by word id: every
+   * later item of the word (a repeat in this block) accepts them at once.
+   *
+   * @type {Map<number, string[]>}
+   */
+  const alsoAccepted = new Map();
   const speechOk = speechAvailable();
   prepareSpeech();
   /** Recorded-clip info per word id, as far as it has arrived (M6). */
@@ -233,6 +284,72 @@ export function renderPractice(root, isCurrent) {
   const screen = h('div', { class: 'practice' }, top, help, errorLine, audioNote, body, bottom, live);
   /** @type {(() => void) | null} */
   let releaseWakeLock = null;
+
+  /**
+   * The on-screen keyboard covers the bottom of the layout viewport (iOS,
+   * and Android in its default mode): the bottom bar, with the answer field
+   * and its buttons, moves up by the covered height (design §7.1 screen 3).
+   */
+  const viewport = window.visualViewport ?? null;
+  const onViewport = () => {
+    if (!viewport) return;
+    const inset = Math.max(0, Math.round(window.innerHeight - viewport.height - viewport.offsetTop));
+    screen.style.setProperty('--keyboard-inset', `${inset}px`);
+    screen.classList.toggle('keyboard-open', inset > 0);
+    // Little room left (a phone in landscape with the keyboard open): the
+    // bar shrinks to the answer field so the sentence with the blank stays
+    // in view above it.
+    const tight = inset > 0 && viewport.height < KEYBOARD_TIGHT_PX;
+    screen.classList.toggle('keyboard-tight', tight);
+    if (tight) keepClozeInView();
+  };
+  /** Scroll the blanked sentence into the room above the bottom bar. */
+  const keepClozeInView = () => {
+    const cloze = body.querySelector('[data-testid="cloze"]');
+    if (!(cloze instanceof HTMLElement)) return;
+    const room = bottom.getBoundingClientRect().top;
+    const box = cloze.getBoundingClientRect();
+    if (box.bottom > room) window.scrollBy(0, Math.min(box.top, box.bottom - room + 4));
+    else if (box.top < 0) window.scrollBy(0, box.top - 4);
+  };
+  viewport?.addEventListener('resize', onViewport);
+  viewport?.addEventListener('scroll', onViewport);
+
+  // ── Produce: the answer field ────────────────────────────────────────────
+
+  // No autocorrect, capitalisation or spellcheck: they would change a
+  // correct rare word or give the answer away (research §3).
+  const answerInput = h('input', {
+    type: 'text',
+    class: 'answer-input',
+    id: 'typed-answer',
+    name: 'typed-answer',
+    autocomplete: 'off',
+    autocorrect: 'off',
+    autocapitalize: 'none',
+    spellcheck: 'false',
+    enterkeyhint: 'go',
+    maxlength: TYPED_MAX,
+    lang: 'en',
+    placeholder: 'Type the English word',
+    'aria-label': 'Your answer: the English word for the blank',
+    'data-testid': 'answer-input',
+  });
+  answerInput.addEventListener('input', () => {
+    state.typed = answerInput.value;
+    if (state.item) saveDraft(state.item.item_id, { typed: state.typed, hint: state.hintShown, check: null });
+  });
+  answerInput.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' || event.isComposing) return;
+    event.preventDefault();
+    if (event.repeat) return;
+    handlingKey = 'Enter';
+    try {
+      checkAnswer();
+    } finally {
+      handlingKey = null;
+    }
+  });
 
   /** @param {...(Node | string)} parts */
   const announce = (...parts) => {
@@ -405,6 +522,8 @@ export function renderPractice(root, isCurrent) {
   const speakSentence = () => {
     const item = state.item;
     if (!item || state.phase === 'complete') return;
+    // A Produce question never plays anything: it would say the answer.
+    if (state.phase === 'question' && isTyped(item)) return;
     const sentence =
       item.card.format === 'sentence' && item.sentence ? item.sentence : state.phase === 'question' ? null : exampleSentence(item);
     if (!sentence) return;
@@ -413,6 +532,7 @@ export function renderPractice(root, isCurrent) {
   const speakWord = () => {
     const item = state.item;
     if (!item || state.phase === 'complete') return;
+    if (state.phase === 'question' && isTyped(item)) return;
     // On the question side of a sentence card only the sentence plays.
     if (state.phase === 'question' && item.card.format === 'sentence' && item.sentence) return;
     play(wordSpeech(item.word), 'word', null);
@@ -514,9 +634,10 @@ export function renderPractice(root, isCurrent) {
       return;
     }
     if (state.phase === 'question') {
-      mount(body, questionView(item, audio));
+      mount(body, isTyped(item) ? produceQuestion(item) : questionView(item, audio));
       return;
     }
+    const check = isTyped(item) ? state.check : null;
     mount(
       body,
       answerView(item, {
@@ -524,6 +645,7 @@ export function renderPractice(root, isCurrent) {
         moreOpen: state.moreOpen,
         showMore: hasMore(item),
         onToggleMore: () => toggleMore(true),
+        lead: check ? checkResult(item, check, { state: state.accept, onAccept: () => void acceptTyped() }) : null,
       }),
       state.phase === 'answer' && !state.unsure && state.legendAlways && !state.helpOpen ? legendLine() : null,
     );
@@ -551,9 +673,40 @@ export function renderPractice(root, isCurrent) {
     armGuard();
   };
 
+  /** The answer field, Check, Hint, I don't know and "I'll just rate myself". */
+  const drawTypedQuestion = () => {
+    const hadFocus = document.activeElement === answerInput;
+    const item = state.item;
+    mount(
+      bottomContent,
+      state.hintShown && item ? typedHint(hint(expectedAnswer(item))) : null,
+      h(
+        'div',
+        { class: 'answer-row' },
+        answerInput,
+        h('button', { type: 'button', class: 'primary check-button guarded', 'data-guarded': true, 'data-testid': 'check', onclick: () => checkAnswer() }, 'Check'),
+      ),
+      state.typedNote ? h('p', { class: 'typed-note', role: 'status', 'data-testid': 'typed-note' }, state.typedNote) : null,
+      h(
+        'div',
+        { class: 'typed-actions' },
+        h('button', { type: 'button', class: 'guarded', 'data-guarded': true, 'data-testid': 'hint-button', disabled: state.hintShown, title: 'Hint: first letter and letter count (H)', onclick: () => showHint() }, 'Hint'),
+        h('button', { type: 'button', class: 'guarded', 'data-guarded': true, 'data-testid': 'dont-know', onclick: () => giveUp() }, 'I don’t know'),
+        h(
+          'button',
+          { type: 'button', class: 'guarded', 'data-guarded': true, 'data-testid': 'self-rate', 'aria-label': 'I’ll just rate myself', title: 'I’ll just rate myself: show the answer without checking', onclick: () => rateMyself() },
+          'Rate myself',
+        ),
+      ),
+    );
+    if (hadFocus) answerInput.focus({ preventScroll: true });
+  };
+
   const drawBottom = () => {
     const item = state.item;
-    if (state.phase === 'question' && item) {
+    if (state.phase === 'question' && item && isTyped(item)) {
+      drawTypedQuestion();
+    } else if (state.phase === 'question' && item) {
       mount(
         bottomContent,
         h('p', { class: 'criterion' }, criterion(item)),
@@ -562,7 +715,13 @@ export function renderPractice(root, isCurrent) {
     } else if (state.phase === 'answer' && state.unsure) {
       mount(bottomContent, unsurePanel());
     } else if (state.phase === 'answer') {
-      mount(bottomContent, ratingBar((grade) => void rate(grade), state.busy ? state.chosen : null));
+      const typed = item !== null && isTyped(item);
+      const suggested = typed ? state.check?.suggested ?? null : null;
+      mount(
+        bottomContent,
+        typed ? suggestionLine(suggested) : null,
+        ratingBar((grade) => void rate(grade), state.busy ? state.chosen : null, suggested),
+      );
     } else if (state.phase === 'feedback') {
       mount(
         bottomContent,
@@ -583,18 +742,83 @@ export function renderPractice(root, isCurrent) {
     renderBody();
     renderBottom();
     if (scroll) window.scrollTo(0, 0);
-    if (focus) body.focus({ preventScroll: true });
+    if (!focus) return;
+    // A Produce question: straight into the answer field.
+    if (state.phase === 'question' && state.item && isTyped(state.item)) answerInput.focus({ preventScroll: true });
+    else body.focus({ preventScroll: true });
   };
 
   // ── transitions ──────────────────────────────────────────────────────────
 
-  /** Show the next unanswered item (or the "complete" state). */
+  /**
+   * A fresh question side for `item`: nothing typed — or what this tab
+   * typed for it before a reload — no hint, no check. Drafts of other
+   * items stay.
+   *
+   * @param {Item | null} item
+   */
+  const resetTyped = (item) => {
+    const draft = item && isTyped(item) ? loadDraft(item.item_id) : null;
+    state.typed = draft?.typed ?? '';
+    state.hintShown = draft?.hint ?? false;
+    state.check = null;
+    state.accept = null;
+    state.typedNote = '';
+    answerInput.value = state.typed;
+  };
+
+  /**
+   * What "Also accept" offers for `item` after `check`.
+   *
+   * @param {Item} item
+   * @param {Check | null} check
+   * @returns {AcceptState | null}
+   */
+  const acceptStateFor = (item, check) => {
+    if (!canAddAccepted(check)) return null;
+    return acceptedItems.has(item.item_id) ? 'saved' : 'offer';
+  };
+
+  /**
+   * Back on the answer side of `item` (after an undo, or to rate it again):
+   * a Produce card shows its check of this visit again; one not checked in
+   * this visit (the page was reloaded) starts at its question.
+   *
+   * @param {Item} item
+   */
+  const reopen = (item) => {
+    state.item = item;
+    const check = isTyped(item) ? checks.get(item.item_id) ?? null : null;
+    if (isTyped(item) && !check) {
+      resetTyped(item);
+      setPhase('question');
+      return;
+    }
+    state.check = check;
+    state.accept = acceptStateFor(item, check);
+    setPhase('answer');
+    state.revealedAt = state.phaseAt;
+    state.moreOpen = check ? moreOpenAfterCheck(item, check.match) : moreOpenOnReveal(item);
+  };
+
+  /**
+   * Show the next unanswered item (or the "complete" state). A Produce
+   * card checked before a reload returns to its checked answer side.
+   */
   const advance = () => {
     const session = state.session;
     if (!session) return;
-    state.item = currentItem(session);
-    setPhase(state.item ? 'question' : 'complete');
-    state.moreOpen = false;
+    const item = currentItem(session);
+    const stored = item && isTyped(item) ? loadDraft(item.item_id)?.check ?? null : null;
+    if (item && stored) {
+      checks.set(item.item_id, stored);
+      reopen(item);
+    } else {
+      state.item = item;
+      resetTyped(item);
+      setPhase(item ? 'question' : 'complete');
+      state.moreOpen = false;
+    }
     state.shownAt = now();
     stopClip();
     render({ focus: true, scroll: true });
@@ -611,6 +835,8 @@ export function renderPractice(root, isCurrent) {
   const afterRated = (item, grade) => {
     if (afterRating(grade) === 'feedback') {
       state.item = item;
+      state.check = isTyped(item) ? checks.get(item.item_id) ?? null : null;
+      state.accept = acceptStateFor(item, state.check);
       setPhase('feedback');
       state.moreOpen = hasMore(item);
       render({ focus: true });
@@ -620,7 +846,13 @@ export function renderPractice(root, isCurrent) {
   };
 
   const reveal = () => {
-    if (state.phase !== 'question' || !state.item || !advanceReady()) return;
+    if (state.phase !== 'question' || !state.item) return;
+    // A Produce card is answered by typing (Space on the page goes there).
+    if (isTyped(state.item)) {
+      answerInput.focus();
+      return;
+    }
+    if (!advanceReady()) return;
     // Where the finger was when the answer appeared (null for keys).
     state.revealTap = handlingKey === null && lastPointer && now() - lastPointer.t < 1000 ? lastPointer : null;
     setPhase('answer');
@@ -634,6 +866,107 @@ export function renderPractice(root, isCurrent) {
     if (state.settings.autoplay) play(wordSpeech(word), 'word', null, true);
     const info = clips.get(word.id);
     if (info) markApproximate(info);
+  };
+
+  // ── Produce: check, hint, I don't know, rate myself, also accept ─────────
+
+  /**
+   * Show the answer side of the Produce card after `check` (wireframe 4b).
+   *
+   * @param {Check} check
+   */
+  const showChecked = (check) => {
+    const item = state.item;
+    if (!item) return;
+    // Where the finger was (the Check button sits where ratings appear).
+    state.revealTap = handlingKey === null && lastPointer && now() - lastPointer.t < 1000 ? lastPointer : null;
+    state.check = check;
+    checks.set(item.item_id, check);
+    state.accept = acceptStateFor(item, check);
+    state.typedNote = '';
+    // A reload now returns to this answer side, not to an empty question.
+    saveDraft(item.item_id, { typed: check.typed ?? state.typed, hint: check.hintUsed, check });
+    setPhase('answer');
+    state.revealedAt = state.phaseAt;
+    state.moreOpen = moreOpenAfterCheck(item, check.match);
+    // Closes the on-screen keyboard: the answer side needs the screen.
+    answerInput.blur();
+    render({ focus: true, scroll: true });
+    const answer = expectedAnswer(item);
+    if (check.verdict === 'correct') announce('Correct: ', h('span', { lang: 'en' }, answer), '.');
+    else if (check.verdict === 'right_word') announce('Right word. Here it is: ', h('span', { lang: 'en' }, answer), '.');
+    else if (check.verdict === 'alternative') announce('Accepted. This sentence has ', h('span', { lang: 'en' }, answer), '.');
+    else if (check.match === 'none') announce('Not quite. You typed ', h('span', { lang: 'en' }, check.typed ?? ''), '; the answer is ', h('span', { lang: 'en' }, answer), '.');
+    else announce('The answer: ', h('span', { lang: 'en' }, answer), '.');
+  };
+
+  /** May the Produce question act now (not the second tap of a double tap)? */
+  const typedQuestionReady = () => state.phase === 'question' && state.item !== null && isTyped(state.item) && advanceReady();
+
+  const checkAnswer = () => {
+    const item = state.item;
+    if (!item || !typedQuestionReady()) return;
+    const typed = typedText(answerInput.value);
+    if (!checkable(typed)) {
+      state.typedNote = 'Type the word first, or choose “I don’t know”.';
+      renderBottom();
+      answerInput.focus();
+      announce(state.typedNote);
+      return;
+    }
+    showChecked(checkTyped(typed, answersFor(item, alsoAccepted.get(item.word.id)), state.hintShown));
+  };
+
+  const giveUp = () => {
+    if (typedQuestionReady()) showChecked(dontKnow(state.hintShown));
+  };
+
+  const rateMyself = () => {
+    if (typedQuestionReady()) showChecked(selfRated(state.hintShown));
+  };
+
+  /** The hint: first letter and letter count (it lowers a match to 3). */
+  const showHint = () => {
+    const item = state.item;
+    if (state.phase !== 'question' || !item || !isTyped(item) || state.hintShown) return;
+    state.hintShown = true;
+    saveDraft(item.item_id, { typed: answerInput.value, hint: true, check: null });
+    renderBody();
+    renderBottom();
+    answerInput.focus({ preventScroll: true });
+    const shown = hint(expectedAnswer(item));
+    announce(`Hint: starts with ${shown.pattern.charAt(0)}, ${shown.letters} letters.`);
+  };
+
+  /** Enter on the answer side of a Produce card takes the suggested grade. */
+  const acceptSuggested = () => {
+    const item = state.item;
+    const suggested = state.check?.suggested ?? null;
+    if (state.phase === 'answer' && item && isTyped(item) && suggested !== null) void rate(suggested);
+  };
+
+  /** "Also accept … next time": the typed answer joins the word's accepted answers. */
+  const acceptTyped = async () => {
+    const item = state.item;
+    const check = state.check;
+    if (!item || !check || check.typed === null || !canAddAccepted(check)) return;
+    if (state.accept !== 'offer' && state.accept !== 'failed') return;
+    state.accept = 'saving';
+    renderBody();
+    const answer = await acceptAnswer(item.word.id, check.typed);
+    if (!isCurrent()) return;
+    // Already on the list (added elsewhere meanwhile): just as good.
+    const added = answer.ok || answer.code === 'item_exists';
+    if (added) {
+      acceptedItems.add(item.item_id);
+      alsoAccepted.set(item.word.id, [...(alsoAccepted.get(item.word.id) ?? []), check.typed]);
+    }
+    // Still on that card: show the outcome there.
+    if (state.item?.item_id !== item.item_id || state.phase === 'question' || state.phase === 'complete') return;
+    state.accept = added ? 'saved' : 'failed';
+    if (added) clearError();
+    else showError(`“${check.typed}” was not added because ${reason(answer)}. Try again.`);
+    renderBody();
   };
 
   const next = () => {
@@ -704,6 +1037,7 @@ export function renderPractice(root, isCurrent) {
    * @param {number} itemId
    */
   const showAlreadySaved = (itemId) => {
+    clearDraft(itemId);
     const grade = storedGrade(itemId);
     const item = state.session?.items.find((i) => i.item_id === itemId) ?? null;
     if (!grade || !item) {
@@ -733,6 +1067,7 @@ export function renderPractice(root, isCurrent) {
       itemId: pending.itemId,
       grade: pending.grade,
       durationMs: now() - state.shownAt,
+      details: pending.details,
     });
     setBusy(false);
     if (!isCurrent()) return;
@@ -765,6 +1100,7 @@ export function renderPractice(root, isCurrent) {
       return;
     }
     clearError();
+    clearDraft(pending.itemId);
     state.pending = null;
     state.unsure = null;
     state.chosen = null;
@@ -789,10 +1125,16 @@ export function renderPractice(root, isCurrent) {
     }
     // The same item rated the same way again (after a failed post) reuses
     // its id, so the server stores it at most once.
+    // A Produce card's answer goes with its rating (and with any retry).
+    const check = isTyped(item) ? state.check : null;
+    /** @type {AnswerDetails | null} */
+    const details = check
+      ? { typedAnswer: check.typed, answerMatch: check.match, hintUsed: check.hintUsed, suggestedGrade: check.suggested }
+      : null;
     const pending =
       state.pending && state.pending.itemId === item.item_id && state.pending.grade === grade
         ? state.pending
-        : { itemId: item.item_id, grade, id: crypto.randomUUID() };
+        : { itemId: item.item_id, grade, id: crypto.randomUUID(), details };
     // Acknowledge the tap at once (U3): the button shows pressed while saving.
     state.chosen = grade;
     for (const button of bottomContent.querySelectorAll('button.rate')) {
@@ -804,7 +1146,7 @@ export function renderPractice(root, isCurrent) {
   const retry = async () => {
     const unsure = state.unsure;
     if (state.busy || !unsure) return;
-    await submit({ itemId: unsure.itemId, grade: unsure.grade, id: unsure.id });
+    await submit({ itemId: unsure.itemId, grade: unsure.grade, id: unsure.id, details: unsure.details });
   };
 
   /** Find out whether the unsure rating was saved before allowing another grade. */
@@ -832,12 +1174,12 @@ export function renderPractice(root, isCurrent) {
     }
     // Not saved: rate the same card again with any grade.
     clearError();
-    state.item = state.session.items.find((i) => i.item_id === unsure.itemId) ?? currentItem(state.session);
-    if (!state.item) {
+    const again = state.session.items.find((i) => i.item_id === unsure.itemId) ?? currentItem(state.session);
+    if (!again) {
       advance();
       return;
     }
-    setPhase('answer');
+    reopen(again);
     render();
     announce('The rating was not saved. Rate the word again.');
   };
@@ -871,10 +1213,8 @@ export function renderPractice(root, isCurrent) {
     state.item = item;
     if (item) {
       // Back on the answer side of the undone item: rate it again.
-      setPhase('answer');
-      state.revealedAt = state.phaseAt;
+      reopen(item);
       state.shownAt = state.phaseAt;
-      state.moreOpen = moreOpenOnReveal(item);
     } else {
       setPhase('complete');
     }
@@ -945,6 +1285,12 @@ export function renderPractice(root, isCurrent) {
         break;
       case 'help':
         toggleHelp();
+        break;
+      case 'hint':
+        showHint();
+        break;
+      case 'accept':
+        acceptSuggested();
         break;
     }
   };
@@ -1030,6 +1376,8 @@ export function renderPractice(root, isCurrent) {
   return () => {
     document.removeEventListener('keydown', onKeyDown);
     document.removeEventListener('keyup', onKeyUp);
+    viewport?.removeEventListener('resize', onViewport);
+    viewport?.removeEventListener('scroll', onViewport);
     screen.removeEventListener('pointerdown', onPointerDown, true);
     toast.clearTimer();
     if (savingTimer !== null) clearTimeout(savingTimer);

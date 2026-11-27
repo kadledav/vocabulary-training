@@ -308,7 +308,7 @@ impl Env {
                     conn,
                     &catalog::WordQuery {
                         text: Some(headword.clone()),
-                        source: None,
+                        ..catalog::WordQuery::default()
                     },
                 )?;
                 Ok::<_, DbError>(

@@ -370,7 +370,7 @@ async fn r85_a_v0_1_0_database_upgrades_without_loss_and_sessions_keep_working()
     {
         let conn = Connection::open(data.path().join(DB_FILE)).expect("open");
         conn.pragma_update(None, "foreign_keys", "ON").expect("fk");
-        assert_eq!(int(&conn, "PRAGMA user_version"), 6);
+        assert_eq!(int(&conn, "PRAGMA user_version"), 7);
         let check: String = conn
             .query_row("PRAGMA quick_check", [], |r| r.get(0))
             .expect("quick_check");

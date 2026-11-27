@@ -57,6 +57,13 @@ impl Card {
     pub fn is_due_on(&self, day: StudyDay) -> bool {
         self.due_day.is_some_and(|d| d <= day)
     }
+
+    /// An unlocked Produce/Spelling card that was never reviewed: it has a
+    /// due day (the earliest day it may come) but no memory state yet, so
+    /// its first review is new learning, not a review (design §6.4, §17 M8).
+    pub fn awaits_first_review(&self) -> bool {
+        self.kind != CardKind::Understand && self.state == CardState::New
+    }
 }
 
 const CARD_COLUMNS: &str = "id, word_id, kind, format, state, stability, difficulty, due_day, \
@@ -111,6 +118,12 @@ pub fn cards_of_word(conn: &Connection, word: WordId) -> rusqlite::Result<Vec<Ca
     cards_where(conn, "word_id = ?1", [word.get()])
 }
 
+/// Every card (the word list joins them to its words in memory: one query
+/// for the whole list, design §7.1 screen 6).
+pub fn all_cards(conn: &Connection) -> rusqlite::Result<Vec<Card>> {
+    cards_where(conn, "1", [])
+}
+
 /// Cards with a due day (reviewed cards and unlocked Produce/Spelling
 /// cards), not suspended. Callers filter by word, scope and kind.
 pub fn scheduled_cards(conn: &Connection) -> rusqlite::Result<Vec<Card>> {
@@ -134,6 +147,16 @@ pub fn introduced_words_on(conn: &Connection, day: StudyDay) -> rusqlite::Result
             .into_iter()
             .map(|c| c.word_id)
             .collect(),
+    )
+}
+
+/// How many Produce/Spelling cards had their first review on `day` (the
+/// daily cap on first-time typed cards, design §17 M8).
+pub fn first_typed_reviews_on(conn: &Connection, day: StudyDay) -> rusqlite::Result<u32> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM card WHERE kind != 'understand' AND introduced_day = ?1",
+        [day],
+        |row| row.get(0),
     )
 }
 
@@ -420,12 +443,25 @@ impl Snapshot {
         self.stability
     }
 
-    /// Write the snapshot back to card `id`.
+    /// Write the snapshot back to card `id`, suspension included (the Undo
+    /// of an owner change, which may have suspended the card).
     pub fn restore(&self, tx: &Transaction<'_>, id: CardId) -> rusqlite::Result<()> {
+        self.restore_scheduling(tx, id)?;
+        tx.execute(
+            "UPDATE card SET suspended = ?2 WHERE id = ?1",
+            params![id.0, self.suspended],
+        )?;
+        Ok(())
+    }
+
+    /// Write the snapshot's scheduling state back to card `id`, leaving
+    /// its suspension as it is now: a rating never changes suspension, so
+    /// neither does its Undo (a goal switch made since stays).
+    pub fn restore_scheduling(&self, tx: &Transaction<'_>, id: CardId) -> rusqlite::Result<()> {
         tx.execute(
             "UPDATE card SET format = ?2, state = ?3, stability = ?4, difficulty = ?5, due_day = ?6, \
              last_review_day = ?7, last_review_at = ?8, introduced_day = ?9, reps = ?10, lapses = ?11, \
-             consecutive_fives = ?12, leech = ?13, leech_lapses_at_ack = ?14, suspended = ?15 \
+             consecutive_fives = ?12, leech = ?13, leech_lapses_at_ack = ?14 \
              WHERE id = ?1",
             params![
                 id.0,
@@ -442,16 +478,16 @@ impl Snapshot {
                 self.consecutive_fives,
                 self.leech,
                 self.leech_lapses_at_ack,
-                self.suspended,
             ],
         )?;
         Ok(())
     }
 }
 
-/// Store `card`'s scheduling columns (after a review).
+/// Store `card`'s scheduling columns (after a review; suspension is not
+/// the scheduler's to change here).
 pub fn save(tx: &Transaction<'_>, card: &Card) -> rusqlite::Result<()> {
-    Snapshot::of(card).restore(tx, card.id)
+    Snapshot::of(card).restore_scheduling(tx, card.id)
 }
 
 /// Delete cards created by an undone review if nobody reviewed them since.
