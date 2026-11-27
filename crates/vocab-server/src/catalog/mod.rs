@@ -36,7 +36,8 @@ pub use edit::{
 pub use identity::PackSpelling;
 pub use merge::{ConflictReport, ImportLink, ItemsAdded, MergeOutcome, WordMerge, merge_word};
 pub use practice::{
-    PracticeWord, WordTraits, all_traits, practice_words, source_exists, traits, word_traits,
+    PracticeWord, WordTraits, all_traits, practice_words, source_exists, spelling_practice, traits,
+    word_traits,
 };
 pub use read::{
     ConflictView, FormItemView, FormView, ItemLists, ItemView, PresentedForm, PresentedSentence,

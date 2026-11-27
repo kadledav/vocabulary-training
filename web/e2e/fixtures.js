@@ -186,6 +186,35 @@ export async function waitingProduce(app, headwords) {
 }
 
 /**
+ * Make every word known on its Understand card (nothing due, no new word),
+ * mark `headwords` for spelling practice with `note` as the spelling note,
+ * and give each a Spelling card that waits for its first review since
+ * today, as an unlock leaves it (design §6.4).
+ *
+ * @param {App} app
+ * @param {string[]} headwords
+ * @param {string | null} [note]
+ */
+export async function waitingSpelling(app, headwords, note = null) {
+  const today = await app.api('GET', '/api/today');
+  const db = new DatabaseSync(app.dbPath);
+  db.prepare(
+    `UPDATE card SET state = 'review', stability = 40.0, difficulty = 5.0, due_day = '2099-01-01',
+     last_review_day = ?, introduced_day = '2026-10-01', reps = 4, format = 'word_only' WHERE kind = 'understand'`,
+  ).run(today.study_day);
+  const mark = db.prepare('UPDATE word SET spelling = 1, spelling_note = ? WHERE headword = ?');
+  const insert = db.prepare(
+    `INSERT INTO card (word_id, kind, state, due_day, created_at)
+     SELECT id, 'spelling', 'new', ?, '2026-11-01T00:00:00Z' FROM word WHERE headword = ?`,
+  );
+  for (const headword of headwords) {
+    mark.run(note, headword);
+    insert.run(today.study_day, headword);
+  }
+  db.close();
+}
+
+/**
  * Start a block in the book's scope from the Today screen.
  *
  * @param {import('@playwright/test').Page} page

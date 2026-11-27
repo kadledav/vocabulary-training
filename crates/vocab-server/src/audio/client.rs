@@ -176,6 +176,9 @@ pub struct SpokenClip {
     pub duration_ms: i64,
     /// Words whose pronunciation is a guess (`X-Approximate`).
     pub approximate: i64,
+    /// Words read letter by letter (`X-Words-Spelled`); `None` when the
+    /// service did not say (then nobody knows whether the clip spells).
+    pub spelled: Option<i64>,
 }
 
 struct Response {
@@ -413,10 +416,12 @@ pub async fn speak(
         .filter(|d| *d > 0)
         .ok_or_else(|| temporary("speak: no X-Duration-Ms"))?;
     let approximate = number("x-approximate").unwrap_or(0).max(0);
+    let spelled = number("x-words-spelled").filter(|n| *n >= 0);
     Ok(SpokenClip {
         mp3,
         duration_ms,
         approximate,
+        spelled,
     })
 }
 

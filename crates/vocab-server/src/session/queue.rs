@@ -3,7 +3,7 @@
 
 use rusqlite::{Transaction, params};
 
-use super::build::{sentence_for, shown_format};
+use super::build::{item_sentence, shown_format};
 use super::view::{self, BlockSummary, ItemRow, RateResult, SessionRow, UndoResult};
 use super::{ItemOrigin, RateInput, SessionError, SessionId, SessionStatus};
 use crate::catalog;
@@ -117,6 +117,7 @@ pub fn rate(
     let card = scheduler::card(tx, item.card_id)?.ok_or(SessionError::ItemNotFound)?;
     input.check_for(card.kind)?;
     let word = catalog::word_traits(tx, card.word_id)?.ok_or(SessionError::ItemNotFound)?;
+    let typed_answer = input.stored_typed_answer();
     let review = scheduler::record_review(
         tx,
         &ReviewInput {
@@ -125,7 +126,7 @@ pub fn rate(
             session_id: Some(id.as_str()),
             raw_grade: input.raw_grade,
             suggested_grade: input.suggested_grade,
-            typed_answer: input.typed_answer.as_deref(),
+            typed_answer: typed_answer.as_deref(),
             answer_match: input.answer_match,
             hint_used: input.hint_used,
             duration_ms: input.duration_ms,
@@ -175,7 +176,7 @@ fn queue_repeat(
         .collect();
     let ord = repeat_ord(item.ord, &upcoming, gap);
     let card = scheduler::card(tx, item.card_id)?.ok_or(SessionError::ItemNotFound)?;
-    let sentence = sentence_for(tx, card.word_id, now.day, item.sentence_id, session.scope)?;
+    let sentence = item_sentence(tx, &card, now.day, item.sentence_id, session.scope)?;
     // The card's format is fixed now (it was just reviewed).
     let format = shown_format(tx, &card)?;
     let repeat = view::insert_item(

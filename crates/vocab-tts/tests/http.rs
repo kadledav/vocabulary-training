@@ -470,3 +470,29 @@ async fn r84_audio_beyond_the_limit_stops_the_engine_and_is_unprocessable() {
     );
     assert_eq!(calls.lock().expect("test setup").len(), 7);
 }
+
+#[tokio::test]
+async fn r58_a_word_read_letter_by_letter_is_counted_in_x_words_spelled() {
+    // "hello" is in the lexicon; "tkt" is in none and no compound: it is
+    // read as its letters' names ("t", "k" are words of this lexicon).
+    let lexicon = "hello h ə l ˈ O\nt t ˈ i\nk k ˈ A\n";
+    let phonemizer = Phonemizer::new(
+        Lexicon::parse(lexicon).expect("test setup"),
+        Lexicon::parse(lexicon).expect("test setup"),
+        parse_symbols(SYMBOLS).expect("test setup"),
+    );
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let engine = FakeEngine {
+        calls: Arc::clone(&calls),
+        gate: None,
+    };
+    let app = vocab_tts::http::app(Speaker::new(Local::new(phonemizer, Box::new(engine)), 1));
+    let (status, headers, _) = send(&app, speak_request(r#"{"text": "hello"}"#)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["x-words-spelled"], "0");
+    let (status, headers, _) = send(&app, speak_request(r#"{"text": "hello tkt"}"#)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["x-words-spelled"], "1");
+    // A spelled word is also a guess.
+    assert_eq!(headers["x-approximate"], "1");
+}

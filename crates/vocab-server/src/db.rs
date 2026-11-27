@@ -67,6 +67,10 @@ const MIGRATIONS: &[Migration] = &[
         "0007_word_edits",
         include_str!("../migrations/0007_word_edits.sql"),
     ),
+    sql_only(
+        "0008_audio_spelled",
+        include_str!("../migrations/0008_audio_spelled.sql"),
+    ),
 ];
 
 #[derive(Debug, thiserror::Error)]

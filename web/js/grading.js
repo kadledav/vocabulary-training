@@ -57,6 +57,39 @@ const FOLDS = { æ: 'ae', œ: 'oe', ø: 'o', ł: 'l', đ: 'd' };
 const FOLDABLE = /[æœøłđ]/gu;
 
 /**
+ * Invisible formatting characters as [from, to] code points: zero-width
+ * space, non-joiner and joiner, left-to-right and right-to-left marks,
+ * word joiner and invisible operators, bidirectional embeddings, overrides
+ * and isolates, byte order mark and soft hyphen. The same set as the
+ * server's `vocab_pack::keys::is_invisible` (a unit test reads that
+ * function and compares): a typed answer is compared and stored without
+ * them, so an answer that looks right is right, and what is stored shows
+ * as it was compared.
+ *
+ * @type {ReadonlyArray<readonly [number, number]>}
+ */
+export const INVISIBLE_RANGES = [
+  [0x200b, 0x200f],
+  [0x2060, 0x2064],
+  [0x202a, 0x202e],
+  [0x2066, 0x2069],
+  [0xfeff, 0xfeff],
+  [0x00ad, 0x00ad],
+];
+
+const hex = (/** @type {number} */ c) => `\\u{${c.toString(16)}}`;
+const INVISIBLE = new RegExp(`[${INVISIBLE_RANGES.map(([a, b]) => (a === b ? hex(a) : `${hex(a)}-${hex(b)}`)).join('')}]`, 'gu');
+
+/**
+ * `text` without [invisible](INVISIBLE_RANGES) characters.
+ *
+ * @param {string} text
+ */
+export function removeInvisible(text) {
+  return text.replace(INVISIBLE, '');
+}
+
+/**
  * The comparison key of an answer: lowercase, diacritics and ligatures
  * folded (NFKD without combining marks, æ → ae), apostrophes, quotes and
  * other punctuation dropped (don’t = dont), invisible characters dropped,
@@ -68,7 +101,7 @@ const FOLDABLE = /[æœøłđ]/gu;
  * @param {string} text
  */
 export function normalise(text) {
-  return text
+  return removeInvisible(text)
     .toLowerCase()
     .normalize('NFKD')
     .replace(/\p{M}/gu, '')
@@ -85,13 +118,14 @@ export const TYPED_MAX = 300;
 
 /**
  * The typed text as it is checked and stored: control characters (a
- * pasted tab) become spaces, surrounding space goes, at most
+ * pasted tab) become spaces, [invisible](INVISIBLE_RANGES) characters go
+ * (the server drops them too), surrounding space goes, at most
  * [`TYPED_MAX`] characters.
  *
  * @param {string} raw
  */
 export function typedText(raw) {
-  return [...raw.replace(/\p{Cc}/gu, ' ').trim()].slice(0, TYPED_MAX).join('').trim();
+  return [...removeInvisible(raw).replace(/\p{Cc}/gu, ' ').trim()].slice(0, TYPED_MAX).join('').trim();
 }
 
 /**
@@ -230,4 +264,208 @@ export function canAddAccepted(check) {
     checkable(check.typed) &&
     [...check.typed.trim()].length <= ACCEPTED_MAX
   );
+}
+
+// ── Spelling (R-58, design §6.8) ────────────────────────────────────────────
+
+/**
+ * Apostrophe look-alikes a phone keyboard types for the apostrophe key
+ * (smart punctuation: ’ ‘ ʼ ′).
+ */
+const APOSTROPHE_GLYPHS = /[‘’ʼ′]/gu;
+
+/**
+ * A spelling as it is compared letter by letter: Unicode NFC (the same
+ * letters in another encoding are the same text), [invisible](INVISIBLE_RANGES)
+ * characters removed (a zero-width space or a direction mark looks like
+ * nothing and is no letter), surrounding white space
+ * trimmed, a run of white space as one space and typographic apostrophes
+ * as `'` (what the keyboard typed for the apostrophe key). Nothing else
+ * changes — diacritics, hyphens, apostrophes and spaces are part of a
+ * spelling. Case is compared per letter ([`spellingDiff`]), not changed
+ * here, so the diff shows the letters as they were typed.
+ *
+ * @param {string} text
+ */
+export function spellingText(text) {
+  return removeInvisible(text).normalize('NFC').replace(APOSTROPHE_GLYPHS, "'").replace(/\s+/gu, ' ').trim();
+}
+
+/**
+ * One column of a spelling diff:
+ * - `same`: the right letter (case does not count);
+ * - `wrong`: another letter typed in its place;
+ * - `missing`: a letter of the word that was not typed;
+ * - `extra`: a typed letter the word does not have.
+ *
+ * @typedef {'same' | 'wrong' | 'missing' | 'extra'} DiffMark
+ * @typedef {{ mark: DiffMark, typed: string | null, correct: string | null }} DiffColumn
+ */
+
+/** @param {string} ch */
+function letterKey(ch) {
+  return ch.toLowerCase();
+}
+
+/**
+ * The letter-by-letter comparison of what was typed with the correct
+ * spelling (design §6.8): a Levenshtein alignment of the two (after
+ * [`spellingText`]; letters compared without case) as columns in reading
+ * order. Of the alignments with the fewest edits it takes the one that
+ * keeps the most letters matched (“dessicated” → one extra s and one
+ * missing c, not two wrong letters; a swapped pair → one letter extra and
+ * one missing on either side of the letter it jumped); among those,
+ * reading from the end, a matching or substituted letter first, then a
+ * missing one. Pure and deterministic.
+ *
+ * @param {string} typed
+ * @param {string} correct
+ * @returns {DiffColumn[]}
+ */
+export function spellingDiff(typed, correct) {
+  const a = [...spellingText(typed)];
+  const b = [...spellingText(correct)];
+  const ka = a.map(letterKey);
+  const kb = b.map(letterKey);
+  const cols = b.length + 1;
+  // Cost of an edit, plus one for a substitution: fewest edits first, then
+  // the fewest substitutions (= the most letters matched).
+  const edit = a.length + b.length + 1;
+  /** @param {boolean} same */
+  const step = (same) => (same ? 0 : edit + 1);
+  // cost[i * cols + j]: between the first i typed and j correct letters.
+  const cost = new Float64Array((a.length + 1) * cols);
+  for (let i = 0; i <= a.length; i++) cost[i * cols] = i * edit;
+  for (let j = 0; j <= b.length; j++) cost[j] = j * edit;
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      const diagonal = cost[(i - 1) * cols + j - 1] + step(ka[i - 1] === kb[j - 1]);
+      cost[i * cols + j] = Math.min(diagonal, cost[(i - 1) * cols + j] + edit, cost[i * cols + j - 1] + edit);
+    }
+  }
+  /** @type {DiffColumn[]} */
+  const out = [];
+  let i = a.length;
+  let j = b.length;
+  while (i > 0 || j > 0) {
+    const here = cost[i * cols + j];
+    const same = i > 0 && j > 0 && ka[i - 1] === kb[j - 1];
+    if (i > 0 && j > 0 && here === cost[(i - 1) * cols + j - 1] + step(same)) {
+      out.push({ mark: same ? 'same' : 'wrong', typed: a[i - 1], correct: b[j - 1] });
+      i--;
+      j--;
+    } else if (j > 0 && here === cost[i * cols + j - 1] + edit) {
+      out.push({ mark: 'missing', typed: null, correct: b[j - 1] });
+      j--;
+    } else {
+      out.push({ mark: 'extra', typed: a[i - 1], correct: null });
+      i--;
+    }
+  }
+  return out.reverse();
+}
+
+/**
+ * Check a typed spelling (design §6.8): strict — exactly the spelling
+ * (only case and the [`spellingText`] form do not count) suggests 2;
+ * anything else, a one-letter slip included, suggests 4. No hint and no
+ * list of accepted answers: the spelling is the point.
+ *
+ * @param {string} typed what the owner typed
+ * @param {string} correct the word's spelling (its headword)
+ * @returns {Check}
+ */
+export function checkSpelling(typed, correct) {
+  const exact = spellingText(typed) !== '' && spellingDiff(typed, correct).every((column) => column.mark === 'same');
+  return exact
+    ? { match: 'exact', verdict: 'correct', suggested: 2, typed, hintUsed: false }
+    : { match: 'none', verdict: 'miss', suggested: 4, typed, hintUsed: false };
+}
+
+/** Longest summary of a spelling diff a screen reader gets (characters). */
+export const DIFF_SUMMARY_MAX = 300;
+
+/** A run of differences longer than this is counted, not spelled out. */
+const RUN_SPELLED_MAX = 6;
+
+/**
+ * How a character is said in a summary: a space as "a space", any other
+ * character that shows as nothing (white space, a format character) by its
+ * code point.
+ *
+ * @param {string | null} ch
+ */
+function sayChar(ch) {
+  if (ch === ' ') return 'a space';
+  if (ch !== null && /^[\p{Z}\p{C}]$/u.test(ch)) return `an invisible character (U+${(ch.codePointAt(0) ?? 0).toString(16).toUpperCase().padStart(4, '0')})`;
+  return `“${ch ?? ''}”`;
+}
+
+/** @param {readonly (string | null)[]} chars */
+function sayRun(chars) {
+  return chars.length === 1 ? sayChar(chars[0]) : `“${chars.join('')}”`;
+}
+
+/**
+ * The differences of a spelling diff in words, for a screen reader (the
+ * grid of letters is hidden from it): "letter 4: you typed “i”, the word
+ * has “e”; letter 6 missing: “n”". Runs of the same difference are said
+ * once ("letters 3 to 5 missing: “bbe”", "12 extra letters at the start").
+ * An answer that has less than half of the word's letters right is
+ * "very different", with the word spelled out; at most
+ * [`DIFF_SUMMARY_MAX`] characters ("…and 4 more differences"). Empty when
+ * there is no difference.
+ *
+ * @param {readonly DiffColumn[]} diff
+ */
+export function diffSummary(diff) {
+  if (diff.every((column) => column.mark === 'same')) return '';
+  const correct = diff.flatMap((column) => (column.correct === null ? [] : [column.correct]));
+  const same = diff.filter((column) => column.mark === 'same').length;
+  if (same * 2 < correct.length) {
+    const word = correct.join('');
+    const spelled = correct.map((ch) => (ch === ' ' ? 'space' : ch)).join(', ');
+    const whole = `very different from the word, which is spelled “${word}”: ${spelled}`;
+    const short = `very different from the word, which is spelled “${word}”`;
+    if (whole.length <= DIFF_SUMMARY_MAX) return whole;
+    return short.length <= DIFF_SUMMARY_MAX ? short : 'very different from the word';
+  }
+  /** @type {string[]} */
+  const parts = [];
+  let position = 0;
+  let index = 0;
+  while (index < diff.length) {
+    const mark = diff[index].mark;
+    let end = index;
+    while (end < diff.length && diff[end].mark === mark) end++;
+    const run = diff.slice(index, end);
+    const first = position + 1;
+    position += run.filter((column) => column.correct !== null).length;
+    index = end;
+    if (mark === 'same') continue;
+    const typed = run.map((column) => column.typed);
+    const wanted = run.map((column) => column.correct);
+    const n = run.length;
+    const letters = n === 1 ? `letter ${first}` : `letters ${first} to ${position}`;
+    if (mark === 'wrong') {
+      parts.push(n <= RUN_SPELLED_MAX ? `${letters}: you typed ${sayRun(typed)}, the word has ${sayRun(wanted)}` : `${letters} wrong: the word has ${sayRun(wanted)}`);
+    } else if (mark === 'missing') {
+      parts.push(n <= RUN_SPELLED_MAX * 3 ? `${letters} missing: ${sayRun(wanted)}` : `${letters} missing`);
+    } else {
+      const where = position === 0 ? 'at the start' : `after letter ${position}`;
+      if (n === 1) parts.push(`extra ${sayChar(typed[0])} ${where}`);
+      else parts.push(n <= RUN_SPELLED_MAX ? `${n} extra letters ${sayRun(typed)} ${where}` : `${n} extra letters ${where}`);
+    }
+  }
+  let out = '';
+  for (const [k, part] of parts.entries()) {
+    const next = out === '' ? part : `${out}; ${part}`;
+    // Room for "; …and N more differences" unless this is the last part.
+    if (next.length > (k === parts.length - 1 ? DIFF_SUMMARY_MAX : DIFF_SUMMARY_MAX - 30) && out !== '') {
+      const left = parts.length - k;
+      return `${out}; …and ${left} more ${left === 1 ? 'difference' : 'differences'}`;
+    }
+    out = next;
+  }
+  return out;
 }

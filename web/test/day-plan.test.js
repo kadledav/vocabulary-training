@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { busyAnswer, busyWaitMs } from '../js/api.js';
-import { blockLabel, blockPreview, dayDone, dueTomorrow, moreNewCount, newWaiting, nextBlock, pausedForBacklog, typedLine } from '../js/day-plan.js';
+import { blockLabel, blockPreview, dayDone, dueTomorrow, moreNewCount, newWaiting, nextBlock, pausedForBacklog, typedCardsName, typedLine } from '../js/day-plan.js';
 import { describePointer } from '../js/import-issues.js';
 import { RATING_GUARD_MS, ratingGuardOpen, sameSpotTap } from '../js/rating.js';
 
@@ -97,7 +97,7 @@ test('busy servers are asked again after Retry-After; lock-outs and timeouts are
   assert.equal(busyWaitMs(null, 1), 4000);
 });
 
-test('R-52 Today says how many Produce cards wait for their first time and how many come today', () => {
+test('R-52 Today says how many Produce/Spelling cards wait for their first time and how many come today', () => {
   /** @param {number} waiting @param {Partial<import('../js/session.js').TypedAllowance>} [typed] */
   const line = (waiting, typed = {}) =>
     typedLine(
@@ -107,23 +107,35 @@ test('R-52 Today says how many Produce cards wait for their first time and how m
       }),
     );
   assert.equal(line(0), null);
-  assert.equal(line(0, { introduced_today: 3 }), '3 Produce cards practised for the first time today.');
-  assert.equal(line(1), '1 Produce card waits for the first time — it comes today.');
-  assert.equal(line(4), '4 Produce cards wait for the first time — all come today.');
-  assert.equal(line(90), '90 Produce cards wait for the first time — 10 today (limit 10 a day), the rest on later days.');
+  assert.equal(line(0, { introduced_today: 3 }), '3 Produce/Spelling cards practised for the first time today.');
+  assert.equal(line(1), '1 Produce/Spelling card waits for the first time — it comes today.');
+  assert.equal(line(4), '4 Produce/Spelling cards wait for the first time — all come today.');
+  assert.equal(line(90), '90 Produce/Spelling cards wait for the first time — 10 today (limit 10 a day), the rest on later days.');
   assert.equal(
     line(90, { introduced_today: 4, left_today: 6, quota: 6 }),
-    '90 Produce cards wait for the first time — 6 today (limit 10 a day), the rest on later days.',
+    '90 Produce/Spelling cards wait for the first time — 6 today (limit 10 a day), the rest on later days.',
   );
   assert.equal(
     line(80, { introduced_today: 10, left_today: 0, quota: 0 }),
-    '80 Produce cards wait for the first time — today’s 10 are done (limit in Settings); more tomorrow.',
+    '80 Produce/Spelling cards wait for the first time — today’s 10 are done (limit in Settings); more tomorrow.',
   );
-  assert.equal(line(5, { paused: true, quota: 0 }), '5 Produce cards wait for the first time — held back until you catch up on reviews.');
+  assert.equal(line(5, { paused: true, quota: 0 }), '5 Produce/Spelling cards wait for the first time — held back until you catch up on reviews.');
   assert.equal(typedLine(today()), null, 'an older server without the counts');
 });
 
-test('R-52 cap 0 says first-time Produce cards are switched off and where to change it', () => {
+test('R-58 without spelling words Today just says Produce cards', () => {
+  const t = today({
+    typed_waiting: 4,
+    spelling_practice: false,
+    new_typed: { per_day: 0, introduced_today: 0, left_today: 0, quota: 0, paused: false },
+  });
+  assert.equal(typedLine(t), '4 Produce cards wait for the first time — new Produce cards are switched off (New Produce cards per day in Settings).');
+  assert.equal(typedCardsName(t), 'Produce');
+  assert.equal(typedCardsName({ ...t, spelling_practice: true }), 'Produce/Spelling');
+  assert.equal(typedCardsName(null), 'Produce/Spelling', 'unknown: both');
+});
+
+test('R-52 cap 0 says first-time Produce/Spelling cards are switched off and where to change it', () => {
   const t = today({
     typed_waiting: 4,
     typed_today: 0,
@@ -131,7 +143,7 @@ test('R-52 cap 0 says first-time Produce cards are switched off and where to cha
   });
   assert.equal(
     typedLine(t),
-    '4 Produce cards wait for the first time — new Produce cards are switched off (New Produce cards per day in Settings).',
+    '4 Produce/Spelling cards wait for the first time — new Produce/Spelling cards are switched off (New Produce/Spelling cards per day in Settings).',
   );
 });
 
@@ -143,14 +155,14 @@ test('R-52 Produce cards whose words already have a card today come on a later d
     next_block: { due: 0, new: 0 },
     new_typed: { per_day: 10, introduced_today: 0, left_today: 10, quota: 10, paused: false },
   });
-  assert.equal(typedLine(t), '1 Produce card waits for the first time — its word has a card today already, so it comes on a later day.');
+  assert.equal(typedLine(t), '1 Produce/Spelling card waits for the first time — its word has a card today already, so it comes on a later day.');
   assert.equal(dayDone(t, 20), true, 'no Start that yields nothing');
   const some = today({
     typed_waiting: 5,
     typed_today: 3,
     new_typed: { per_day: 10, introduced_today: 0, left_today: 10, quota: 10, paused: false },
   });
-  assert.equal(typedLine(some), '5 Produce cards wait for the first time — 3 today (limit 10 a day), the rest on later days.');
+  assert.equal(typedLine(some), '5 Produce/Spelling cards wait for the first time — 3 today (limit 10 a day), the rest on later days.');
 });
 
 test('R-52 the Start label is the server\'s own plan when it sends one', () => {

@@ -157,6 +157,16 @@ pub fn practice_words(
     .collect()
 }
 
+/// Is any word that may be practised marked for spelling practice (it then
+/// gets a Spelling card, R-58)? Today names the typed cards by what exists.
+pub fn spelling_practice(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM word WHERE spelling = 1 AND suspended = 0)",
+        [],
+        |row| row.get(0),
+    )
+}
+
 /// Does a source with this id exist?
 pub fn source_exists(conn: &Connection, id: SourceId) -> rusqlite::Result<bool> {
     conn.query_row(

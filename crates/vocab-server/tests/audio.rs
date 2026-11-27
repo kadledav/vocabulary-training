@@ -77,6 +77,10 @@ async fn speak(State(fake): State<Arc<Fake>>, Json(body): Json<Value>) -> Respon
     headers.insert("x-duration-ms", HeaderValue::from(1234));
     let approximate = u32::from(text.contains("zxq"));
     headers.insert("x-approximate", HeaderValue::from(approximate));
+    // An older service says nothing about words read letter by letter.
+    if !text.contains("hush") {
+        headers.insert("x-words-spelled", HeaderValue::from(approximate));
+    }
     (headers, fake_mp3(&text)).into_response()
 }
 
@@ -508,6 +512,43 @@ async fn r40_approximate_pronunciations_are_reported() {
     assert_eq!(clips["word"]["approximate"], true);
     let (_, status) = env.get("/api/audio/status").await;
     assert_eq!(status["approximate"], 1, "{status}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r58_clips_that_spell_a_word_out_are_marked_and_unknown_counts_as_spelled() {
+    let (_fake, endpoint) = fake_tts().await;
+    let env = env_with_audio(tempfile::tempdir().expect("tempdir"), START, Some(endpoint));
+    let mut odd = word("zxqoid", 6, 0);
+    odd["speak"] = json!("zxqoid");
+    env.import(
+        "test-audio-book",
+        vec![odd, word("glimmerwick", 7, 0), word("hushwick", 8, 0)],
+    )
+    .await;
+    drain(env.audio.as_ref().expect("audio")).await;
+    // Stored as the service said it (NULL: it did not say).
+    assert_eq!(
+        env.int("SELECT spelled FROM audio_clip WHERE text = 'zxqoid'"),
+        1
+    );
+    assert_eq!(
+        env.int("SELECT spelled FROM audio_clip WHERE text = 'glimmerwick'"),
+        0
+    );
+    assert_eq!(
+        env.int("SELECT COUNT(*) FROM audio_clip WHERE text = 'hushwick' AND spelled IS NULL"),
+        env.int("SELECT COUNT(*) FROM audio_clip WHERE text = 'hushwick'"),
+    );
+    for (headword, whole) in [
+        ("zxqoid", false),
+        ("glimmerwick", true),
+        ("hushwick", false),
+    ] {
+        let id = env.word_id(headword).await;
+        let (_, clips) = env.get(&format!("/api/audio/words/{}", id.get())).await;
+        assert_eq!(clips["word"]["ready"], true, "{headword}: {clips}");
+        assert_eq!(clips["word"]["whole_words"], whole, "{headword}: {clips}");
+    }
 }
 
 #[tokio::test]

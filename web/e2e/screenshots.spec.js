@@ -6,7 +6,7 @@
 
 import path from 'node:path';
 
-import { expect, startBookBlock, test, waitGuard, waitingProduce } from './fixtures.js';
+import { expect, startBookBlock, test, waitGuard, waitingProduce, waitingSpelling } from './fixtures.js';
 
 const dir = process.env.SCREENSHOT_DIR;
 
@@ -118,6 +118,64 @@ for (const theme of /** @type {const} */ (['dark', 'light'])) {
     await expect(page.getByLabel('New Produce cards per day')).toBeVisible();
     await page.getByLabel('New Produce cards per day').scrollIntoViewIfNeeded();
     await shot('8-settings');
+  });
+}
+
+/** M10: the Spelling card's question and answer states. */
+for (const theme of /** @type {const} */ (['dark', 'light'])) {
+  test(`M10 Spelling screens, ${theme}`, async ({ page, app }, info) => {
+    test.skip(!dir, 'set SCREENSHOT_DIR to take screenshots');
+    const shot = (/** @type {string} */ name) =>
+      page.screenshot({ path: path.join(/** @type {string} */ (dir), `m10-${info.project.name}-${theme}-${name}.png`) });
+    await app.api('PATCH', '/api/settings', { theme });
+    await waitingSpelling(app, ['glimmerous', 'brontle', 'quabble', 'snorkish'], 'Two m, then -ous.');
+    await page.goto(`${app.url}/#/`);
+    await expect(page.getByTestId('typed-waiting')).toBeVisible();
+    await shot('1-today');
+    await page.getByTestId('start').click();
+    await expect(page.getByTestId('listen-status')).toHaveText(/Tap/);
+    await shot('2-question-tap-to-listen');
+    await page.getByTestId('listen').click();
+    await page.getByTestId('answer-input').fill('glimerous');
+    await shot('3-question-heard-typed');
+    if (info.project.name === 'webkit-phone') {
+      await page.evaluate(() => {
+        const vv = /** @type {VisualViewport} */ (window.visualViewport);
+        Object.defineProperty(vv, 'height', { configurable: true, get: () => 450 });
+        vv.dispatchEvent(new Event('resize'));
+      });
+      await shot('3b-question-keyboard-450px');
+      await page.evaluate(() => {
+        const vv = /** @type {VisualViewport} */ (window.visualViewport);
+        Object.defineProperty(vv, 'height', { configurable: true, get: () => window.innerHeight });
+        vv.dispatchEvent(new Event('resize'));
+      });
+    }
+    await page.getByTestId('check').click();
+    await expect(page.getByTestId('spell-diff')).toBeVisible();
+    await shot('4-answer-letter-diff');
+    await waitGuard();
+    await page.getByRole('button', { name: /^Rate 4,/ }).click();
+    await expect(page.getByTestId('next')).toBeVisible();
+    await shot('5-feedback-after-4');
+    await page.getByTestId('next').click();
+    await page.waitForTimeout(300);
+    await page.getByTestId('answer-input').fill('Brontle');
+    await page.getByTestId('check').click();
+    await expect(page.getByTestId('check-result')).toHaveAttribute('data-match', 'exact');
+    await shot('6-answer-correct');
+    await waitGuard();
+    await page.getByRole('button', { name: /^Rate 2,/ }).click();
+    await page.waitForTimeout(300);
+    await page.getByTestId('answer-input').fill('quabbel the long way round to test wrapping');
+    await page.getByTestId('check').click();
+    await expect(page.getByTestId('spell-diff')).toBeVisible();
+    await shot('7-answer-long-diff');
+    await waitGuard();
+    await page.getByRole('button', { name: /^Rate 3,/ }).click();
+    await page.waitForTimeout(300);
+    await page.getByTestId('dont-know').click();
+    await shot('8-answer-dont-know');
   });
 }
 

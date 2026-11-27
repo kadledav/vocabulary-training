@@ -74,6 +74,9 @@ pub struct TodayView {
     /// review and could come today (beyond the cap they wait for a later
     /// day).
     pub typed_waiting: u32,
+    /// Some word is marked for spelling practice (R-58): Today and Settings
+    /// say "Produce/Spelling cards", else "Produce cards".
+    pub spelling_practice: bool,
     /// Of `due_now`, the first-time Produce/Spelling cards that come today
     /// (within the cap, not blocked by a review of the same word).
     pub typed_today: u32,
@@ -168,6 +171,7 @@ pub fn today(
         new_paused_reason: new_words.paused.then_some(PauseReason::Backlog),
         new_typed,
         typed_waiting,
+        spelling_practice: catalog::spelling_practice(conn)?,
         typed_today: due.first_time,
         next_block: due.next_block,
         extra_available,

@@ -125,7 +125,18 @@ export function dayDone(today, blockSize) {
 }
 
 /**
- * What Today says about Produce cards waiting for their first time (design
+ * What the typed cards are called: "Produce/Spelling" while some word has
+ * spelling practice (or the server does not say), else just "Produce" —
+ * an owner without spelling words has no Spelling card to hear about.
+ *
+ * @param {Today | null | undefined} today
+ */
+export function typedCardsName(today) {
+  return today?.spelling_practice === false ? 'Produce' : 'Produce/Spelling';
+}
+
+/**
+ * What Today says about Produce/Spelling cards waiting for their first time (design
  * §17 M8): how many wait, how many come today, or why they do not — held
  * back with new words while reviews pile up, switched off in Settings,
  * today's limit used up, or their words already practised today (one card
@@ -138,15 +149,16 @@ export function dayDone(today, blockSize) {
 export function typedLine(today) {
   const typed = today.new_typed;
   const waiting = today.typed_waiting ?? 0;
+  const name = typedCardsName(today);
   if (!typed) return null;
   if (waiting === 0) {
-    return typed.introduced_today > 0 ? `${plural(typed.introduced_today, 'Produce card')} practised for the first time today.` : null;
+    return typed.introduced_today > 0 ? `${plural(typed.introduced_today, `${name} card`)} practised for the first time today.` : null;
   }
-  const cards = plural(waiting, 'Produce card');
+  const cards = plural(waiting, `${name} card`);
   const verb = waiting === 1 ? 'waits' : 'wait';
   if (typed.paused) return `${cards} ${verb} for the first time — held back until you catch up on reviews.`;
   if (typed.per_day === 0) {
-    return `${cards} ${verb} for the first time — new Produce cards are switched off (New Produce cards per day in Settings).`;
+    return `${cards} ${verb} for the first time — new ${name} cards are switched off (New ${name} cards per day in Settings).`;
   }
   const comingToday = today.typed_today ?? Math.min(waiting, typed.quota);
   if (comingToday === waiting) return `${cards} ${verb} for the first time — ${waiting === 1 ? 'it comes' : 'all come'} today.`;
