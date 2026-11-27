@@ -20,6 +20,7 @@ const TABLES: &[&str] = &[
     "card",
     "field_conflict",
     "fsrs_params",
+    "id_floor",
     "pack_import",
     "practice_session",
     "review_log",
@@ -873,6 +874,46 @@ fn r04_v6_database_with_data_migrates_to_v7() {
         [word],
     )
     .expect("alias");
+    // Ids are never reused: the floors start at the highest stored ids and
+    // follow every delete, also one by a cascade.
+    let floor = |name: &str| -> i64 {
+        conn.query_row(
+            "SELECT last_id FROM id_floor WHERE name = ?1",
+            [name],
+            |r| r.get(0),
+        )
+        .expect("floor")
+    };
+    let max = |table: &str| -> i64 {
+        conn.query_row(
+            &format!("SELECT COALESCE(MAX(id), 0) FROM {table}"),
+            [],
+            |r| r.get(0),
+        )
+        .expect("max")
+    };
+    for table in ["word", "sentence", "field_conflict"] {
+        assert_eq!(floor(table), max(table), "{table}");
+    }
+    let newest: i64 = max("word");
+    let newest_sentence: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(id), 0) FROM sentence WHERE word_id = ?1",
+            [newest],
+            |r| r.get(0),
+        )
+        .expect("sentence");
+    conn.execute("DELETE FROM card WHERE word_id = ?1", [newest])
+        .expect("cards");
+    conn.execute(
+        "DELETE FROM review_log WHERE card_id NOT IN (SELECT id FROM card)",
+        [],
+    )
+    .expect("reviews");
+    conn.execute("DELETE FROM word WHERE id = ?1", [newest])
+        .expect("delete");
+    assert_eq!(floor("word"), newest);
+    assert!(floor("sentence") >= newest_sentence);
     assert!(pragma_rows(&conn, "foreign_key_check").is_empty());
     assert_eq!(pragma_rows(&conn, "integrity_check"), vec!["Text(\"ok\")"]);
 }

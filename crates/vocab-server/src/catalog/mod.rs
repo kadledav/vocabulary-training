@@ -6,7 +6,7 @@
 //! catalog tables (design §3.2).
 //!
 //! Owned tables: `source`, `word`, `word_source`, `word_item`, `word_form`,
-//! `sentence`, `word_override`, `field_conflict`. The `audio` module reads
+//! `sentence`, `word_override`, `field_conflict`, `id_floor`. The `audio` module reads
 //! what can be spoken through [`speak_sources`]. All SQL touching them is in
 //! this module (R-92). Other modules use the functions re-exported here.
 //!
@@ -16,6 +16,7 @@
 
 mod edit;
 mod identity;
+mod ids;
 mod merge;
 mod practice;
 mod read;

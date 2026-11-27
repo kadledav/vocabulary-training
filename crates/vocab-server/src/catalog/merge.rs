@@ -27,6 +27,7 @@ use vocab_pack::keys::{item_key, span_key};
 use vocab_pack::types::{PackSentence, PackWord, TagKind};
 
 use super::identity::find_word;
+use super::ids::{IdTable, next_id};
 use super::{SourceId, WordId, scalar};
 
 /// Where an imported word comes from.
@@ -435,10 +436,11 @@ fn insert_word(
     link: &ImportLink<'_>,
     word: &PackWord,
 ) -> rusqlite::Result<WordId> {
+    let id = next_id(tx, IdTable::Word)?;
     tx.execute(
         "INSERT INTO word (headword, headword_key, grammar, pronunciation, speak, meaning, usefulness, \
-         goal, hint, spelling, spelling_note, note, icon, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)",
+         goal, hint, spelling, spelling_note, note, icon, created_at, updated_at, id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14, ?15)",
         params![
             word.headword,
             word.key,
@@ -455,9 +457,10 @@ fn insert_word(
             word.note.as_deref().unwrap_or(""),
             word.icon,
             link.now,
+            id,
         ],
     )?;
-    Ok(WordId(tx.last_insert_rowid()))
+    Ok(WordId(id))
 }
 
 fn apply_existing(
@@ -473,7 +476,7 @@ fn apply_existing(
         let current = (!conflict.current.is_null()).then(|| conflict.current.to_string());
         tx.execute(
             "INSERT INTO field_conflict (word_id, field, current_value, incoming_value, \
-             pack_import_id, status, created_at) VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6)",
+             pack_import_id, status, created_at, id) VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?7)",
             params![
                 id.0,
                 conflict.field,
@@ -481,6 +484,7 @@ fn apply_existing(
                 conflict.incoming.to_string(),
                 link.pack_import_id,
                 link.now,
+                next_id(tx, IdTable::FieldConflict)?,
             ],
         )?;
     }
@@ -523,9 +527,9 @@ fn apply_sentences(
         let s = &word.sentences[i];
         tx.execute(
             "INSERT INTO sentence (word_id, en_marked, cs_marked, en_key, origin, location, source_id, \
-             position, pack_import_id, created_at, updated_at) \
+             position, pack_import_id, created_at, updated_at, id) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, \
-             (SELECT COALESCE(MAX(position) + 1, 0) FROM sentence WHERE word_id = ?1), ?8, ?9, ?9)",
+             (SELECT COALESCE(MAX(position) + 1, 0) FROM sentence WHERE word_id = ?1), ?8, ?9, ?9, ?10)",
             params![
                 id.0,
                 s.en,
@@ -536,6 +540,7 @@ fn apply_sentences(
                 link.source_id.0,
                 link.pack_import_id,
                 link.now,
+                next_id(tx, IdTable::Sentence)?,
             ],
         )?;
     }

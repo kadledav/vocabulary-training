@@ -699,3 +699,54 @@ async fn r04_single_line_fields_and_the_spelling_note_follow_the_import_rules() 
     let view = patch_ok(&env, id, json!({ "spelling": false })).await;
     assert_eq!(view["spelling_note"], "Double l.");
 }
+
+/// A deleted word's ids (word, sentences, suggestions) are never given to
+/// a new row: a stale page or an Undo for it must not reach another word.
+#[tokio::test]
+async fn r04_ids_of_a_deleted_word_are_never_reused() {
+    let env = env();
+    env.import(BOOK, vec![word("sift", 6, 3)]).await;
+    env.import(BOOK, vec![lull()]).await;
+    let id = id_of(&env, "lull").await;
+    patch_ok(&env, id, json!({ "meaning": "Owner meaning." })).await;
+    env.import(BOOK, vec![lull()]).await;
+    let view = detail(&env, id).await;
+    let sentence = view["sentences"][2]["id"].as_i64().expect("sentence");
+    let conflict = conflicts(&view, "meaning")[0]["id"].as_i64().expect("c");
+    assert_eq!(id, env.int("SELECT MAX(id) FROM word"), "the newest word");
+    let (status, _) = env
+        .request("DELETE", &format!("/api/words/{id}"), Some(&json!({})))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let mut other = word("brontle", 5, 3);
+    other["meaning"] = json!("Another invented meaning.");
+    env.import(BOOK, vec![other]).await;
+    env.import(BOOK, vec![word("brontle", 6, 3)]).await;
+    let new = id_of(&env, "brontle").await;
+    assert!(new > id, "word id {new} after deleted {id}");
+    assert!(
+        env.int("SELECT MIN(id) FROM sentence WHERE word_id = (SELECT MAX(id) FROM word)")
+            > sentence
+    );
+    assert!(env.int("SELECT COALESCE(MAX(id), 0) FROM field_conflict") > conflict);
+    // The stale requests find nothing.
+    let (status, _) = patch(&env, id, json!({ "usefulness": 3 })).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = env
+        .request(
+            "PATCH",
+            &format!("/api/sentences/{sentence}"),
+            Some(&json!({ "en": "The [[brontle]] test.", "cs": "Test [[brontle]]." })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = env
+        .post(
+            &format!("/api/conflicts/{conflict}"),
+            &json!({ "use": "keep" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(detail(&env, new).await["usefulness"], 5);
+}
