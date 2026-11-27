@@ -136,10 +136,15 @@ impl Model {
 
     /// Due-card priority (design §6.7 step 2): `(1 − R_now / R_target) × w(u)`
     /// with `w(u) = 0.5 + u/10`. A card without a memory state yet (an
-    /// unlocked Produce/Spelling card) counts as `R_now = 0`.
+    /// unlocked Produce/Spelling card waiting for its first review) gets the
+    /// neutral priority 0, as if `R_now = R_target` (design §17 M8): it is
+    /// not forgotten, it was never learnt in this direction, so it must not
+    /// push ahead of real reviews.
     pub fn priority(&self, card: &Card, word: &WordTraits, day: StudyDay) -> f64 {
         let target = f64::from(desired_retention(card.kind, word));
-        let now = self.retrievability(card, day).unwrap_or(0.0);
+        let Some(now) = self.retrievability(card, day) else {
+            return 0.0;
+        };
         // Usefulness is 1..=10; f64 holds it exactly.
         let weight = 0.5 + word.usefulness as f64 / 10.0;
         (1.0 - now / target) * weight
@@ -254,6 +259,40 @@ mod tests {
         };
         let (_, max) = m.next(Some(huge), 0.8, 1000, Rating::Easy).expect("next");
         assert_eq!(max, 36500);
+    }
+
+    #[test]
+    fn r52_a_card_without_memory_has_the_neutral_priority() {
+        use crate::scheduler::{CardFormat, CardId, CardState, LeechState};
+        let day: StudyDay = "2026-11-20".parse().expect("day");
+        let mut card = Card {
+            id: CardId::new(1),
+            word_id: WordId::new(1),
+            kind: CardKind::Produce,
+            format: None,
+            state: CardState::New,
+            stability: None,
+            difficulty: None,
+            due_day: Some(day),
+            last_review_day: None,
+            last_review_at: None,
+            introduced_day: None,
+            reps: 0,
+            lapses: 0,
+            consecutive_fives: 0,
+            leech: LeechState::None,
+            leech_lapses_at_ack: 0,
+            suspended: false,
+        };
+        let m = Model::default_parameters();
+        assert_eq!(m.priority(&card, &word(10), day), 0.0);
+        // An overdue reviewed card ranks above it.
+        card.format = Some(CardFormat::Cloze);
+        card.state = CardState::Review;
+        card.stability = Some(5.0);
+        card.difficulty = Some(5.0);
+        card.last_review_day = Some("2026-10-20".parse().expect("day"));
+        assert!(m.priority(&card, &word(10), day) > 0.0);
     }
 
     #[test]

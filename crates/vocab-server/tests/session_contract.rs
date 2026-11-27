@@ -484,6 +484,15 @@ async fn r61_the_api_stores_raw_grade_applied_rating_and_answer_details() {
         settings(&env, json!({ "block_size": 5 })).await.0,
         StatusCode::OK
     );
+    // Answer details belong to typed cards (M8): every word has a Produce
+    // card due, its Understand card is known and not due.
+    make_due(&env, "w%", "2026-12-30");
+    env.exec(
+        "INSERT INTO card (word_id, kind, format, state, stability, difficulty, due_day, \
+         last_review_day, introduced_day, reps, created_at) \
+         SELECT id, 'produce', 'cloze', 'review', 5.0, 5.0, '2026-11-19', '2026-11-10', \
+         '2026-11-01', 2, '2026-11-01T00:00:00Z' FROM word",
+    );
     let mut block = start_block(&env).await;
     // Rate in queue order with raw 1..5; repeats of 4 and 5 are left aside.
     for raw in 1..=5u8 {
@@ -564,15 +573,34 @@ async fn r52_today_and_blocks_leave_out_card_kinds_that_are_not_served_yet() {
     let env = env();
     env.import("test-novel", vec![word("alpha", 9, 3)]).await;
     make_due(&env, "alpha", "2026-11-25");
+    // Spelling is served from M10 on.
+    env.exec(
+        "INSERT INTO card (word_id, kind, format, state, stability, difficulty, due_day, \
+         last_review_day, introduced_day, reps, created_at) \
+         SELECT id, 'spelling', 'spelling', 'review', 5.0, 5.0, '2026-11-19', '2026-11-10', \
+         '2026-11-01', 2, '2026-11-01T00:00:00Z' FROM word",
+    );
+    assert_eq!(today(&env, None).await["due_now"], 0);
+    let result = start(&env, json!({ "kind": "start" })).await;
+    assert!(result["session"].is_null(), "{result}");
+}
+
+#[tokio::test]
+async fn r52_produce_cards_are_served_from_m8() {
+    let env = env();
+    env.import("test-novel", vec![word("alpha", 9, 3)]).await;
+    make_due(&env, "alpha", "2026-11-25");
     env.exec(
         "INSERT INTO card (word_id, kind, format, state, stability, difficulty, due_day, \
          last_review_day, introduced_day, reps, created_at) \
          SELECT id, 'produce', 'cloze', 'review', 5.0, 5.0, '2026-11-19', '2026-11-10', \
          '2026-11-01', 2, '2026-11-01T00:00:00Z' FROM word",
     );
-    assert_eq!(today(&env, None).await["due_now"], 0);
-    let result = start(&env, json!({ "kind": "start" })).await;
-    assert!(result["session"].is_null(), "{result}");
+    assert_eq!(today(&env, None).await["due_now"], 1);
+    let block = start_block(&env).await;
+    let item = next_item(&block);
+    assert_eq!(item["card"]["kind"], "produce");
+    assert_eq!(item["card"]["format"], "cloze");
 }
 
 // ── sentence rotation (design §6.7 step 6, R-53) ────────────────────────────

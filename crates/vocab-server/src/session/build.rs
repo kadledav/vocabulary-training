@@ -41,10 +41,30 @@ pub struct NewAllowance {
     pub backlog: bool,
     /// The owner chose "Add new words anyway" today.
     pub anyway_today: bool,
-    /// Due cards of served kinds, all sources, words not suspended.
+    /// Reviews due (cards of served kinds with a memory state, all
+    /// sources, words not suspended); Produce/Spelling cards waiting for
+    /// their first review are not a backlog and do not count.
     pub due_now: u32,
     /// Mean daily reviews over the last 14 days, at least 20.
     pub normal_load: f64,
+}
+
+/// Today's allowance of first-time Produce/Spelling cards (design §17
+/// M8): unlocked cards wait until a day has room for them, so words that
+/// reach the unlock threshold together are spread over several days.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TypedAllowance {
+    /// The `new_typed_per_day` setting.
+    pub per_day: u32,
+    /// Produce/Spelling cards first reviewed today.
+    pub introduced_today: u32,
+    /// `per_day − introduced_today`.
+    pub left_today: u32,
+    /// What blocks may still introduce now: 0 while new learning is paused
+    /// for the review backlog (the same pause and the same "add anyway" as
+    /// new words, design §6.6).
+    pub quota: u32,
+    pub paused: bool,
 }
 
 fn count(n: usize) -> u32 {
@@ -64,13 +84,53 @@ fn scheduled_of(
         .collect())
 }
 
-/// Scheduled cards of the served kinds in `scope` (words not suspended,
-/// R-59). Callers pick the due ones with `Card::is_due_on`.
-pub fn scheduled_in_scope(
+/// Reviewed cards (with a memory state) of the served kinds in `scope`
+/// (words not suspended, R-59): the reviews that are or will be due.
+/// Produce/Spelling cards waiting for their first review are left out;
+/// they come through [`TypedAllowance`]. Callers pick the due ones with
+/// `Card::is_due_on`.
+pub fn reviews_in_scope(conn: &Connection, scope: Option<SourceId>) -> rusqlite::Result<Vec<Card>> {
+    Ok(
+        scheduled_of(conn, &catalog::practice_words(conn, scope)?, SERVED_KINDS)?
+            .into_iter()
+            .filter(|c| !c.awaits_first_review())
+            .collect(),
+    )
+}
+
+/// Unlocked Produce/Spelling cards of the served kinds in `scope` that wait
+/// for their first review and may come on `day` (due day reached).
+pub fn typed_waiting(
     conn: &Connection,
+    day: StudyDay,
     scope: Option<SourceId>,
-) -> rusqlite::Result<Vec<Card>> {
-    scheduled_of(conn, &catalog::practice_words(conn, scope)?, SERVED_KINDS)
+) -> rusqlite::Result<u32> {
+    let words = catalog::practice_words(conn, scope)?;
+    Ok(count(
+        scheduled_of(conn, &words, SERVED_KINDS)?
+            .iter()
+            .filter(|c| c.awaits_first_review() && c.is_due_on(day))
+            .count(),
+    ))
+}
+
+/// The allowance of first-time Produce/Spelling cards on `day`; `new` is
+/// the day's new-word allowance (its pause applies to both).
+pub fn typed_allowance(
+    conn: &Connection,
+    day: StudyDay,
+    settings: &Settings,
+    new: &NewAllowance,
+) -> rusqlite::Result<TypedAllowance> {
+    let introduced_today = scheduler::first_typed_reviews_on(conn, day)?;
+    let left_today = settings.new_typed_per_day.saturating_sub(introduced_today);
+    Ok(TypedAllowance {
+        per_day: settings.new_typed_per_day,
+        introduced_today,
+        left_today,
+        quota: if new.paused { 0 } else { left_today },
+        paused: new.paused,
+    })
 }
 
 /// New-word candidates among `words`: never reviewed Understand cards
@@ -107,7 +167,7 @@ pub fn new_word_allowance(
 ) -> rusqlite::Result<NewAllowance> {
     let introduced_today = count(scheduler::introduced_words_on(conn, day)?.len());
     let due_now = count(
-        scheduled_in_scope(conn, None)?
+        reviews_in_scope(conn, None)?
             .iter()
             .filter(|c| c.is_due_on(day))
             .count(),
@@ -213,17 +273,34 @@ struct Planned {
     origin: ItemOrigin,
 }
 
+/// A due card ranked for the block: relearning first, then priority
+/// (highest first), then `rank` (the waiting order of first-time cards),
+/// then card id.
+struct Ranked {
+    relearning: bool,
+    priority: f64,
+    rank: usize,
+    card: Card,
+}
+
 /// Steps 1–3: due cards of `kinds` in priority order, one per word, sibling
 /// rule and Spelling cap applied.
+///
+/// Produce/Spelling cards waiting for their first review (design §17 M8)
+/// join only up to `typed_quota`, those waiting longest first (then
+/// usefulness, then card id), with the neutral priority 0, and never in
+/// place of a due review of the same word: a review put off costs memory,
+/// a first-time card loses nothing by waiting a day.
 fn plan_due(
     conn: &Connection,
     day: StudyDay,
     kinds: &[CardKind],
     words: &HashMap<WordId, PracticeWord>,
     reviewed_today: &HashMap<WordId, HashSet<CardId>>,
+    typed_quota: u32,
 ) -> rusqlite::Result<Vec<Planned>> {
     let model = scheduler::model(conn)?;
-    let mut due: Vec<(bool, f64, Card)> = scheduled_of(conn, words, kinds)?
+    let (mut first_time, reviews): (Vec<Card>, Vec<Card>) = scheduled_of(conn, words, kinds)?
         .into_iter()
         .filter(|c| c.is_due_on(day))
         .filter(|c| {
@@ -232,22 +309,54 @@ fn plan_due(
                 .get(&c.word_id)
                 .is_none_or(|cards| cards.iter().all(|id| *id == c.id))
         })
-        .filter_map(|c| {
-            let word = &words.get(&c.word_id)?.traits;
-            let priority = model.priority(&c, word, day);
-            Some((c.state == CardState::Relearning, priority, c))
-        })
-        .collect();
-    // Relearning first, then priority (highest first), then card id.
+        .filter(|c| words.contains_key(&c.word_id))
+        .partition(Card::awaits_first_review);
+    let usefulness = |c: &Card| words.get(&c.word_id).map_or(0, |w| w.traits.usefulness);
+    let mut due: Vec<Ranked> = Vec::with_capacity(reviews.len());
+    for card in reviews {
+        if let Some(word) = words.get(&card.word_id) {
+            due.push(Ranked {
+                relearning: card.state == CardState::Relearning,
+                priority: model.priority(&card, &word.traits, day),
+                rank: 0,
+                card,
+            });
+        }
+    }
+    let review_words: HashSet<WordId> = due.iter().map(|r| r.card.word_id).collect();
+    // Waiting longest first, then the more useful word, then card id.
+    first_time.sort_by(|a, b| {
+        a.due_day
+            .cmp(&b.due_day)
+            .then(usefulness(b).cmp(&usefulness(a)))
+            .then(a.id.cmp(&b.id))
+    });
+    let mut typed_words = HashSet::new();
+    let admitted = first_time
+        .into_iter()
+        .filter(|c| !review_words.contains(&c.word_id) && typed_words.insert(c.word_id))
+        .take(typed_quota as usize);
+    for (rank, card) in admitted.enumerate() {
+        if let Some(word) = words.get(&card.word_id) {
+            due.push(Ranked {
+                relearning: false,
+                priority: model.priority(&card, &word.traits, day),
+                rank,
+                card,
+            });
+        }
+    }
     due.sort_by(|a, b| {
-        b.0.cmp(&a.0)
-            .then(b.1.total_cmp(&a.1))
-            .then(a.2.id.cmp(&b.2.id))
+        b.relearning
+            .cmp(&a.relearning)
+            .then(b.priority.total_cmp(&a.priority))
+            .then(a.rank.cmp(&b.rank))
+            .then(a.card.id.cmp(&b.card.id))
     });
     let mut seen_words = HashSet::new();
     let mut spelling = 0;
     let mut planned = Vec::new();
-    for (_, _, card) in due {
+    for Ranked { card, .. } in due {
         if !seen_words.insert(card.word_id) {
             continue;
         }
@@ -343,9 +452,17 @@ fn plan_block(
 ) -> rusqlite::Result<Vec<Planned>> {
     let words = catalog::practice_words(conn, scope)?;
     let reviewed_today = scheduler::reviewed_cards_on(conn, day)?;
-    let due = plan_due(conn, day, SERVED_KINDS, &words, &reviewed_today)?;
-    let due_words: HashSet<WordId> = due.iter().map(|p| p.word).collect();
     let allowance = new_word_allowance(conn, day, settings)?;
+    let typed = typed_allowance(conn, day, settings, &allowance)?;
+    let due = plan_due(
+        conn,
+        day,
+        SERVED_KINDS,
+        &words,
+        &reviewed_today,
+        typed.quota,
+    )?;
+    let due_words: HashSet<WordId> = due.iter().map(|p| p.word).collect();
     let new = plan_new(
         conn,
         day,
@@ -357,10 +474,30 @@ fn plan_block(
     Ok(interleave(due, new, settings.block_size as usize))
 }
 
+/// Is anything left for a regular block in `scope` on `day`: a due review,
+/// or a first-time Produce/Spelling card that today's cap still lets in?
+fn anything_due(
+    conn: &Connection,
+    day: StudyDay,
+    scope: Option<SourceId>,
+    settings: &Settings,
+) -> rusqlite::Result<bool> {
+    if reviews_in_scope(conn, scope)?
+        .iter()
+        .any(|c| c.is_due_on(day))
+    {
+        return Ok(true);
+    }
+    let new = new_word_allowance(conn, day, settings)?;
+    Ok(typed_allowance(conn, day, settings, &new)?.quota > 0
+        && typed_waiting(conn, day, scope)? > 0)
+}
+
 /// Extra practice (R-63, design §6.9), offered only while nothing is due
-/// in `scope` (due cards come first; an empty plan otherwise): cards
-/// already seen (at least one review) of the served kinds in `scope`, one
-/// per word.
+/// in `scope` (due cards come first; an empty plan otherwise — first-time
+/// Produce/Spelling cards count as due while today's cap lets them in):
+/// cards already seen (at least one review) of the served kinds in
+/// `scope`, one per word.
 /// Cards whose latest rating today was 1–2 are left out (just shown, known);
 /// cards rated 3–5 today come first, then the lowest current FSRS
 /// retrievability. Not limited to a block yet.
@@ -368,13 +505,14 @@ fn plan_extra(
     conn: &Connection,
     day: StudyDay,
     scope: Option<SourceId>,
+    settings: &Settings,
 ) -> rusqlite::Result<Vec<Planned>> {
+    if anything_due(conn, day, scope, settings)? {
+        return Ok(Vec::new());
+    }
     let words = catalog::practice_words(conn, scope)?;
     let model = scheduler::model(conn)?;
     let scheduled = scheduled_of(conn, &words, SERVED_KINDS)?;
-    if scheduled.iter().any(|c| c.is_due_on(day)) {
-        return Ok(Vec::new());
-    }
     let latest = scheduler::latest_grades_on(conn, day)?;
     let mut cards: Vec<(bool, f64, Card)> = scheduled
         .into_iter()
@@ -415,7 +553,7 @@ pub fn extra_available(
     scope: Option<SourceId>,
     settings: &Settings,
 ) -> rusqlite::Result<u32> {
-    let eligible = plan_extra(conn, day, scope)?.len();
+    let eligible = plan_extra(conn, day, scope, settings)?.len();
     Ok(count(eligible).min(settings.block_size))
 }
 
@@ -463,7 +601,7 @@ fn plan_request(
             plan_block(conn, day, request.scope, settings)?,
         ),
         StartKind::Extra => {
-            let mut planned = plan_extra(conn, day, request.scope)?;
+            let mut planned = plan_extra(conn, day, request.scope, settings)?;
             planned.truncate(settings.block_size as usize);
             (BlockKind::Extra, settings.block_size, planned)
         }
@@ -677,7 +815,7 @@ mod tests {
         db.read(move |conn| {
             let words = catalog::practice_words(conn, None)?;
             let reviewed = scheduler::reviewed_cards_on(conn, today.day)?;
-            Ok::<_, DbError>(plan_due(conn, today.day, kinds, &words, &reviewed)?)
+            Ok::<_, DbError>(plan_due(conn, today.day, kinds, &words, &reviewed, 100)?)
         })
         .await
         .expect("plan")

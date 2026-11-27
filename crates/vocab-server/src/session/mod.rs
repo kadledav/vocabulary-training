@@ -9,9 +9,11 @@
 //! remove new items already queued (guarantor decision G4).
 //!
 //! The block builder serves only the card kinds whose practice UI exists
-//! ([`SERVED_KINDS`]: Understand until M8/M10). Produce and Spelling cards
-//! are still created and unlocked by the scheduler; they wait (stay due)
-//! until their kind is served.
+//! ([`SERVED_KINDS`]: Understand and Produce; Spelling from M10). Spelling
+//! cards are still created and unlocked by the scheduler; they wait (stay
+//! due) until their kind is served. Produce/Spelling cards that wait for
+//! their first review come in only up to a daily cap, with a neutral
+//! priority ([`TypedAllowance`], design §17 M8).
 
 mod build;
 mod queue;
@@ -22,8 +24,8 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 pub use build::{
-    NewAllowance, choose_sentence, extra_available, new_candidate_count, new_word_allowance,
-    scheduled_in_scope, start_block,
+    NewAllowance, TypedAllowance, choose_sentence, extra_available, new_candidate_count,
+    new_word_allowance, reviews_in_scope, start_block, typed_allowance, typed_waiting,
 };
 pub use queue::{finish, rate, undo_last};
 pub use view::{
@@ -34,8 +36,8 @@ pub use view::{
 use crate::catalog::SourceId;
 use crate::scheduler::{AnswerMatch, CardKind, RawGrade, SchedulerError};
 
-/// Card kinds the session builder serves (M3: Understand only).
-pub const SERVED_KINDS: &[CardKind] = &[CardKind::Understand];
+/// Card kinds the session builder serves (M8: Understand and Produce).
+pub const SERVED_KINDS: &[CardKind] = &[CardKind::Understand, CardKind::Produce];
 
 /// Id of a practice block: 128 random bits as 32 hex digits.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
@@ -166,14 +168,40 @@ impl RateInput {
                 "client_review_id must be a UUID (8-4-4-4-12 hex digits)".to_owned(),
             ));
         }
-        if self
-            .typed_answer
-            .as_deref()
-            .is_some_and(|t| t.chars().count() > TYPED_ANSWER_MAX)
-        {
-            return Err(SessionError::Invalid(format!(
-                "typed_answer is longer than {TYPED_ANSWER_MAX} characters"
-            )));
+        if let Some(typed) = self.typed_answer.as_deref() {
+            if typed.chars().count() > TYPED_ANSWER_MAX {
+                return Err(SessionError::Invalid(format!(
+                    "typed_answer is longer than {TYPED_ANSWER_MAX} characters"
+                )));
+            }
+            if typed.trim().is_empty() || typed.chars().any(char::is_control) {
+                return Err(SessionError::Invalid(
+                    "typed_answer must be text without control characters, not blank".to_owned(),
+                ));
+            }
+        }
+        // What was typed goes with how it compared (design §6.8): `exact` and
+        // `none` judge a typed answer; "I don't know" and "I'll just rate
+        // myself" have none.
+        let typed = self.typed_answer.is_some();
+        match self.answer_match {
+            Some(AnswerMatch::Exact | AnswerMatch::None) if !typed => {
+                return Err(SessionError::Invalid(
+                    "answer_match \"exact\" and \"none\" need the typed_answer".to_owned(),
+                ));
+            }
+            Some(AnswerMatch::Skipped | AnswerMatch::DontKnow) if typed => {
+                return Err(SessionError::Invalid(
+                    "answer_match \"skipped\" and \"dont_know\" come without a typed_answer"
+                        .to_owned(),
+                ));
+            }
+            None if typed => {
+                return Err(SessionError::Invalid(
+                    "typed_answer needs answer_match".to_owned(),
+                ));
+            }
+            _ => {}
         }
         if let Some(ts) = &self.client_ts
             && ts.parse::<crate::clock::Timestamp>().is_err()
@@ -183,6 +211,28 @@ impl RateInput {
             ));
         }
         Ok(self.client_review_id.to_ascii_lowercase())
+    }
+
+    /// Check the answer details against the kind of card rated: only typed
+    /// cards (Produce, later Spelling) have a typed answer, a match, a hint
+    /// or a suggested grade, and a typed card always says how it was
+    /// answered (`answer_match`).
+    fn check_for(&self, kind: CardKind) -> Result<(), SessionError> {
+        let details = self.typed_answer.is_some()
+            || self.answer_match.is_some()
+            || self.hint_used
+            || self.suggested_grade.is_some();
+        match kind {
+            CardKind::Understand if details => Err(SessionError::Invalid(
+                "typed_answer, answer_match, hint_used and suggested_grade are only for typed \
+                 cards"
+                    .to_owned(),
+            )),
+            CardKind::Produce | CardKind::Spelling if self.answer_match.is_none() => Err(
+                SessionError::Invalid("a typed card needs answer_match".to_owned()),
+            ),
+            _ => Ok(()),
+        }
     }
 }
 

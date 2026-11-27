@@ -15,7 +15,7 @@ use serde::Serialize;
 use crate::catalog::{self, SourceId, SourceSummary};
 use crate::clock::StudyDay;
 use crate::scheduler::{self, CardState};
-use crate::session::{self, BlockKind, FinishedBlocks, NewAllowance, SessionId};
+use crate::session::{self, BlockKind, FinishedBlocks, NewAllowance, SessionId, TypedAllowance};
 use crate::settings;
 
 /// Days of the Today forecast.
@@ -47,7 +47,8 @@ pub struct ActiveBlock {
 pub struct TodayView {
     pub study_day: StudyDay,
     pub scope_source_id: Option<SourceId>,
-    /// Cards due today or earlier in the scope.
+    /// Cards due today or earlier in the scope: due reviews plus the
+    /// first-time Produce/Spelling cards today's cap still lets in.
     pub due_now: u32,
     /// Of those, cards rated 4/5 earlier (repeated first).
     pub relearning: u32,
@@ -64,6 +65,12 @@ pub struct TodayView {
     pub new_left_today: u32,
     /// Why new words are paused: `null` or `"backlog"` (design §6.6).
     pub new_paused_reason: Option<PauseReason>,
+    /// Today's cap on first-time Produce/Spelling cards (design §17 M8).
+    pub new_typed: TypedAllowance,
+    /// Produce/Spelling cards in the scope that wait for their first
+    /// review and could come today (beyond the cap they wait for a later
+    /// day).
+    pub typed_waiting: u32,
     /// Cards an extra-practice block (R-63) would serve now in the scope
     /// (at most a block).
     pub extra_available: u32,
@@ -109,7 +116,7 @@ pub fn today(
     }
     // One implementation each: the session module decides which cards and
     // candidates a scope has (G9).
-    let scheduled = session::scheduled_in_scope(conn, scope)?;
+    let scheduled = session::reviews_in_scope(conn, scope)?;
     let due: Vec<&scheduler::Card> = scheduled.iter().filter(|c| c.is_due_on(day)).collect();
     let forecast: Vec<ForecastDay> = (1..=FORECAST_DAYS)
         .map(|offset| {
@@ -136,12 +143,14 @@ pub fn today(
         remaining: s.remaining,
     });
     let new_words = session::new_word_allowance(conn, day, &settings)?;
+    let new_typed = session::typed_allowance(conn, day, &settings, &new_words)?;
+    let typed_waiting = session::typed_waiting(conn, day, scope)?;
     let extra_available = session::extra_available(conn, day, scope, &settings)?;
     let due_tomorrow = forecast.first().map_or(0, |f| f.due);
     Ok(TodayView {
         study_day: day,
         scope_source_id: scope,
-        due_now: count(due.len()),
+        due_now: count(due.len()).saturating_add(typed_waiting.min(new_typed.quota)),
         relearning: count(
             due.iter()
                 .filter(|c| c.state == CardState::Relearning)
@@ -152,6 +161,8 @@ pub fn today(
         new_waiting: new_available,
         new_left_today: new_words.quota,
         new_paused_reason: new_words.paused.then_some(PauseReason::Backlog),
+        new_typed,
+        typed_waiting,
         extra_available,
         due_tomorrow,
         new_words,

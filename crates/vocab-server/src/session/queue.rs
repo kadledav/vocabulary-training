@@ -115,6 +115,7 @@ pub fn rate(
         return Err(SessionError::NotNextItem);
     }
     let card = scheduler::card(tx, item.card_id)?.ok_or(SessionError::ItemNotFound)?;
+    input.check_for(card.kind)?;
     let word = catalog::word_traits(tx, card.word_id)?.ok_or(SessionError::ItemNotFound)?;
     let review = scheduler::record_review(
         tx,

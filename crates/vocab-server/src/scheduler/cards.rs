@@ -57,6 +57,13 @@ impl Card {
     pub fn is_due_on(&self, day: StudyDay) -> bool {
         self.due_day.is_some_and(|d| d <= day)
     }
+
+    /// An unlocked Produce/Spelling card that was never reviewed: it has a
+    /// due day (the earliest day it may come) but no memory state yet, so
+    /// its first review is new learning, not a review (design §6.4, §17 M8).
+    pub fn awaits_first_review(&self) -> bool {
+        self.kind != CardKind::Understand && self.state == CardState::New
+    }
 }
 
 const CARD_COLUMNS: &str = "id, word_id, kind, format, state, stability, difficulty, due_day, \
@@ -140,6 +147,16 @@ pub fn introduced_words_on(conn: &Connection, day: StudyDay) -> rusqlite::Result
             .into_iter()
             .map(|c| c.word_id)
             .collect(),
+    )
+}
+
+/// How many Produce/Spelling cards had their first review on `day` (the
+/// daily cap on first-time typed cards, design §17 M8).
+pub fn first_typed_reviews_on(conn: &Connection, day: StudyDay) -> rusqlite::Result<u32> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM card WHERE kind != 'understand' AND introduced_day = ?1",
+        [day],
+        |row| row.get(0),
     )
 }
 
