@@ -1554,6 +1554,7 @@ ul.chips {
 .chip {
   display: inline-flex;
   align-items: center;
+  gap: 0.25rem;
   max-width: 100%;
   padding-left: 0.75rem;
   border: 1px solid var(--border);

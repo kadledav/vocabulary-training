@@ -129,3 +129,60 @@ for (const theme of /** @type {const} */ (['dark', 'light'])) {
     });
   }
 }
+
+/** M7: the Words list and a word's screen, phone, both themes. */
+for (const theme of /** @type {const} */ (['dark', 'light'])) {
+  test(`M7 words screens, ${theme}`, async ({ page, app }, info) => {
+    test.skip(!dir || info.project.name !== 'webkit-phone', 'set SCREENSHOT_DIR; phone project only');
+    const shot = (/** @type {string} */ name, fullPage = false) =>
+      page.screenshot({ path: path.join(/** @type {string} */ (dir), `m7-${theme}-${name}.png`), fullPage });
+    await app.api('PATCH', '/api/settings', { theme });
+    const rows = await app.api('GET', '/api/words?q=glimmerous');
+    const id = rows[0].id;
+    // A suggestion from a later pack, and one review for the history.
+    await app.api('PATCH', `/api/words/${id}`, { meaning: 'Glowing on and off (my own words).' });
+    const { BOOK_PACK } = await import('./pack.js');
+    await app.api('POST', '/api/import/commit', {
+      text: JSON.stringify({ ...BOOK_PACK, pack_id: 'test-e2e-novel--2026-11-02--1' }),
+    });
+    const start = await app.api('POST', '/api/sessions', { kind: 'start' });
+    const item = start.session.items.find((/** @type {any} */ i) => i.word.headword === 'glimmerous');
+    await app.api('POST', `/api/sessions/${start.session.id}/reviews`, {
+      client_review_id: crypto.randomUUID(),
+      item_id: item.item_id,
+      raw_grade: 2,
+    });
+
+    await page.goto(`${app.url}/#/words`);
+    await expect(page.getByTestId('word-count')).toHaveText('5 words');
+    await shot('1-list');
+    await page.getByTestId('filters-summary').click();
+    await page.getByRole('radio', { name: 'Most useful' }).check();
+    await page.getByRole('radio', { name: 'New', exact: true }).check();
+    await expect(page.getByTestId('word-count')).toHaveText('4 words');
+    await shot('2-list-filters', true);
+    await page.goto(`${app.url}/#/words/${id}`);
+    await expect(page.getByTestId('conflicts')).toBeVisible();
+    await shot('3-word-top');
+    await shot('4-word-full', true);
+    await page.getByRole('button', { name: 'Edit meaning' }).click();
+    await shot('5-field-editor');
+    await page.getByRole('button', { name: 'Cancel' }).click();
+    await page.getByTestId('list-czech').scrollIntoViewIfNeeded();
+    await shot('6-lists');
+    const sentence = page.locator('ol.sentences li').first();
+    await sentence.getByRole('button', { name: 'Edit' }).click();
+    await sentence.scrollIntoViewIfNeeded();
+    await shot('7-sentence-editor');
+    await sentence.getByRole('button', { name: 'Cancel' }).click();
+    await page.getByTestId('reset-understand').click();
+    await page.getByTestId('card-understand').scrollIntoViewIfNeeded();
+    await shot('8-reset-confirm');
+    await page.getByTestId('delete-word').click();
+    await page.getByTestId('delete-word').or(page.getByTestId('delete-word-confirm')).scrollIntoViewIfNeeded();
+    await shot('9-delete-confirm');
+    await page.getByRole('button', { name: 'Raise usefulness' }).click();
+    await expect(page.getByTestId('toast')).toBeVisible();
+    await shot('10-toast-undo');
+  });
+}
