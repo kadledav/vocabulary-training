@@ -263,9 +263,12 @@ pub fn to_mp3(pcm: Pcm) -> Result<Clip, PostError> {
 fn normalize(samples: &mut [f32], rate: u32) -> Result<(), PostError> {
     let gain_db = (TARGET_LUFS - loudness(samples, rate)?).clamp(-MAX_GAIN_DB, MAX_GAIN_DB);
     scale(samples, db_to_linear(gain_db));
+    // The make-up restores what the limiter takes, up to the target, never
+    // beyond the loudness the clamped gain reached (a near-silent clip
+    // stays quiet).
+    let goal = loudness(samples, rate)?.min(TARGET_LUFS);
     let ceiling_db = PEAK_LIMIT_DBTP - ENCODER_HEADROOM_DB;
     let ceiling = db_to_linear(ceiling_db);
-    let mut total_db = gain_db;
     let mut margin_db = LIMITER_MARGIN_DB;
     // The limiter holds sample peaks; the true peak between samples can be
     // higher. If it is above the ceiling, the limiter aims lower by that
@@ -275,14 +278,11 @@ fn normalize(samples: &mut [f32], rate: u32) -> Result<(), PostError> {
         let limit = db_to_linear(ceiling_db - margin_db);
         limit_peaks(samples, rate, limit);
         for _ in 0..MAKEUP_PASSES {
-            let makeup_db = (TARGET_LUFS - loudness(samples, rate)?)
-                .clamp(0.0, MAX_MAKEUP_DB)
-                .min(MAX_GAIN_DB - total_db);
+            let makeup_db = (goal - loudness(samples, rate)?).clamp(0.0, MAX_MAKEUP_DB);
             if makeup_db < 0.1 {
                 break;
             }
             scale(samples, db_to_linear(makeup_db));
-            total_db += makeup_db;
             limit_peaks(samples, rate, limit);
         }
         let peak = true_peak(samples, rate)?;
@@ -682,6 +682,23 @@ mod tests {
             .collect();
         let samples = normalized(square);
         assert!(true_peak(&samples, OUTPUT_RATE).expect("test setup") <= before_encoding);
+    }
+
+    #[test]
+    fn r40_quiet_peaky_speech_reaches_the_target_too() {
+        // So quiet that the gain is near its clamp: the make-up that
+        // restores what the limiter took is not part of that clamp.
+        let mut quiet = peaky(OUTPUT_RATE);
+        let level = measured_loudness(&quiet);
+        scale(
+            &mut quiet,
+            db_to_linear(TARGET_LUFS - MAX_GAIN_DB + 1.0 - level),
+        );
+        let samples = normalized(quiet);
+        let lufs = measured_loudness(&samples);
+        assert!((lufs - TARGET_LUFS).abs() < 0.3, "{lufs} LUFS");
+        let peak = true_peak(&samples, OUTPUT_RATE).expect("test setup");
+        assert!(peak <= db_to_linear(PEAK_LIMIT_DBTP - ENCODER_HEADROOM_DB) + 1e-6);
     }
 
     /// An utterance as the engine makes it: `lead` ms of silence, a tone
