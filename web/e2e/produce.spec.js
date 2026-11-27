@@ -261,9 +261,10 @@ test('R-56 the typed answer survives a failed post, a retry and a reload', async
   await page.getByTestId('hint-button').click();
   await page.reload();
   await freezeClock(page);
-  await advanceClock(page, 300);
   await expect(input(page)).toHaveValue('glimm');
   await expect(page.getByTestId('hint')).toBeVisible();
+  // The guard's timer starts when the side is drawn: open it only then.
+  await advanceClock(page, 300);
   await input(page).fill('glimmerus');
   await page.getByTestId('check').click();
   await expect(page.getByTestId('typed')).toHaveText('glimmerus');
@@ -491,8 +492,9 @@ test('R-56 a reload after Check returns to the checked answer; Undo after a relo
   await input(page).fill('bront');
   await page.reload();
   await freezeClock(page);
-  await advanceClock(page, 300);
   await expect(input(page)).toHaveValue('bront');
+  // The guard's timer starts when the side is drawn: open it only then.
+  await advanceClock(page, 300);
   await page.getByTestId('undo').click();
   await expect(page.getByTestId('toast')).toContainText('Rating undone');
   await expect(page.getByTestId('cloze')).toBeVisible();

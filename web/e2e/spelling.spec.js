@@ -224,9 +224,10 @@ test('R-58 R-70 Spelling by keyboard: R replays, Enter checks and accepts; typin
   // A reload keeps what was typed …
   await page.reload();
   await freezeClock(page);
-  await advanceClock(page, 300);
   await expectQuestion(page, 'glimmerous');
   await expect(input(page)).toHaveValue('glimerous');
+  // The guard's timer starts when the side is drawn: open it only then.
+  await advanceClock(page, 300);
   await input(page).focus();
   await page.keyboard.press('Enter');
   await expect(page.getByTestId('check-result')).toHaveAttribute('data-match', 'none');
@@ -379,8 +380,9 @@ test('R-58 after a reload, Undo back to a Spelling question plays it or says to 
   // The reload forgets this visit's check: Undo returns to the question.
   await page.reload();
   await freezeClock(page);
-  await advanceClock(page, 300);
   await expect(page.getByTestId('listen-status')).toHaveText('Tap ▶ Listen to hear the word.');
+  // The guard's timer starts when the side is drawn: open it only then.
+  await advanceClock(page, 300);
   await page.locator('.practice-body').focus();
   await page.keyboard.press('u');
   await expect(page.getByTestId('toast')).toContainText('Rating undone');

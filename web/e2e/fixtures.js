@@ -320,6 +320,13 @@ export function installClock(page) {
  * `advanceClock`, however long Playwright, the server or the machine take.
  * Also works again after a reload.
  *
+ * After a reload (or anything that draws a card asynchronously), wait for
+ * the card to be drawn before `advanceClock`: a side drawn on the frozen
+ * clock starts its input guard then, and the guarded buttons (Check,
+ * Show answer, Next) stay disabled until page time passes again — a
+ * click on one would wait for the test's timeout. Advancing first lets
+ * the time pass before the guard has even started.
+ *
  * @param {import('@playwright/test').Page} page
  */
 export async function freezeClock(page) {
