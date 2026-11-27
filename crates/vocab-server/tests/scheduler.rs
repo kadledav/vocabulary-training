@@ -401,8 +401,17 @@ async fn r55_acknowledged_leech_is_flagged_again_after_four_more_lapses() {
     for _ in 0..4 {
         lapse(&env, id).await;
     }
-    // The leech actions are M9; acknowledgement is seeded as they will store it.
-    env.exec("UPDATE card SET leech = 'acknowledged', leech_lapses_at_ack = lapses");
+    // "Keep practising" on the leech screen acknowledges the flag.
+    let (status, _) = env
+        .post(
+            &format!("/api/words/{}/actions", id.get()),
+            &json!({ "action": "leech_keep" }),
+        )
+        .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let card = understand(&env, id).await;
+    assert_eq!(card.leech, LeechState::Acknowledged);
+    assert_eq!(card.leech_lapses_at_ack, 4);
     for _ in 0..3 {
         let outcome = lapse(&env, id).await;
         assert_eq!(outcome.card.leech, LeechState::Acknowledged);

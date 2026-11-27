@@ -36,12 +36,12 @@ function storedReviews(app) {
  *
  * @param {import('@playwright/test').Page} page
  * @param {import('./fixtures.js').App} app
- * @param {{ touch?: boolean }} [options]
+ * @param {{ touch?: boolean, waiting?: boolean }} [options] `waiting`: the Produce cards wait for their first review
  */
-async function startProduceBlock(page, app, { touch = false } = {}) {
+async function startProduceBlock(page, app, { touch = false, waiting = true } = {}) {
   await installClock(page);
   await page.goto(`${app.url}/#/`);
-  await expect(page.getByTestId('typed-waiting')).toBeVisible();
+  if (waiting) await expect(page.getByTestId('typed-waiting')).toBeVisible();
   const start = page.getByTestId('start');
   if (touch) await start.tap();
   else await start.click();
@@ -339,6 +339,31 @@ test('R-70 the answer field and its buttons stay above the on-screen keyboard', 
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 });
 
+test('R-55 on a flagged Produce card the leech panel stays folded, so the checked answer stays in sight', async ({ page, app, pageErrors }, info) => {
+  test.skip(info.project.name !== 'webkit-phone', 'the on-screen keyboard is a phone matter');
+  void pageErrors;
+  await waitingProduce(app, ['glimmerous']);
+  const db = new DatabaseSync(app.dbPath);
+  db.prepare("UPDATE card SET state = 'review', stability = 2.0, difficulty = 6.0, reps = 6, lapses = 4, leech = 'flagged', format = 'cloze' WHERE kind = 'produce'").run();
+  db.close();
+  await startProduceBlock(page, app, { touch: true, waiting: false });
+  // The keyboard open: 375 × 420 is what is left.
+  await page.setViewportSize({ width: 375, height: 420 });
+  await input(page).tap();
+  await input(page).fill('glimmerous');
+  await press(page, true, page.getByTestId('check'));
+  await expect(page.getByTestId('check-result')).toHaveAttribute('data-match', 'exact');
+  await expect(page.getByTestId('check-result')).toBeInViewport();
+  const panel = page.getByTestId('leech-panel');
+  await expect(panel.getByTestId('leech-open')).toBeVisible();
+  await expect(panel.getByTestId('leech-suspend')).toBeHidden();
+  const box = await panel.boundingBox();
+  expect(box?.height ?? 999).toBeLessThan(80);
+  // One tap opens the choices.
+  await panel.getByTestId('leech-open').tap();
+  await expect(panel.getByTestId('leech-suspend')).toBeVisible();
+});
+
 test('R-52 Today counts the Produce cards waiting and the daily limit is a setting', async ({ page, app, pageErrors }) => {
   void pageErrors;
   await waitingProduce(app, ['glimmerous', 'brontle', 'quabble', 'snorkish']);
@@ -450,11 +475,13 @@ test('R-56 a reload after Check returns to the checked answer; Undo after a relo
   await expect(page.getByTestId('check-result')).toHaveAttribute('data-match', 'none');
   await page.reload();
   await freezeClock(page);
-  await advanceClock(page, 700);
   // The checked side, not an empty question to retype the answer.
   await expect(page.getByTestId('check-result')).toHaveAttribute('data-match', 'none');
   await expect(page.getByTestId('typed')).toHaveText('glimmerus');
   await expect(page.getByTestId('suggestion')).toContainText('Suggested: 4');
+  // Open the rating guard only once the side is drawn: on a slow load the
+  // side can appear after the clock was frozen and advanced.
+  await advanceClock(page, 700);
   await page.getByRole('button', { name: /^Rate 3,/ }).click();
   await expect(page.getByTestId('toast')).toContainText('Rated 3');
 

@@ -179,6 +179,21 @@ pub fn env_with_audio(
     now: &str,
     tts: Option<vocab_server::audio::TtsEndpoint>,
 ) -> Env {
+    env_with(dir, now, tts, &Limits::default())
+}
+
+/// A fresh app with other `limits`.
+pub fn env_with_limits(limits: &Limits) -> Env {
+    let dir = tempfile::tempdir().expect("tempdir");
+    env_with(dir, START, None, limits)
+}
+
+fn env_with(
+    dir: tempfile::TempDir,
+    now: &str,
+    tts: Option<vocab_server::audio::TtsEndpoint>,
+    limits: &Limits,
+) -> Env {
     let db = Db::open(dir.path()).expect("db");
     let clock = Arc::new(ManualClock::new(ts(now)));
     let (auth, code) = long_auth();
@@ -200,7 +215,7 @@ pub fn env_with_audio(
     if let Some(audio) = &audio {
         state = state.with_audio(audio.clone());
     }
-    let router = logged_in(http::app(state, &Limits::default()), code);
+    let router = logged_in(http::app(state, limits), code);
     Env {
         dir,
         db,

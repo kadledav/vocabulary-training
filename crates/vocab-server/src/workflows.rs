@@ -355,6 +355,24 @@ pub enum WordAction {
     Exclude,
     /// Forget one card's learning state (its history stays).
     ResetCard(CardKind),
+    /// What the owner chose for a problem word (design §6.5, R-55).
+    Leech(LeechAction),
+}
+
+/// The choices of the leech screen (design §6.5). Each also acknowledges
+/// the word's flagged cards: their lapses count again from now on, so four
+/// further lapses flag the word again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeechAction {
+    /// Keep practising as before.
+    Keep,
+    /// Goal `recognise` (owner override): the Produce card is suspended.
+    RecogniseOnly,
+    /// A lower usefulness (1 up to one below the current value): lower
+    /// desired retention, later new-word order.
+    LowerUsefulness(i64),
+    /// Suspend the word: none of its cards is practised.
+    Suspend,
 }
 
 /// Bring the word's cards in line with its (changed) traits.
@@ -402,8 +420,47 @@ pub fn word_action(
             // An item queued for the card's old state is not practised.
             session::withdraw_card(tx, card.id)?;
         }
+        WordAction::Leech(choice) => leech_action(tx, id, choice, &stamp)?,
     }
     refresh_cards(tx, id, now)
+}
+
+/// The owner's choice on a problem word's leech screen (design §6.5): the
+/// catalog change it asks for, then the acknowledgement of the word's
+/// flagged cards. The caller brings the cards in line afterwards (a goal
+/// switched to `recognise` suspends the Produce card).
+fn leech_action(
+    tx: &Transaction<'_>,
+    id: WordId,
+    choice: LeechAction,
+    stamp: &str,
+) -> Result<(), WorkflowError> {
+    let traits = catalog::word_traits(tx, id)?.ok_or(EditError::WordNotFound)?;
+    match choice {
+        LeechAction::Keep => {}
+        LeechAction::RecogniseOnly => {
+            catalog::update_word(tx, id, &serde_json::json!({ "goal": "recognise" }), stamp)?;
+        }
+        LeechAction::LowerUsefulness(value) => {
+            if traits.usefulness <= 1 {
+                return Err(EditError::Invalid(
+                    "The usefulness is already at its lowest (1).".to_owned(),
+                )
+                .into());
+            }
+            if !(1..traits.usefulness).contains(&value) {
+                return Err(EditError::Invalid(format!(
+                    "Choose a usefulness from 1 to {} (lower than now).",
+                    traits.usefulness - 1
+                ))
+                .into());
+            }
+            catalog::update_word(tx, id, &serde_json::json!({ "usefulness": value }), stamp)?;
+        }
+        LeechAction::Suspend => catalog::set_suspended(tx, id, true, stamp)?,
+    }
+    scheduler::acknowledge_leech(tx, id)?;
+    Ok(())
 }
 
 /// Add an item to a list field (`POST /api/words/{id}/items`).

@@ -2,12 +2,20 @@
 //! screen 1; R-54, R-59) and the Words screens ([`words`]). Uses only the
 //! read functions of `catalog`, `scheduler`, `session` and `settings`.
 
+mod progress;
 mod words;
 
-pub use words::{
-    CardView, WordDetail, WordListQuery, WordListRow, WordSort, WordStatus, word_detail, word_list,
-    word_status,
+pub use progress::{
+    ActivityView, ConflictEntry, FEW_TESTS, KindRetention, LeechCard, LeechEntry,
+    PROGRESS_FORECAST_DAYS, ProgressView, RetentionView, SourceProgress, StatusCounts, WINDOW_DAYS,
+    problem_word_count, progress,
 };
+pub use words::{
+    CardView, WordDetail, WordListQuery, WordListRow, WordSort, WordStatus, can_produce,
+    problem_word_ids, word_detail, word_list, word_status,
+};
+
+use std::collections::HashMap;
 
 use rusqlite::Connection;
 use serde::Serialize;
@@ -93,6 +101,9 @@ pub struct TodayView {
     pub finished_blocks: FinishedBlocks,
     /// All sources with their reading position (scope chooser).
     pub sources: Vec<SourceSummary>,
+    /// Problem words (R-55, all sources; suspended words left out): Today
+    /// links to their list on Progress, without nagging.
+    pub problem_words: u32,
 }
 
 /// Why new words are paused.
@@ -101,6 +112,26 @@ pub struct TodayView {
 pub enum PauseReason {
     /// More cards due than twice the normal daily load.
     Backlog,
+}
+
+/// Reviews due on each of the `days` study days after `day` among
+/// `scheduled` (one count per day: the cards whose due day it is).
+fn forecast(scheduled: &[crate::scheduler::Card], day: StudyDay, days: i32) -> Vec<ForecastDay> {
+    let mut due: HashMap<StudyDay, u32> = HashMap::new();
+    for card in scheduled {
+        if let Some(d) = card.due_day {
+            *due.entry(d).or_default() += 1;
+        }
+    }
+    (1..=days)
+        .map(|offset| {
+            let target = day.add_days(offset);
+            ForecastDay {
+                day: target,
+                due: due.get(&target).copied().unwrap_or(0),
+            }
+        })
+        .collect()
 }
 
 fn count(n: usize) -> u32 {
@@ -128,21 +159,7 @@ pub fn today(
     }
     // One implementation each: the session module decides which cards and
     // candidates a scope has (G9).
-    let scheduled = session::reviews_in_scope(conn, scope)?;
-    let forecast: Vec<ForecastDay> = (1..=FORECAST_DAYS)
-        .map(|offset| {
-            let target = day.add_days(offset);
-            ForecastDay {
-                day: target,
-                due: count(
-                    scheduled
-                        .iter()
-                        .filter(|c| c.due_day == Some(target))
-                        .count(),
-                ),
-            }
-        })
-        .collect();
+    let forecast = forecast(&session::reviews_in_scope(conn, scope)?, day, FORECAST_DAYS);
     let new_available = session::new_candidate_count(conn, scope)?;
     let settings = settings::get(conn)?;
     let active_session = session::current(conn, day)?.map(|s| ActiveBlock {
@@ -180,5 +197,57 @@ pub fn today(
         active_session,
         finished_blocks: session::finished_blocks(conn, day)?,
         sources: catalog::sources(conn)?,
+        problem_words: problem_word_count(conn)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::WordId;
+    use crate::scheduler::{Card, CardId, CardKind, CardState, LeechState};
+
+    fn due(id: i64, day: Option<&str>) -> Card {
+        Card {
+            id: CardId::new(id),
+            word_id: WordId::new(id),
+            kind: CardKind::Understand,
+            format: None,
+            state: CardState::Review,
+            stability: Some(3.0),
+            difficulty: Some(5.0),
+            due_day: day.map(|d| d.parse().expect("day")),
+            last_review_day: None,
+            last_review_at: None,
+            introduced_day: None,
+            reps: 1,
+            lapses: 0,
+            consecutive_fives: 0,
+            leech: LeechState::None,
+            leech_lapses_at_ack: 0,
+            suspended: false,
+            leech_acked_after: None,
+        }
+    }
+
+    #[test]
+    fn r72_forecast_counts_each_following_day_only() {
+        let cards = [
+            due(1, Some("2026-11-20")), // today: not in the forecast
+            due(2, Some("2026-11-21")),
+            due(3, Some("2026-11-21")),
+            due(4, Some("2026-11-27")),
+            due(5, Some("2026-11-28")), // day 8: beyond 7 days
+            due(6, None),
+        ];
+        let day: StudyDay = "2026-11-20".parse().expect("day");
+        let week = forecast(&cards, day, 7);
+        assert_eq!(week.len(), 7);
+        assert_eq!(week[0].day.to_string(), "2026-11-21");
+        assert_eq!(
+            week.iter().map(|f| f.due).collect::<Vec<_>>(),
+            [2, 0, 0, 0, 0, 0, 1]
+        );
+        assert_eq!(forecast(&cards, day, 14)[7].due, 1);
+    }
 }

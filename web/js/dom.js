@@ -44,6 +44,32 @@ export function h(tag, attrs = {}, ...children) {
   return el;
 }
 
+const SVG_NS = 'http://www.w3.org/2000/svg';
+
+/**
+ * Create an SVG element (charts): like `h`, but in the SVG namespace and
+ * without event handlers. Geometry and classes are plain attributes;
+ * colours come from the stylesheet (no inline styles, CSP).
+ *
+ * @param {string} tag
+ * @param {Record<string, string | number | boolean | null | undefined>} [attrs]
+ * @param {...(Node | string | number | null | undefined | false | (Node | string | number | null | undefined | false)[])} children
+ * @returns {SVGElement}
+ */
+export function svg(tag, attrs = {}, ...children) {
+  const el = /** @type {SVGElement} */ (document.createElementNS(SVG_NS, tag));
+  for (const [name, value] of Object.entries(attrs)) {
+    if (name.toLowerCase().startsWith('on')) throw new Error(`no event attributes on SVG: ${name}`);
+    if (value === true) el.setAttribute(name, '');
+    else if (value !== false && value !== null && value !== undefined) el.setAttribute(name, String(value));
+  }
+  for (const child of children.flat()) {
+    if (child === null || child === undefined || child === false) continue;
+    el.append(typeof child === 'object' ? child : document.createTextNode(String(child)));
+  }
+  return el;
+}
+
 /**
  * Replace all children of `parent` (empty slots — null, undefined, false —
  * are skipped).

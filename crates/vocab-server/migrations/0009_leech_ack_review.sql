@@ -1,0 +1,12 @@
+-- Migration 0009: which ratings a problem-word choice came after (M9,
+-- design §6.5, §6.7 step 9).
+--
+-- `card.leech_acked_after`: when a leech choice acknowledges a flagged
+-- card, the id of the card's latest review then (NULL: never acknowledged
+-- since this migration). A rating made before the choice (the one that
+-- flagged the card, typically) cannot be undone while the choice stands:
+-- restoring the card as it was before that rating would take back the
+-- acknowledgement but leave the choice (a suspended word, a goal) in
+-- place. The choice's own Undo restores the column with the rest of the
+-- card, after which the rating can be undone again.
+ALTER TABLE card ADD COLUMN leech_acked_after INTEGER;

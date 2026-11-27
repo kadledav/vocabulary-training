@@ -38,6 +38,10 @@ pub struct Card {
     pub leech: LeechState,
     pub leech_lapses_at_ack: u32,
     pub suspended: bool,
+    /// The card's latest review when a leech choice last acknowledged it
+    /// (ratings up to it cannot be undone while the choice stands).
+    #[serde(skip)]
+    pub leech_acked_after: Option<i64>,
 }
 
 impl Card {
@@ -68,7 +72,7 @@ impl Card {
 
 const CARD_COLUMNS: &str = "id, word_id, kind, format, state, stability, difficulty, due_day, \
      last_review_day, last_review_at, introduced_day, reps, lapses, consecutive_fives, leech, \
-     leech_lapses_at_ack, suspended";
+     leech_lapses_at_ack, suspended, leech_acked_after";
 
 fn card_row(row: &Row<'_>) -> rusqlite::Result<Card> {
     Ok(Card {
@@ -89,6 +93,7 @@ fn card_row(row: &Row<'_>) -> rusqlite::Result<Card> {
         leech: row.get(14)?,
         leech_lapses_at_ack: row.get(15)?,
         suspended: row.get(16)?,
+        leech_acked_after: row.get(17)?,
     })
 }
 
@@ -128,6 +133,11 @@ pub fn all_cards(conn: &Connection) -> rusqlite::Result<Vec<Card>> {
 /// cards), not suspended. Callers filter by word, scope and kind.
 pub fn scheduled_cards(conn: &Connection) -> rusqlite::Result<Vec<Card>> {
     cards_where(conn, "due_day IS NOT NULL AND suspended = 0", [])
+}
+
+/// Cards with a leech flag, flagged or acknowledged (design §6.5).
+pub fn leech_cards(conn: &Connection) -> rusqlite::Result<Vec<Card>> {
+    cards_where(conn, "leech != 'none'", [])
 }
 
 /// Understand cards that were never reviewed (new-word candidates).
@@ -417,6 +427,8 @@ pub struct Snapshot {
     leech: String,
     leech_lapses_at_ack: u32,
     suspended: bool,
+    #[serde(default)]
+    leech_acked_after: Option<i64>,
 }
 
 impl Snapshot {
@@ -436,6 +448,7 @@ impl Snapshot {
             leech: card.leech.as_str().to_owned(),
             leech_lapses_at_ack: card.leech_lapses_at_ack,
             suspended: card.suspended,
+            leech_acked_after: card.leech_acked_after,
         }
     }
 
@@ -461,8 +474,8 @@ impl Snapshot {
         tx.execute(
             "UPDATE card SET format = ?2, state = ?3, stability = ?4, difficulty = ?5, due_day = ?6, \
              last_review_day = ?7, last_review_at = ?8, introduced_day = ?9, reps = ?10, lapses = ?11, \
-             consecutive_fives = ?12, leech = ?13, leech_lapses_at_ack = ?14 \
-             WHERE id = ?1",
+             consecutive_fives = ?12, leech = ?13, leech_lapses_at_ack = ?14, \
+             leech_acked_after = ?15 WHERE id = ?1",
             params![
                 id.0,
                 self.format,
@@ -478,6 +491,7 @@ impl Snapshot {
                 self.consecutive_fives,
                 self.leech,
                 self.leech_lapses_at_ack,
+                self.leech_acked_after,
             ],
         )?;
         Ok(())

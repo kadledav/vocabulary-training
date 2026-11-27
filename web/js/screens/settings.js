@@ -8,7 +8,8 @@
  * change is saved at once; a number out of range is kept in the field with
  * a message saying the allowed range. Account: change the password (logs
  * out every other device), create the connector token (shown once), "Log
- * out" (this device) and "Log out everywhere" (every device).
+ * out" (this device) and "Log out everywhere" (every device). Export: the
+ * feedback for Claude (R-57) and everything as one file (R-86).
  */
 
 import { changePassword, connectorTokenStatus, createConnectorToken, logout, logoutEverywhere, newPasswordProblem } from '../auth.js';
@@ -275,6 +276,80 @@ function connectorTokenSection(isCurrent) {
 }
 
 /**
+ * The two exports (design §8.1): the feedback for Claude (R-57), shown to
+ * copy or downloaded, and everything as one file (R-86).
+ *
+ * @param {import('../router.js').IsCurrent} isCurrent
+ */
+function exportsSection(isCurrent) {
+  const shown = h('div', { class: 'feedback-export' });
+  const status = h('p', { class: 'status', role: 'status', 'data-testid': 'feedback-status' });
+  const show = h('button', { type: 'button', 'data-testid': 'show-feedback' }, 'Show the feedback to copy');
+  show.addEventListener('click', () => {
+    show.disabled = true;
+    status.textContent = 'Loading…';
+    void (async () => {
+      /** @type {import('../api.js').ApiResult<unknown>} */
+      const answer = await getJson('/api/export/feedback');
+      if (!isCurrent()) return;
+      show.disabled = false;
+      if (!answer.ok) {
+        status.textContent = answer.message;
+        return;
+      }
+      status.textContent = '';
+      const text = h('textarea', {
+        readonly: true,
+        rows: 10,
+        spellcheck: 'false',
+        'aria-label': 'Feedback for Claude',
+        'data-testid': 'feedback-text',
+      });
+      text.value = `${JSON.stringify(answer.data, null, 2)}\n`;
+      const copy = h('button', { type: 'button', class: 'primary', 'data-testid': 'copy-feedback' }, 'Copy');
+      copy.addEventListener('click', () => {
+        text.select();
+        void navigator.clipboard?.writeText(text.value).then(
+          () => {
+            copy.textContent = 'Copied';
+          },
+          () => {
+            copy.textContent = 'Select and copy it by hand';
+          },
+        );
+      });
+      mount(shown, text, h('div', { class: 'actions' }, copy));
+    })();
+  });
+  return h(
+    'section',
+    { class: 'settings exports', 'aria-labelledby': 'exports-title' },
+    h('h2', { id: 'exports-title' }, 'Export'),
+    h('h3', {}, 'Feedback for Claude'),
+    h(
+      'p',
+      { class: 'muted small' },
+      'Your problem words, the sentences you hid or corrected, the answers you added and the values you changed — vocabulary only. Paste it into your Claude project and ask for the next export: Claude then writes hints and better sentences for these words.',
+    ),
+    h(
+      'div',
+      { class: 'actions' },
+      show,
+      h('a', { class: 'button', href: '/api/export/feedback', download: '', 'data-testid': 'download-feedback' }, 'Download as a file'),
+    ),
+    status,
+    shown,
+    h('h3', {}, 'Everything'),
+    h(
+      'p',
+      { class: 'muted small' },
+      'All words and sources, your changes, every card and your whole practice history, as one JSON file (format “vocab-full-export”, version 1). Keep it as a copy or to move your data; the server’s regular backup is its own snapshot.',
+    ),
+    h('a', { class: 'button', href: '/api/export/full', download: '', 'data-testid': 'download-full' }, 'Download everything'),
+  );
+}
+
+/**
  * @param {HTMLElement} root
  * @param {import('../router.js').IsCurrent} isCurrent
  */
@@ -315,7 +390,7 @@ export function renderSettings(root, isCurrent) {
     passwordForm(isCurrent),
     connectorTokenSection(isCurrent),
   );
-  mount(root, h('h1', {}, 'Settings'), form, account, status);
+  mount(root, h('h1', {}, 'Settings'), form, exportsSection(isCurrent), account, status);
 
   /** @param {SettingsPatch} patch */
   const save = async (patch) => {

@@ -10,6 +10,7 @@ pub mod catalog;
 pub mod clock;
 pub mod config;
 pub mod db;
+pub mod exports;
 pub mod http;
 pub mod importer;
 mod keep_alive;

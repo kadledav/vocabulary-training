@@ -23,6 +23,9 @@
  * Question side → reveal → answer side → rate 1–5. Every rating is posted
  * at once (idempotent by its client UUID); a 4/5 keeps the answer on screen
  * with "More" open until Next. The toast, ↶ and `U` undo the last rating.
+ * A problem-word choice made here gets its own toast with Undo; ↶ and `U`
+ * undo it too while no rating came after it (design §6.5: the choice is
+ * undone before the rating that flagged the card).
  * When every item is rated, "See summary" finishes the block.
  *
  * Every phase change opens the 250 ms input guard again for the reveal and
@@ -51,6 +54,8 @@ import {
   spellingResult,
   typedHint,
 } from '../practice/card.js';
+import { leechPanel } from '../practice/leech-panel.js';
+import { undoLeechChoice } from '../leech.js';
 import {
   TYPED_MAX,
   answersFor,
@@ -121,7 +126,7 @@ const SHORTCUTS = [
   ['Enter', 'Produce, Spelling: check · accept the suggested grade'],
   ['H', 'Produce: hint (outside the answer field)'],
   ['1 – 5', 'rate (1 = best)'],
-  ['U', 'undo the last rating'],
+  ['U', 'undo the last rating (or problem-word choice)'],
   ['M', 'more: note, forms, sentences'],
   ['S / R', 'speak sentence / word (Spelling: R or ▶ replays the word)'],
   ['E', 'word detail'],
@@ -220,6 +225,16 @@ function wakeLock() {
 }
 
 /**
+ * A problem-word choice made in practice, with its Undo token and how many
+ * ratings came after it (↶ undoes the choice when none did).
+ *
+ * @typedef {{ wordId: number, itemId: number, token: string, ratingsSince: number }} ChoiceUndo
+ */
+
+/** How long the toast after a problem-word choice stays (with Undo). */
+const CHOICE_TOAST_MS = 8000;
+
+/**
  * @param {HTMLElement} root
  * @param {import('../router.js').IsCurrent} isCurrent
  * @returns {() => void} cleanup when the screen is left
@@ -232,7 +247,7 @@ export function renderPractice(root, isCurrent) {
    *           phaseKey: string | null, pending: PendingRating | null, unsure: (PendingRating & { why: string }) | null,
    *           settings: import('../settings.js').Settings, revealTap: { x: number, y: number, t: number } | null,
    *           chosen: Grade | null, typed: string, hintShown: boolean, check: Check | null,
-   *           accept: AcceptState | null, typedNote: string, listen: ListenState }} */
+   *           accept: AcceptState | null, typedNote: string, listen: ListenState, choiceUndo: ChoiceUndo | null }} */
   const state = {
     session: null,
     item: null,
@@ -260,10 +275,19 @@ export function renderPractice(root, isCurrent) {
     typedNote: '',
     // Spelling: where the question's sound stands.
     listen: 'waiting',
+    // The problem-word choice made in this visit that can still be undone.
+    choiceUndo: null,
   };
   /** Check results of this visit by item (undo returns to the checked answer). */
   /** @type {Map<number, Check>} */
   const checks = new Map();
+  /**
+   * Leech screens answered in this visit, by item (design §6.5): the panel
+   * then shows only the confirmation.
+   *
+   * @type {Map<number, import('../practice/leech-panel.js').LeechDone>}
+   */
+  const leechDone = new Map();
   /** Items whose typed answer was added to the accepted answers. */
   /** @type {Set<number>} */
   const acceptedItems = new Set();
@@ -714,9 +738,9 @@ export function renderPractice(root, isCurrent) {
         {
           type: 'button',
           class: 'icon-button',
-          'aria-label': 'Undo last rating (U)',
-          title: 'Undo last rating (U)',
-          disabled: !session.can_undo,
+          'aria-label': choiceFirst() ? 'Undo the problem-word choice (U)' : 'Undo last rating (U)',
+          title: choiceFirst() ? 'Undo the problem-word choice (U)' : 'Undo last rating (U)',
+          disabled: !session.can_undo && !choiceFirst(),
           'data-testid': 'undo',
           onclick: () => void undo(),
         },
@@ -776,6 +800,9 @@ export function renderPractice(root, isCurrent) {
     else if (check) lead = checkResult(item, check, { state: state.accept, onAccept: () => void acceptTyped() });
     mount(
       body,
+      state.phase === 'answer' && (item.card.leech_flagged || leechDone.has(item.item_id))
+        ? leechPanel(item, leechDone.get(item.item_id) ?? null, (done) => void afterLeechChoice(item, done), isCurrent)
+        : null,
       answerView(item, {
         audio,
         moreOpen: state.moreOpen,
@@ -1202,8 +1229,66 @@ export function renderPractice(root, isCurrent) {
     return true;
   };
 
+  /**
+   * A choice on the leech screen of `item` was saved: load the block again
+   * (a suspended word, or a Produce card of a word now recognise-only,
+   * leaves it) and stay on this answer side while the item is still to be
+   * rated; otherwise go on to the next card.
+   *
+   * @param {Item} item
+   * @param {import('../practice/leech-panel.js').LeechDone} done
+   */
+  const afterLeechChoice = async (item, done) => {
+    leechDone.set(item.item_id, done);
+    state.choiceUndo = done.undo ? { wordId: item.word.id, itemId: item.item_id, token: done.undo, ratingsSince: 0 } : null;
+    toast.show({ text: done.text, ms: CHOICE_TOAST_MS, onUndo: state.choiceUndo ? () => void undoChoice() : undefined });
+    if (!(await refresh())) return;
+    const still = state.session?.items.find((i) => i.item_id === item.item_id && i.answered === null) ?? null;
+    if (still && state.item?.item_id === item.item_id) {
+      state.item = still;
+      render();
+      announce(done.text);
+    } else if (!still) {
+      announce(done.text);
+      advance();
+    }
+  };
+
   const reload = async () => {
     if (await refresh()) advance();
+  };
+
+  /** Is the problem-word choice the latest thing to undo? */
+  const choiceFirst = () => state.choiceUndo !== null && state.choiceUndo.ratingsSince === 0;
+
+  /**
+   * Undo the problem-word choice made here: the word and its cards exactly
+   * as before; back on the answer side of its item (the leech panel with
+   * its choices again) when that is still to be rated.
+   */
+  const undoChoice = async () => {
+    const choice = state.choiceUndo;
+    if (state.busy || !choice) return;
+    setBusy(true);
+    const answer = await undoLeechChoice(choice.wordId, choice.token);
+    setBusy(false);
+    if (!isCurrent()) return;
+    state.choiceUndo = null;
+    if (!answer.ok) {
+      showError(`The choice could not be undone: ${answer.message}`);
+      render();
+      return;
+    }
+    clearError();
+    leechDone.delete(choice.itemId);
+    if (!(await refresh())) return;
+    const item = state.session?.items.find((i) => i.item_id === choice.itemId && i.answered === null) ?? null;
+    if (item) {
+      reopen(item);
+      state.shownAt = state.phaseAt;
+    }
+    toast.show({ text: 'Choice undone', ms: 2500 });
+    render({ focus: true, scroll: true });
   };
 
   /**
@@ -1292,6 +1377,7 @@ export function renderPractice(root, isCurrent) {
     state.unsure = null;
     state.chosen = null;
     state.session = answer.data.session;
+    if (state.choiceUndo) state.choiceUndo.ratingsSince += 1;
     const plan = toastPlan({ grade: pending.grade, msSinceReveal: sinceReveal, lastFailed: item.card.last_failed || item.card.is_repeat });
     toast.show({ text: toastText(pending.grade), grade: pending.grade, ms: plan.ms, pulse: plan.pulse, onUndo: () => void undo() });
     afterRated(item, pending.grade);
@@ -1374,6 +1460,10 @@ export function renderPractice(root, isCurrent) {
   };
 
   const undo = async () => {
+    if (choiceFirst()) {
+      await undoChoice();
+      return;
+    }
     const session = state.session;
     if (state.busy || !session || !session.can_undo) return;
     setBusy(true);
@@ -1386,6 +1476,10 @@ export function renderPractice(root, isCurrent) {
         await reload();
       } else if (answer.code === 'session_expired') {
         dayRolledOver();
+      } else if (answer.code === 'leech_choice_first') {
+        // A problem-word choice came after this rating (another window,
+        // or its Undo is gone): the server says what to do.
+        showError(answer.message);
       } else if (answer.status === 409 || answer.status === 404) {
         showError('The block changed (perhaps in another window), so it was loaded again.');
         await reload();
@@ -1397,6 +1491,7 @@ export function renderPractice(root, isCurrent) {
     clearError();
     state.pending = null;
     state.unsure = null;
+    if (state.choiceUndo && state.choiceUndo.ratingsSince > 0) state.choiceUndo.ratingsSince -= 1;
     state.session = answer.data.session;
     const item = state.session.items.find((i) => i.item_id === answer.data.item_id) ?? currentItem(state.session);
     state.item = item;

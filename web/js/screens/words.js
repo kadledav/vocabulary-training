@@ -278,6 +278,7 @@ export function renderWords(root, isCurrent) {
       return;
     }
     count.textContent = plural(answer.data.length, 'word');
+    leechHint.hidden = state.status !== 'leech';
     drawRows(answer.data);
     if (memory.openedWord && !restored) {
       restored = true;
@@ -289,6 +290,15 @@ export function renderWords(root, isCurrent) {
       }
     }
   };
+
+  // Problem words: why they are and what to do is on Progress (R-55).
+  const leechHint = h(
+    'p',
+    { class: 'muted small', 'data-testid': 'leech-hint', hidden: true },
+    'Why these words keep slipping, and what you can do: ',
+    h('a', { href: '#/progress' }, 'Progress → Problem words'),
+    '.',
+  );
 
   search.addEventListener('input', () => {
     state.q = search.value;
@@ -302,6 +312,7 @@ export function renderWords(root, isCurrent) {
     notice ? h('p', { class: 'notice-box', role: 'status', 'data-testid': 'notice' }, notice) : null,
     h('div', { class: 'filters' }, search, filters),
     count,
+    leechHint,
     list,
   );
   drawPanel();

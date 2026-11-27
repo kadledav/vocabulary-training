@@ -364,6 +364,12 @@ pub enum SessionError {
     /// detail): restoring the state before the rating would undo that too.
     #[error("the last rating cannot be undone: its card was reset since")]
     CardChangedSince,
+    /// A problem-word choice was made after the last rating (design §6.5):
+    /// its Undo comes first.
+    #[error(
+        "You chose what to do with this problem word after this rating. Undo that choice first, then the rating."
+    )]
+    LeechChoiceSince,
     #[error("{0}")]
     Invalid(String),
     #[error("random source failed: {0}")]
@@ -372,4 +378,20 @@ pub enum SessionError {
     Scheduler(#[from] SchedulerError),
     #[error("database: {0}")]
     Sqlite(#[from] rusqlite::Error),
+}
+
+/// The practice blocks for the full export (design §8.1): `reviews` name
+/// their block (`session_id`). The blocks' items are left out (what a
+/// block still holds is no history).
+pub fn export(
+    conn: &rusqlite::Connection,
+    sink: &mut dyn crate::db::TableSink,
+) -> Result<(), crate::db::TableError> {
+    crate::db::write_table(
+        conn,
+        sink,
+        "practice_sessions",
+        "SELECT id, study_day, scope_source_id, block_no, block_size, status, started_at, \
+         finished_at, kind FROM practice_session ORDER BY started_at, id",
+    )
 }

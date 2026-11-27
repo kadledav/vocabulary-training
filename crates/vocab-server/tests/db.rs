@@ -8,8 +8,6 @@ use rusqlite::Connection;
 use vocab_server::db::{Db, DbError};
 
 const DB_FILE: &str = "vocabulary.sqlite";
-/// The schema version of this build (the number of migrations).
-const LATEST: u32 = 8;
 const FIXTURE: &str = include_str!("fixtures/schema_v1_synthetic.sql");
 
 /// Every table of design §4.2.
@@ -75,7 +73,7 @@ fn r85_empty_database_migrates_to_v1_with_foreign_keys_and_integrity_ok() {
     let version: u32 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("user_version");
-    assert_eq!(version, LATEST);
+    assert_eq!(version, Db::schema_version());
 
     let mut stmt = conn
         .prepare("SELECT name, strict FROM pragma_table_list WHERE schema = 'main' AND name NOT LIKE 'sqlite_%' ORDER BY name")
@@ -266,7 +264,7 @@ fn r85_reopening_is_idempotent() {
     let version: u32 = inspect(&data)
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("user_version");
-    assert_eq!(version, LATEST);
+    assert_eq!(version, Db::schema_version());
 }
 
 #[test]
@@ -277,10 +275,7 @@ fn r85_newer_schema_is_refused() {
         .pragma_update(None, "user_version", 99)
         .expect("bump");
     match Db::open(&data) {
-        Err(DbError::SchemaTooNew {
-            found: 99,
-            known: LATEST,
-        }) => {}
+        Err(DbError::SchemaTooNew { found: 99, known }) if known == Db::schema_version() => {}
         other => panic!("expected SchemaTooNew, got {other:?}"),
     }
 }
@@ -351,7 +346,7 @@ fn r85_v1_database_with_data_migrates_to_v2() {
     let version: u32 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("user_version");
-    assert_eq!(version, LATEST);
+    assert_eq!(version, Db::schema_version());
     let (headword, spelling): (String, Option<i64>) = conn
         .query_row(
             "SELECT headword, spelling FROM word WHERE id = 1",
@@ -405,7 +400,7 @@ fn r85_v2_database_with_data_migrates_to_v3() {
     let version: u32 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("user_version");
-    assert_eq!(version, LATEST);
+    assert_eq!(version, Db::schema_version());
     let (items, with_format): (i64, i64) = conn
         .query_row(
             "SELECT count(*), count(format) FROM session_item",
@@ -465,7 +460,7 @@ fn r85_v4_database_with_data_migrates_to_v5() {
     let version: u32 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("user_version");
-    assert_eq!(version, LATEST);
+    assert_eq!(version, Db::schema_version());
     let defaulted: Vec<(String, bool)> = conn
         .prepare("SELECT slug, title_defaulted FROM source ORDER BY id")
         .expect("prepare")
@@ -875,7 +870,7 @@ fn r04_r58_released_v5_database_with_data_migrates_to_the_latest() {
     let version: u32 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("user_version");
-    assert_eq!(version, LATEST);
+    assert_eq!(version, Db::schema_version());
     assert_eq!(form_rows(&conn, "removed = 0"), forms_before);
     assert_eq!(table_counts(&conn), counts_before, "no row lost");
     let unmatched: i64 = conn

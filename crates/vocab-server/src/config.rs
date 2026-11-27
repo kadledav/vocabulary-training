@@ -134,6 +134,9 @@ pub struct Limits {
     /// Time an import commit may take before the server answers 503 (the
     /// commit itself may still finish; see `workflows`).
     pub import_commit_timeout_secs: u64,
+    /// A full export download that takes no data for this long (a stalled
+    /// client) is broken off and gives the one export turn back.
+    pub export_idle_ms: u64,
 }
 
 impl Default for Limits {
@@ -151,6 +154,7 @@ impl Default for Limits {
             max_connections_per_peer: 128,
             import_body_bytes: 5 * 1024 * 1024 / 2,
             import_commit_timeout_secs: 120,
+            export_idle_ms: 30_000,
         }
     }
 }
@@ -158,6 +162,10 @@ impl Default for Limits {
 impl Limits {
     pub fn request_timeout(&self) -> Duration {
         Duration::from_secs(self.request_timeout_secs)
+    }
+
+    pub fn export_idle(&self) -> Duration {
+        Duration::from_millis(self.export_idle_ms)
     }
 
     pub fn slot_wait(&self) -> Duration {

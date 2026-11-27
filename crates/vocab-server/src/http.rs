@@ -67,6 +67,7 @@ use crate::catalog::{self, EditError, ListKind, SourceId, WordId, WordQuery};
 use crate::clock::{Clock, DayRule, Moment, SystemClock};
 use crate::config::Limits;
 use crate::db::{Db, DbError};
+use crate::exports::{self, ExportError};
 use crate::importer::Via;
 use crate::keep_alive;
 use crate::rate_limit::RateLimit;
@@ -76,7 +77,7 @@ use crate::settings::{self, SettingsError, SettingsPatch};
 use crate::stats::{self, StatsError, WordListQuery};
 use crate::undo::UndoToken;
 use crate::web_assets;
-use crate::workflows::{self, WordAction, WorkflowError};
+use crate::workflows::{self, LeechAction, WordAction, WorkflowError};
 
 const HEALTHZ_PATH: &str = "/healthz";
 
@@ -158,6 +159,12 @@ pub struct AppState {
     body_read_timeout: Duration,
     /// Neural audio; `None` without `VOCAB_TTS_URL` (browser speech only).
     audio: Option<Audio>,
+    /// One full export at a time (it streams after its request slot is
+    /// given back, design §8.1).
+    export_turn: Arc<Semaphore>,
+    /// A full export download that takes no chunk for this long is broken
+    /// off (set by [`app`] from the limits).
+    export_idle: Duration,
 }
 
 impl AppState {
@@ -178,6 +185,8 @@ impl AppState {
             import_wait: limits.slot_wait(),
             body_read_timeout: limits.request_timeout(),
             audio: None,
+            export_turn: Arc::new(Semaphore::new(1)),
+            export_idle: limits.export_idle(),
         }
     }
 
@@ -428,6 +437,15 @@ fn endpoints() -> Vec<Endpoint> {
             hide_sentence,
         ),
         endpoint(Standard, Session, Get, "/api/today", today),
+        endpoint(Standard, Session, Get, "/api/progress", progress),
+        endpoint(
+            Standard,
+            Session,
+            Get,
+            "/api/export/feedback",
+            export_feedback,
+        ),
+        endpoint(Standard, Session, Get, "/api/export/full", export_full),
         endpoint(Standard, Session, Post, "/api/sessions", start_session),
         endpoint(
             Standard,
@@ -485,6 +503,7 @@ pub fn app(state: AppState, limits: &Limits) -> Router {
         import_body_bytes: limits.import_body_bytes,
         import_wait: limits.slot_wait(),
         body_read_timeout: limits.request_timeout(),
+        export_idle: limits.export_idle(),
         ..state
     };
     let standard = TimeoutPolicy {
@@ -1437,16 +1456,27 @@ async fn undo_word_change(
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ActionBody {
-    /// `suspend`, `unsuspend`, `include`, `exclude`, `reset_card`.
+    /// `suspend`, `unsuspend`, `include`, `exclude`, `reset_card`, and the
+    /// leech screen's `leech_keep`, `leech_recognise`, `leech_usefulness`,
+    /// `leech_suspend` (design §6.5).
     action: String,
     /// `reset_card` only: `understand`, `produce` or `spelling`.
     kind: Option<String>,
+    /// `leech_usefulness` only: the new, lower usefulness.
+    usefulness: Option<i64>,
 }
 
 impl ActionBody {
     fn action(&self) -> Option<WordAction> {
         let kind = self.kind.as_deref();
+        if let Some(value) = self.usefulness {
+            return (self.action == "leech_usefulness" && kind.is_none())
+                .then_some(WordAction::Leech(LeechAction::LowerUsefulness(value)));
+        }
         match (self.action.as_str(), kind) {
+            ("leech_keep", None) => Some(WordAction::Leech(LeechAction::Keep)),
+            ("leech_recognise", None) => Some(WordAction::Leech(LeechAction::RecogniseOnly)),
+            ("leech_suspend", None) => Some(WordAction::Leech(LeechAction::Suspend)),
             ("suspend", None) => Some(WordAction::Suspend),
             ("unsuspend", None) => Some(WordAction::Unsuspend),
             ("include", None) => Some(WordAction::Include),
@@ -1466,7 +1496,10 @@ async fn word_action(
     body: Result<Json<ActionBody>, JsonRejection>,
 ) -> Response {
     const SHAPE: &str = "The body must be {\"action\": \"suspend\"|\"unsuspend\"|\"include\"|\
-                         \"exclude\"|\"reset_card\", \"kind\"?: \"understand\"|\"produce\"|\"spelling\"}.";
+                         \"exclude\"|\"reset_card\"|\"leech_keep\"|\"leech_recognise\"|\
+                         \"leech_usefulness\"|\"leech_suspend\", \"kind\"?: \"understand\"|\
+                         \"produce\"|\"spelling\" (reset_card only), \"usefulness\"?: a number \
+                         (leech_usefulness only)}.";
     let Ok(Path(id)) = id else {
         return not_found().await;
     };
@@ -1738,6 +1771,8 @@ enum ApiError {
     Settings(#[from] SettingsError),
     #[error(transparent)]
     Stats(#[from] StatsError),
+    #[error(transparent)]
+    Export(#[from] ExportError),
 }
 
 impl From<rusqlite::Error> for ApiError {
@@ -1788,6 +1823,7 @@ fn api_error(err: &ApiError) -> Response {
             SessionError::ReviewUndone => conflict("review_undone"),
             SessionError::NothingToUndo => conflict("nothing_to_undo"),
             SessionError::CardChangedSince => conflict("card_changed"),
+            SessionError::LeechChoiceSince => conflict("leech_choice_first"),
             SessionError::Random(_) | SessionError::Scheduler(_) | SessionError::Sqlite(_) => {
                 internal_error(err)
             }
@@ -1800,7 +1836,9 @@ fn api_error(err: &ApiError) -> Response {
             "unknown_source",
             &err.to_string(),
         ),
-        ApiError::Db(_) | ApiError::Settings(_) | ApiError::Stats(_) => internal_error(err),
+        ApiError::Db(_) | ApiError::Settings(_) | ApiError::Stats(_) | ApiError::Export(_) => {
+            internal_error(err)
+        }
     }
 }
 
@@ -1832,6 +1870,148 @@ async fn today(
             .read(move |conn| Ok::<_, ApiError>(stats::today(conn, day, scope)?))
             .await,
     )
+}
+
+/// `GET /api/progress`: the Progress view (R-72, design §7.1 screen 9).
+async fn progress(State(state): State<AppState>) -> Response {
+    let day = state.moment().day;
+    respond(
+        state
+            .db
+            .read(move |conn| Ok::<_, ApiError>(stats::progress(conn, day)?))
+            .await,
+    )
+}
+
+/// Headers of an export download: a file to save (never shown inline,
+/// never cached: it holds the owner's data).
+fn download_headers(response: &mut Response, file_name: &str) {
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json; charset=utf-8"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    if let Ok(value) = HeaderValue::from_str(&format!("attachment; filename=\"{file_name}\"")) {
+        headers.insert(header::CONTENT_DISPOSITION, value);
+    }
+}
+
+/// `GET /api/export/feedback`: the feedback for Claude (R-57, design §8.1)
+/// as a JSON download (`vocab-feedback-<study day>.json`).
+async fn export_feedback(State(state): State<AppState>) -> Response {
+    let day = state.moment().day;
+    let result = state
+        .db
+        .read(move |conn| Ok::<_, ApiError>(exports::feedback(conn, day)?))
+        .await;
+    match result.and_then(|export| {
+        serde_json::to_vec_pretty(&export).map_err(|e| ApiError::Export(e.into()))
+    }) {
+        Ok(mut bytes) => {
+            bytes.push(b'\n');
+            let mut response = Body::from(bytes).into_response();
+            download_headers(&mut response, &format!("vocab-feedback-{day}.json"));
+            response
+        }
+        Err(err) => api_error(&err),
+    }
+}
+
+/// Bytes of the full export sent to the client at a time.
+const EXPORT_CHUNK_BYTES: usize = 64 * 1024;
+/// Chunks waiting for a slow client (memory per export: about this many
+/// chunks, whatever the export's size).
+const EXPORT_CHUNKS_QUEUED: usize = 4;
+
+/// Send the spooled export `file` to the body `sender` chunk by chunk
+/// (blocking: it runs on the blocking pool). A chunk the client does not
+/// take within `idle` (a stalled download) stops the download; a download
+/// that keeps moving is never cut off, however long it takes.
+fn send_spooled(
+    mut file: std::fs::File,
+    sender: &mut http_body_util::channel::Sender<axum::body::Bytes, std::io::Error>,
+    runtime: &tokio::runtime::Handle,
+    idle: Duration,
+) -> std::io::Result<()> {
+    let mut buffer = vec![0; EXPORT_CHUNK_BYTES];
+    loop {
+        let n = match std::io::Read::read(&mut file, &mut buffer) {
+            Ok(0) => return Ok(()),
+            Ok(n) => n,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        };
+        let chunk = axum::body::Bytes::copy_from_slice(&buffer[..n]);
+        match runtime.block_on(tokio::time::timeout(idle, sender.send_data(chunk))) {
+            Ok(Ok(())) => {}
+            // The client went away.
+            Ok(Err(_)) => return Err(std::io::ErrorKind::BrokenPipe.into()),
+            Err(_) => return Err(std::io::ErrorKind::TimedOut.into()),
+        }
+    }
+}
+
+/// `GET /api/export/full`: everything as one JSON download (R-86, design
+/// §8.1). A separate read-only connection writes one consistent snapshot
+/// to an anonymous file next to the database (`507 no_space` when that
+/// would leave too little free), the snapshot is given back at once, and
+/// the file is then streamed: a slow download holds neither the snapshot
+/// (WAL checkpoints go on) nor the shared connection. One export at a time
+/// (`503 busy` otherwise); a download that stalls for the idle timeout is
+/// broken off (never a complete-looking file) and gives the turn back.
+async fn export_full(State(state): State<AppState>) -> Response {
+    let Ok(turn) = Arc::clone(&state.export_turn).try_acquire_owned() else {
+        return busy(
+            "busy",
+            "An export is already running. Try again when it has finished.",
+        );
+    };
+    let now = state.moment();
+    let db = state.db.clone();
+    let spooled = state
+        .db
+        .read_detached(move |conn| {
+            let (file, free) = db.scratch_file().map_err(ExportError::from)?;
+            exports::spool_full(conn, file, free, &now).map_err(ApiError::from)
+        })
+        .await;
+    let spooled = match spooled {
+        Ok(spooled) => spooled,
+        Err(ApiError::Export(ExportError::NoSpace)) => {
+            return error_response(
+                StatusCode::INSUFFICIENT_STORAGE,
+                "no_space",
+                "The server has too little free disk space to prepare the export.",
+            );
+        }
+        Err(err) => return api_error(&err),
+    };
+    let (mut sender, body) =
+        http_body_util::channel::Channel::<axum::body::Bytes, std::io::Error>::new(
+            EXPORT_CHUNKS_QUEUED,
+        );
+    let runtime = tokio::runtime::Handle::current();
+    let idle = state.export_idle;
+    tokio::task::spawn_blocking(move || {
+        let _turn = turn;
+        match send_spooled(spooled.file, &mut sender, &runtime, idle) {
+            // Dropping the sender ends the body normally.
+            Ok(()) => drop(sender),
+            Err(err) => {
+                tracing::warn!(error = %err, "full export download stopped");
+                // The client sees a broken download, never a complete-looking
+                // file.
+                sender.abort(err);
+            }
+        }
+    });
+    let mut response = Body::new(body).into_response();
+    if let Ok(len) = HeaderValue::from_str(&spooled.len.to_string()) {
+        response.headers_mut().insert(header::CONTENT_LENGTH, len);
+    }
+    download_headers(&mut response, &format!("vocab-export-{}.json", now.day));
+    response
 }
 
 /// Body of `POST /api/sessions`.

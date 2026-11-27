@@ -49,7 +49,7 @@ import { getJson, postJson } from './api.js';
  *             sources: SourceSummary[], new_waiting?: number, new_left_today?: number,
  *             new_paused_reason?: 'backlog' | null, extra_available?: number, due_tomorrow?: number,
  *             new_typed?: TypedAllowance, typed_waiting?: number, typed_today?: number, spelling_practice?: boolean,
- *             next_block?: { due: number, new: number } }} Today
+ *             next_block?: { due: number, new: number }, problem_words?: number }} Today
  * @typedef {'start' | 'continue' | 'extra' | 'more_new'} StartKind
  * @typedef {import('./api.js').ApiResult<any>} AnyResult
  */

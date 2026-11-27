@@ -598,6 +598,21 @@ pub struct ImportLogRow {
     pub summary: Value,
 }
 
+/// The import log for the full export (design §8.1): which packs were
+/// imported when (word links name them), without the stored reports.
+pub fn export(
+    conn: &Connection,
+    sink: &mut dyn crate::db::TableSink,
+) -> Result<(), crate::db::TableError> {
+    crate::db::write_table(
+        conn,
+        sink,
+        "pack_imports",
+        "SELECT id, pack_id, content_sha256, format_version, source_slug, exported_at, \
+         part_index, part_total, via, imported_at FROM pack_import ORDER BY id",
+    )
+}
+
 /// The most recent imports, newest first.
 pub fn recent(conn: &Connection, limit: u32) -> rusqlite::Result<Vec<ImportLogRow>> {
     let mut stmt = conn.prepare(
