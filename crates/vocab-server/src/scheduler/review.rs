@@ -424,8 +424,8 @@ pub fn card_as_rated(conn: &Connection, id: ReviewId) -> rusqlite::Result<bool> 
     )
 }
 
-/// Undo one review (design §6.7.9): the card is restored from the
-/// snapshot, the review is marked `undone` (kept for audit), the cards it
+/// Undo one review (design §6.7.9): the card's scheduling state is
+/// restored from the snapshot (its suspension stays as it is now), the review is marked `undone` (kept for audit), the cards it
 /// unlocked are deleted if still unreviewed, and so is any other unreviewed
 /// Produce/Spelling card of the word whose unlock condition no longer holds
 /// (G1). `word` are the traits of the card's word.
@@ -448,7 +448,7 @@ pub fn undo_review(
     let card_id = CardId::new(card_id);
     let snapshot: Snapshot = serde_json::from_str(&before)
         .map_err(|e| SchedulerError::Corrupt(format!("snapshot of review {}: {e}", id.0)))?;
-    snapshot.restore(tx, card_id)?;
+    snapshot.restore_scheduling(tx, card_id)?;
     // The snapshot may predate sentences that upgraded the card's format.
     cards::upgrade_format(tx, word)?;
     tx.execute("UPDATE review_log SET undone = 1 WHERE id = ?1", [id.0])?;

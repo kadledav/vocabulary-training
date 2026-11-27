@@ -692,3 +692,38 @@ async fn r52_a_word_learnt_to_stability_seven_comes_back_as_produce() {
     let t = today(&env).await;
     assert_eq!(t["new_typed"]["introduced_today"], 1, "{day}");
 }
+
+#[tokio::test]
+async fn r52_undoing_a_rating_keeps_a_suspension_made_since() {
+    let env = env();
+    env.import("test-novel", words("tg", 1)).await;
+    waiting_produce(&env, "2026-12-30", "2026-11-20");
+    let block = start_block(&env).await;
+    assert_eq!(kinds(&block), vec!["produce"]);
+    let after = rate_next(&env, &block, 2).await;
+    let id = env.word_id("tg01").await.get();
+    let (status, body) = env
+        .request(
+            "PATCH",
+            &format!("/api/words/{id}"),
+            Some(&json!({ "goal": "recognise" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let suspended = "SELECT suspended FROM card WHERE kind = 'produce'";
+    assert_eq!(env.int(suspended), 1, "recognise only suspends Produce");
+    let (status, body) = env
+        .post(&format!("/api/sessions/{}/undo", sid(&after)), &json!({}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        env.int("SELECT reps FROM card WHERE kind = 'produce'"),
+        0,
+        "the rating is undone"
+    );
+    assert_eq!(
+        env.int(suspended),
+        1,
+        "the Undo of a rating leaves suspension alone"
+    );
+}
