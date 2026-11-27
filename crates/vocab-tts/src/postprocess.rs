@@ -26,9 +26,9 @@ const MAX_GAIN_DB: f64 = 20.0;
 /// True-peak ceiling of the MP3, dBTP.
 const PEAK_LIMIT_DBTP: f64 = -1.5;
 /// Headroom kept below the ceiling before encoding: MP3 encoding changes
-/// the waveform and raises peaks (measured on decoded clips: up to +0.7 dB
-/// with no headroom; see docs/design/tts-spike.md).
-const ENCODER_HEADROOM_DB: f64 = 1.0;
+/// the waveform and raises the true peak (measured on decoded clips: by up
+/// to 0.9 dB; docs/design/tts-spike.md, "Small memory").
+const ENCODER_HEADROOM_DB: f64 = 1.5;
 /// Leading and trailing samples below this level are cut.
 const SILENCE_DBFS: f64 = -50.0;
 /// Silence added before and after (mobile browsers clip the first
@@ -46,6 +46,9 @@ const LIMITER_RELEASE_MS: f64 = 80.0;
 /// by at most this much more gain per pass (never beyond `MAX_GAIN_DB`).
 const MAX_MAKEUP_DB: f64 = 6.0;
 const MAKEUP_PASSES: usize = 8;
+/// Rounds of the limiter with a lower aim when the true peak is still above
+/// the ceiling (see `normalize`).
+const TRUE_PEAK_ROUNDS: usize = 4;
 /// Half-width of the resampling filter in input samples (at cutoff 1).
 const RESAMPLE_TAPS: f64 = 16.0;
 /// A tight join ([`Seam::Words`]): what counts as silence at a chunk's end
@@ -261,22 +264,34 @@ fn normalize(samples: &mut [f32], rate: u32) -> Result<(), PostError> {
     let gain_db = (TARGET_LUFS - loudness(samples, rate)?).clamp(-MAX_GAIN_DB, MAX_GAIN_DB);
     scale(samples, db_to_linear(gain_db));
     let ceiling_db = PEAK_LIMIT_DBTP - ENCODER_HEADROOM_DB;
-    let limit = db_to_linear(ceiling_db - LIMITER_MARGIN_DB);
-    limit_peaks(samples, rate, limit);
+    let ceiling = db_to_linear(ceiling_db);
     let mut total_db = gain_db;
-    for _ in 0..MAKEUP_PASSES {
-        let makeup_db = (TARGET_LUFS - loudness(samples, rate)?)
-            .clamp(0.0, MAX_MAKEUP_DB)
-            .min(MAX_GAIN_DB - total_db);
-        if makeup_db < 0.1 {
-            break;
-        }
-        scale(samples, db_to_linear(makeup_db));
-        total_db += makeup_db;
+    let mut margin_db = LIMITER_MARGIN_DB;
+    // The limiter holds sample peaks; the true peak between samples can be
+    // higher. If it is above the ceiling, the limiter aims lower by that
+    // much and runs again (a few times), which costs far less loudness
+    // than scaling the whole clip down.
+    for _ in 0..TRUE_PEAK_ROUNDS {
+        let limit = db_to_linear(ceiling_db - margin_db);
         limit_peaks(samples, rate, limit);
+        for _ in 0..MAKEUP_PASSES {
+            let makeup_db = (TARGET_LUFS - loudness(samples, rate)?)
+                .clamp(0.0, MAX_MAKEUP_DB)
+                .min(MAX_GAIN_DB - total_db);
+            if makeup_db < 0.1 {
+                break;
+            }
+            scale(samples, db_to_linear(makeup_db));
+            total_db += makeup_db;
+            limit_peaks(samples, rate, limit);
+        }
+        let peak = true_peak(samples, rate)?;
+        if peak <= ceiling {
+            return Ok(());
+        }
+        margin_db += 20.0 * (peak / ceiling).log10() + 0.1;
     }
     let peak = true_peak(samples, rate)?;
-    let ceiling = db_to_linear(ceiling_db);
     if peak > ceiling {
         scale(samples, ceiling / peak);
     }
