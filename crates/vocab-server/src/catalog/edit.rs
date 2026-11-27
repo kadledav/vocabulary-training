@@ -106,6 +106,19 @@ pub fn update_word(
     if !word_exists(tx, id)? {
         return Err(EditError::WordNotFound);
     }
+    // As the import: a spelling note is only stored with spelling practice.
+    let spelling_after = match edits.iter().find(|(name, _)| *name == "spelling") {
+        Some((_, value)) => value.clone(),
+        None => scalar::current(tx, id, "spelling")?,
+    };
+    let note_given = edits
+        .iter()
+        .any(|(name, value)| *name == "spelling_note" && !value.is_null());
+    if note_given && spelling_after != Value::Bool(true) {
+        return Err(EditError::Invalid(
+            "A spelling note needs spelling practice; turn spelling on first.".to_owned(),
+        ));
+    }
     let mut changed = Vec::new();
     for (name, value) in edits {
         if name == "headword" {

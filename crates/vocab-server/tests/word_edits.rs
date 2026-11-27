@@ -659,3 +659,43 @@ async fn r04_deleting_a_word_removes_it_with_its_cards_and_history() {
     env.import(BOOK, vec![lull()]).await;
     assert_ne!(id_of(&env, "lull").await, id);
 }
+
+#[tokio::test]
+async fn r04_single_line_fields_and_the_spelling_note_follow_the_import_rules() {
+    let env = env();
+    env.import(BOOK, vec![lull()]).await;
+    let id = id_of(&env, "lull").await;
+    for edit in [
+        json!({ "headword": "lull\nto sleep" }),
+        json!({ "grammar": "verb\nnoun" }),
+        json!({ "spelling_note": "Double l." }),
+        json!({ "spelling_note": "Double l.", "spelling": false }),
+    ] {
+        let (status, body) = patch(&env, id, edit.clone()).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{edit}: {body}");
+        assert_eq!(body["error"]["code"], "invalid");
+    }
+    for (kind, value) in [("czech", "uko\nlébat"), ("form", "lul\nled")] {
+        let (status, body) = env
+            .post(
+                &format!("/api/words/{id}/items"),
+                &json!({ "kind": kind, "value": value }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{kind}: {body}");
+    }
+    let view = detail(&env, id).await;
+    assert_eq!(view["headword"], "lull");
+    assert!(view["spelling_note"].is_null());
+    // With spelling practice the note is stored; turning spelling off later
+    // keeps it, as a pack would.
+    let view = patch_ok(
+        &env,
+        id,
+        json!({ "spelling": true, "spelling_note": "Double l." }),
+    )
+    .await;
+    assert_eq!(view["spelling_note"], "Double l.");
+    let view = patch_ok(&env, id, json!({ "spelling": false })).await;
+    assert_eq!(view["spelling_note"], "Double l.");
+}

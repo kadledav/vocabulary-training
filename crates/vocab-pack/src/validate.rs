@@ -875,6 +875,31 @@ pub const OWNER_WORD_FIELDS: [&str; 12] = [
     "icon",
 ];
 
+/// Owner fields that are one line in the app (a single-line input; the
+/// headword is also the word's identity): a line break is refused, as are
+/// tabs. A pack never carries one where the app shows a single line.
+const OWNER_SINGLE_LINE: [&str; 6] = [
+    "headword",
+    "grammar",
+    "pronunciation",
+    "speak",
+    "spelling_note",
+    "icon",
+];
+
+/// The error for a line break or tab in a single-line owner field.
+fn one_line(f: &mut Findings, pointer: &str, key: &str, text: &str) -> bool {
+    let ok = !text.contains(['\n', '\t']);
+    if !ok {
+        f.error(
+            pointer,
+            IssueCode::Invalid,
+            format!("{key} must be one line (no line breaks or tabs)."),
+        );
+    }
+    ok
+}
+
 /// Most characters of an optional text field the owner edits.
 fn owner_text_max(field: &str) -> usize {
     match field {
@@ -891,7 +916,11 @@ fn owner_text_max(field: &str) -> usize {
 /// [`OWNER_WORD_FIELDS`]; `null` (or a blank text) clears an optional field
 /// (`goal: null` = derive from usefulness). `headword`, `meaning`,
 /// `usefulness` and `spelling` cannot be cleared. Unknown fields are errors
-/// here: the app sends only what it knows.
+/// here: the app sends only what it knows. The single-line fields
+/// ([`OWNER_SINGLE_LINE`]) take no line break, and a `spelling_note` is
+/// refused together with `spelling: false` (the import never stores a note
+/// without spelling practice either; the caller checks the stored
+/// `spelling` when the edit does not set it).
 pub fn owner_word_edit(value: &Value) -> Result<Vec<(&'static str, Value)>, Vec<Issue>> {
     let mut f = Findings::default();
     let Some(obj) = value.as_object() else {
@@ -939,11 +968,27 @@ pub fn owner_word_edit(value: &Value) -> Result<Vec<(&'static str, Value)>, Vec<
                     .map_or(Value::Null, |t| Value::String(t.trim().to_owned())),
             ),
         };
+        let value = value.filter(|value| match value {
+            Value::String(text) if OWNER_SINGLE_LINE.contains(&field) => {
+                one_line(&mut f, &format!("/{field}"), field, text)
+            }
+            _ => true,
+        });
         if f.errors.len() == before
             && let Some(value) = value
         {
             out.push((field, value));
         }
+    }
+    let note_given = out
+        .iter()
+        .any(|(field, value)| *field == "spelling_note" && !value.is_null());
+    if note_given && obj.get("spelling") == Some(&Value::Bool(false)) {
+        f.error(
+            "/spelling_note",
+            IssueCode::Invalid,
+            "A spelling note needs spelling practice; turn spelling on, or leave the note empty.",
+        );
     }
     if f.errors.is_empty() {
         Ok(out)
@@ -953,20 +998,23 @@ pub fn owner_word_edit(value: &Value) -> Result<Vec<(&'static str, Value)>, Vec<
 }
 
 /// One owner text item of `czech`, `accepted` or `confusables`: 1–200
-/// characters with a visible character; returned trimmed and NFC-normalised.
+/// characters with a visible character, one line; returned trimmed and
+/// NFC-normalised.
 pub fn owner_list_item(text: &str) -> Result<String, Issue> {
     owner_item(text, ITEM_MAX)
 }
 
 /// One owner form (`forms[].form`): 1–100 characters with a visible
-/// character; returned trimmed and NFC-normalised.
+/// character, one line; returned trimmed and NFC-normalised.
 pub fn owner_form(text: &str) -> Result<String, Issue> {
     owner_item(text, FORM_MAX)
 }
 
 fn owner_item(text: &str, max: usize) -> Result<String, Issue> {
     let mut f = Findings::default();
-    let value = f.text(text.trim(), "/value", "value", 1, max);
+    let value = f
+        .text(text.trim(), "/value", "value", 1, max)
+        .filter(|value| one_line(&mut f, "/value", "value", value));
     match value {
         Some(value) if !is_blank(&value) => Ok(value),
         _ => Err(f.errors.into_iter().next().unwrap_or(Issue {
@@ -1473,11 +1521,40 @@ mod tests {
             (serde_json::json!({ "hint": "x".repeat(301) }), "/hint"),
             (serde_json::json!({ "note": "bell\u{7}" }), "/note"),
             (serde_json::json!({ "icon": 3 }), "/icon"),
+            (serde_json::json!({ "headword": "test\nlull" }), "/headword"),
+            (
+                serde_json::json!({ "headword": "test\r\nlull" }),
+                "/headword",
+            ),
+            (serde_json::json!({ "grammar": "verb\tnoun" }), "/grammar"),
+            (
+                serde_json::json!({ "pronunciation": "a\nb" }),
+                "/pronunciation",
+            ),
+            (serde_json::json!({ "speak": "a\rb" }), "/speak"),
+            (serde_json::json!({ "icon": "x\ny" }), "/icon"),
+            (
+                serde_json::json!({ "spelling_note": "a\nb", "spelling": true }),
+                "/spelling_note",
+            ),
+            (
+                serde_json::json!({ "spelling_note": "Double l.", "spelling": false }),
+                "/spelling_note",
+            ),
         ] {
             let errors = owner_word_edit(&edit).expect_err(&edit.to_string());
             assert_eq!(errors[0].pointer, pointer, "{edit}");
         }
         assert!(owner_word_edit(&serde_json::json!({ "note": "x".repeat(6000) })).is_ok());
+        // Several lines where the app shows several lines.
+        for field in ["meaning", "hint", "note"] {
+            assert!(owner_word_edit(&serde_json::json!({ field: "one\ntwo" })).is_ok());
+        }
+        // Clearing the note with spelling off is fine.
+        assert!(
+            owner_word_edit(&serde_json::json!({ "spelling_note": null, "spelling": false }))
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1489,6 +1566,8 @@ mod tests {
         assert!(owner_list_item(&"x".repeat(200)).is_ok());
         assert_eq!(owner_form("lulled"), Ok("lulled".to_owned()));
         assert!(owner_form(&"x".repeat(101)).is_err());
+        assert!(owner_list_item("uko\nlébat").is_err());
+        assert!(owner_form("lul\tled").is_err());
     }
 
     #[test]
