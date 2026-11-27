@@ -15,6 +15,7 @@
 //! transaction that is always rolled back (`workflows`).
 
 mod edit;
+mod identity;
 mod merge;
 mod practice;
 mod read;

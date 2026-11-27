@@ -57,9 +57,16 @@ export function clipsFor(wordId) {
   return pending;
 }
 
-/** Forget what is cached (the voice setting changed). */
-export function forgetClips() {
-  cache.clear();
+/**
+ * Forget what is cached: everything (the voice setting changed) or one word
+ * (its text was edited: its clips are made anew, and the old clip of a
+ * sentence must not be played for the new text).
+ *
+ * @param {number} [wordId]
+ */
+export function forgetClips(wordId) {
+  if (wordId === undefined) cache.clear();
+  else cache.delete(wordId);
 }
 
 /**

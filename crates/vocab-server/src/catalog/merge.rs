@@ -26,6 +26,7 @@ use serde_json::Value;
 use vocab_pack::keys::{item_key, span_key};
 use vocab_pack::types::{PackSentence, PackWord, TagKind};
 
+use super::identity::find_word;
 use super::{SourceId, WordId, scalar};
 
 /// Where an imported word comes from.
@@ -191,18 +192,6 @@ fn incoming_scalars(word: &PackWord) -> [(&'static str, Option<Value>); 11] {
         ("note", text(&word.note)),
         ("icon", text(&word.icon)),
     ]
-}
-
-/// The word a pack headword key belongs to: by its own key, or by a key
-/// it had before the owner changed its headword (`word_alias`, R-04).
-pub(super) fn find_word(conn: &Connection, key: &str) -> rusqlite::Result<Option<WordId>> {
-    conn.query_row(
-        "SELECT id FROM word WHERE headword_key = ?1 \
-         UNION ALL SELECT word_id FROM word_alias WHERE key = ?1 LIMIT 1",
-        [key],
-        |row| row.get(0).map(WordId),
-    )
-    .optional()
 }
 
 fn plan(conn: &Connection, source: SourceId, word: &PackWord) -> rusqlite::Result<Plan> {

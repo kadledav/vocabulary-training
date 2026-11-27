@@ -1,45 +1,109 @@
 // @ts-check
 /**
- * Minimal read-only word list and word view (M2: to inspect what an import
- * did; the full Words screens with editing arrive in M7). All pack text is
- * rendered as text (R-84).
+ * Words (design §7.1 screen 6, R-73): search by headword, Czech or
+ * meaning; sort (A–Z, most useful, newest, next due, status, source order);
+ * filters (source, usefulness range, status, pack suggestions, suspended,
+ * low priority) folded into one "Sort and filter" panel so the list starts
+ * high on a phone. Rows are drawn 100 at a time ("Show more"). Every row
+ * opens the word (`screens/word.js`). All pack text is rendered as text
+ * (R-84).
  */
 
 import { getJson } from '../api.js';
-import { h, mount } from '../dom.js';
-import { displayIcon } from '../icon.js';
-import { markedText } from '../marked.js';
+import { h, keepFocus, mount } from '../dom.js';
+import { takeNotice } from '../notice.js';
+import {
+  FLAGS,
+  SORTS,
+  STATUSES,
+  activeFilters,
+  emptyListState,
+  listParams,
+  plural,
+  statusLabel,
+} from '../words-model.js';
 
 /**
  * @typedef {{ id: number, headword: string, meaning: string, czech: string[], usefulness: number,
- *             low_priority: boolean, sentence_count: number, open_conflicts: number, seq: number | null }} WordRow
+ *             low_priority: boolean, included: boolean, suspended: boolean, sentence_count: number,
+ *             open_conflicts: number, seq: number | null, created_at: string, status: string,
+ *             next_due: string | null }} WordRow
  * @typedef {{ id: number, slug: string, type: string, title: string, reading_position: string | null,
  *             word_count: number }} Source
- * @typedef {import('../marked.js').TextParts} TextParts
- * @typedef {{ id: number, en: TextParts, cs: TextParts, origin: string, location: string | null,
- *             source_title: string | null, hidden: boolean }} Sentence
- * @typedef {{ id: number, field: string, current: unknown, incoming: unknown, created_at: string }} Conflict
- * @typedef {{ id: number, headword: string, grammar: string | null, pronunciation: string | null,
- *             speak: string | null, meaning: string, usefulness: number, goal: string | null,
- *             hint: string | null, spelling: boolean, spelling_note: string | null, note: string,
- *             icon: string | null, low_priority: boolean, suspended: boolean, czech: string[],
- *             accepted: string[], confusables: string[], forms: { form: string, common: boolean }[],
- *             sources: { source_id: number, title: string, seq: number, tag_kind: string | null, tag_text: string | null }[],
- *             sentences: Sentence[], conflicts: Conflict[] }} WordView
  */
 
-/**
- * The list's search text, source filter and scroll position, kept while
- * the app is open so Back from a word returns to the same place (bug 5).
- */
-const memory = { query: '', source: '', scrollY: 0, openedWord: false };
+/** Rows drawn at first and per "Show more". */
+const PAGE = 100;
 
 /**
- * @param {number} n
- * @param {string} one
+ * The list's filters, how many rows are shown and the scroll position,
+ * kept while the app is open so Back from a word returns to the same place
+ * (bug 5).
  */
-function plural(n, one) {
-  return `${n} ${n === 1 ? one : `${one}s`}`;
+const memory = { state: emptyListState(), shown: PAGE, scrollY: 0, openedWord: false, filtersOpen: false };
+
+/**
+ * A group of radio choices.
+ *
+ * @param {string} name
+ * @param {string} legend
+ * @param {readonly (readonly [string, string])[]} options
+ * @param {string} current
+ * @param {(value: string) => void} onChange
+ */
+function radios(name, legend, options, current, onChange) {
+  return h(
+    'fieldset',
+    { class: `choices ${name}` },
+    h('legend', {}, legend),
+    options.map(([value, label]) =>
+      h(
+        'label',
+        { class: 'choice-option' },
+        h('input', { type: 'radio', name, value, checked: value === current, onchange: () => onChange(value) }),
+        ' ',
+        label,
+      ),
+    ),
+  );
+}
+
+/** @param {WordRow} row */
+function rowView(row) {
+  const facts = [`usefulness ${row.usefulness}`, statusLabel(row.status)];
+  if (row.next_due) facts.push(`due ${row.next_due}`);
+  facts.push(plural(row.sentence_count, 'sentence'));
+  if (row.seq !== null) facts.push(`#${row.seq}`);
+  return h(
+    'li',
+    {},
+    // The whole row is the link: an easy tap target (bug 8).
+    h(
+      'a',
+      {
+        class: 'word-row',
+        href: `#/words/${row.id}`,
+        onclick: () => {
+          memory.openedWord = true;
+          memory.scrollY = window.scrollY;
+        },
+      },
+      h(
+        'span',
+        { class: 'word-row-head' },
+        h('span', { class: 'headword', lang: 'en' }, row.headword),
+        h('span', { class: 'muted', lang: 'cs' }, ` — ${row.czech.join(', ')}`),
+      ),
+      h(
+        'span',
+        { class: 'muted small' },
+        facts.join(' · '),
+        row.suspended ? h('span', { class: 'badge' }, 'suspended') : null,
+        row.low_priority ? h('span', { class: 'badge' }, row.included ? 'low priority, included' : 'low priority') : null,
+        row.open_conflicts > 0 ? h('span', { class: 'badge outcome-merged' }, 'pack suggestions') : null,
+      ),
+    ),
+  );
 }
 
 /**
@@ -47,93 +111,174 @@ function plural(n, one) {
  * @param {import('../router.js').IsCurrent} isCurrent
  */
 export function renderWords(root, isCurrent) {
+  const state = memory.state;
+  /** @type {Source[]} */
+  let sources = [];
+  let restored = false;
+  let generation = 0;
+  const notice = takeNotice();
+
   const search = h('input', {
     type: 'search',
     placeholder: 'Search headword, Czech or meaning',
     'aria-label': 'Search words',
     autocomplete: 'off',
     spellcheck: 'false',
-    value: memory.query,
+    maxlength: '200',
+    value: state.q,
   });
-  // Radio buttons rather than a <select>: WebKit's built-in select styles
-  // are refused by the CSP (style-src 'self'), and radios are easier to tap.
-  let source = memory.source;
-  let restored = false;
-  /**
-   * @param {string} value
-   * @param {string} label
-   */
-  const sourceOption = (value, label) =>
-    h(
-      'label',
-      { class: 'choice-option' },
-      h('input', {
-        type: 'radio',
-        name: 'word-source',
-        value,
-        checked: value === source,
-        onchange: () => {
-          source = value;
-          memory.source = value;
-          void load();
-        },
-      }),
-      ' ',
-      label,
-    );
-  const sourceChoice = h('fieldset', { class: 'word-sources' }, h('legend', {}, 'Source'), sourceOption('', 'All sources'));
-  const list = h('div', { class: 'word-list' }, h('p', { class: 'muted' }, 'Loading…'));
-  let generation = 0;
+  const summary = h('summary', { 'data-testid': 'filters-summary' });
+  const panel = h('div', { class: 'filter-panel' });
+  const filters = h('details', { class: 'word-filters', open: memory.filtersOpen }, summary, panel);
+  filters.addEventListener('toggle', () => {
+    memory.filtersOpen = filters.open;
+  });
+  const count = h('p', { class: 'muted', role: 'status', 'data-testid': 'word-count' }, 'Loading…');
+  const list = h('div', { class: 'word-list' });
 
-  const load = async () => {
-    const mine = ++generation;
-    const params = new URLSearchParams();
-    if (search.value.trim()) params.set('q', search.value.trim());
-    if (source) params.set('source', source);
-    const answer = /** @type {import('../api.js').ApiResult<WordRow[]>} */ (
-      await getJson(`/api/words?${params}`)
-    );
-    if (mine !== generation || !isCurrent()) return;
-    if (!answer.ok) {
-      mount(list, h('p', { class: 'error' }, answer.message));
-      return;
-    }
-    const rows = answer.data;
-    mount(
-      list,
-      h('p', { class: 'muted' }, plural(rows.length, 'word')),
-      h(
-        'ul',
-        { class: 'rows word-rows' },
-        rows.map((row) =>
-          h(
-            'li',
-            {},
-            // The whole row is the link: an easy tap target (bug 8).
+  const changed = () => {
+    memory.shown = PAGE;
+    drawPanel();
+    void load();
+  };
+
+  const usefulnessInput = (/** @type {'minU' | 'maxU'} */ key, /** @type {string} */ label) => {
+    const input = h('input', {
+      type: 'number',
+      min: '1',
+      max: '10',
+      step: '1',
+      inputmode: 'numeric',
+      'aria-label': label,
+      value: state[key],
+      class: 'small-number',
+    });
+    input.addEventListener('change', () => {
+      state[key] = input.value;
+      changed();
+    });
+    return input;
+  };
+
+  const drawPanel = () => {
+    const n = activeFilters(state);
+    summary.textContent = n > 0 ? `Sort and filter · ${plural(n, 'filter')} on` : 'Sort and filter';
+    const sorts = state.source ? [...SORTS, ['source', 'Source order']] : SORTS;
+    const currentSort = state.sort || (state.source ? 'source' : 'alpha');
+    keepFocus(panel, () =>
+      mount(
+        panel,
+        radios('word-sort', 'Sort', /** @type {[string, string][]} */ (sorts), currentSort, (value) => {
+          state.sort = value;
+          changed();
+        }),
+        radios(
+          'word-source',
+          'Source',
+          [['', 'All sources'], ...sources.map((s) => /** @type {[string, string]} */ ([
+            String(s.id),
+            `${s.title} (${s.word_count})${s.reading_position ? ` — ${s.reading_position}` : ''}`,
+          ]))],
+          state.source,
+          (value) => {
+            state.source = value;
+            if (state.sort === 'source' && !value) state.sort = '';
+            changed();
+          },
+        ),
+        radios('word-status', 'Status', [['', 'Any'], ...STATUSES], state.status, (value) => {
+          state.status = value;
+          changed();
+        }),
+        h(
+          'fieldset',
+          { class: 'choices usefulness-range' },
+          h('legend', {}, 'Usefulness'),
+          h('label', { class: 'range-part' }, 'from ', usefulnessInput('minU', 'Usefulness from')),
+          h('label', { class: 'range-part' }, 'to ', usefulnessInput('maxU', 'Usefulness to')),
+        ),
+        h(
+          'fieldset',
+          { class: 'choices word-flags' },
+          h('legend', {}, 'Only'),
+          FLAGS.map(([value, label]) =>
             h(
-              'a',
-              {
-                class: 'word-row',
-                href: `#/words/${row.id}`,
-                onclick: () => {
-                  memory.openedWord = true;
-                  memory.scrollY = window.scrollY;
+              'label',
+              { class: 'choice-option' },
+              h('input', {
+                type: 'checkbox',
+                name: 'word-flag',
+                value,
+                checked: state.flags.includes(value),
+                onchange: (/** @type {Event} */ event) => {
+                  const on = /** @type {HTMLInputElement} */ (event.target).checked;
+                  state.flags = on ? [...state.flags, value] : state.flags.filter((f) => f !== value);
+                  changed();
                 },
-              },
-              h('span', { class: 'word-row-head' }, h('span', { class: 'headword', lang: 'en' }, row.headword), h('span', { class: 'muted', lang: 'cs' }, ` — ${row.czech.join(', ')}`)),
-              h(
-                'span',
-                { class: 'muted small' },
-                `usefulness ${row.usefulness} · ${plural(row.sentence_count, 'sentence')}`,
-                row.seq !== null ? ` · #${row.seq}` : '',
-                row.low_priority ? h('span', { class: 'badge' }, 'low priority') : null,
-                row.open_conflicts > 0 ? h('span', { class: 'badge outcome-merged' }, 'conflicts') : null,
-              ),
+              }),
+              ' ',
+              label,
             ),
           ),
         ),
+        n > 0 || state.sort
+          ? h(
+              'button',
+              {
+                type: 'button',
+                class: 'link-button',
+                onclick: () => {
+                  const q = state.q;
+                  Object.assign(state, emptyListState(), { q });
+                  changed();
+                },
+              },
+              'Clear sort and filters',
+            )
+          : null,
       ),
     );
+  };
+
+  /** @param {WordRow[]} rows */
+  const drawRows = (rows) => {
+    const shown = rows.slice(0, memory.shown);
+    const rest = rows.length - shown.length;
+    mount(
+      list,
+      rows.length === 0 ? h('p', { class: 'muted' }, 'No word matches.') : null,
+      h('ul', { class: 'rows word-rows' }, shown.map(rowView)),
+      rest > 0
+        ? h(
+            'button',
+            {
+              type: 'button',
+              class: 'big',
+              'data-testid': 'show-more',
+              onclick: () => {
+                memory.shown += PAGE;
+                drawRows(rows);
+              },
+            },
+            `Show ${Math.min(PAGE, rest)} more (${rest} left)`,
+          )
+        : null,
+    );
+  };
+
+  const load = async () => {
+    const mine = ++generation;
+    const answer = /** @type {import('../api.js').ApiResult<WordRow[]>} */ (
+      await getJson(`/api/words?${listParams(state)}`)
+    );
+    if (mine !== generation || !isCurrent()) return;
+    if (!answer.ok) {
+      count.textContent = '';
+      mount(list, h('p', { class: 'error', role: 'alert' }, answer.message));
+      return;
+    }
+    count.textContent = plural(answer.data.length, 'word');
+    drawRows(answer.data);
     if (memory.openedWord && !restored) {
       restored = true;
       // The source choices above the list change its position: wait for them.
@@ -146,125 +291,27 @@ export function renderWords(root, isCurrent) {
   };
 
   search.addEventListener('input', () => {
-    memory.query = search.value;
+    state.q = search.value;
+    memory.shown = PAGE;
     void load();
   });
 
   mount(
     root,
     h('h1', {}, 'Words'),
-    h('div', { class: 'filters' }, search, sourceChoice),
+    notice ? h('p', { class: 'notice-box', role: 'status', 'data-testid': 'notice' }, notice) : null,
+    h('div', { class: 'filters' }, search, filters),
+    count,
     list,
   );
+  drawPanel();
 
   const sourcesLoaded = (async () => {
     const answer = /** @type {import('../api.js').ApiResult<Source[]>} */ (await getJson('/api/sources'));
     if (answer.ok && isCurrent()) {
-      for (const source of answer.data) {
-        const label =
-          `${source.title} (${source.word_count})` +
-          (source.reading_position ? ` — ${source.reading_position}` : '');
-        sourceChoice.append(sourceOption(String(source.id), label));
-      }
+      sources = answer.data;
+      drawPanel();
     }
   })();
   void load();
-}
-
-/**
- * @param {string} label
- * @param {string | number | null | undefined | false} value
- */
-function field(label, value) {
-  if (value === null || value === undefined || value === false || value === '') return null;
-  return h('div', { class: 'field' }, h('dt', {}, label), h('dd', {}, String(value)));
-}
-
-/** @param {unknown} value */
-function show(value) {
-  if (value === null || value === undefined) return '(empty)';
-  return typeof value === 'string' ? value : JSON.stringify(value);
-}
-
-/** @param {WordView} word */
-function wordView(word) {
-  const forms = word.forms.map((f) => (f.common ? f.form : `${f.form} (rare)`)).join(', ');
-  return h(
-    'article',
-    { class: 'word-view' },
-    h('p', {}, h('a', { class: 'back-link', href: '#/words' }, '← Words')),
-    h('h1', { lang: 'en' }, displayIcon(word.icon) ? `${displayIcon(word.icon)} ` : '', word.headword),
-    h('p', { class: 'meaning', lang: 'en' }, word.meaning),
-    h(
-      'dl',
-      { class: 'fields' },
-      field('Czech', word.czech.join(', ')),
-      field('Grammar', word.grammar),
-      field('Pronunciation', word.pronunciation),
-      field('Speak', word.speak),
-      field('Forms', forms),
-      field('Usefulness', word.usefulness),
-      field('Goal', word.goal ?? 'from usefulness'),
-      field('Accepted answers', word.accepted.join(', ')),
-      field('Confusables', word.confusables.join(', ')),
-      field('Hint', word.hint),
-      field('Spelling', word.spelling ? word.spelling_note ?? 'yes' : false),
-      field('Low priority', word.low_priority ? 'yes' : false),
-      field(
-        'Sources',
-        word.sources
-          .map((s) => `${s.title} #${s.seq}${s.tag_kind ? ` [${s.tag_kind}${s.tag_text ? `: ${s.tag_text}` : ''}]` : ''}`)
-          .join('; '),
-      ),
-    ),
-    word.note ? h('section', { class: 'note-text' }, h('h2', {}, 'Note'), h('p', { lang: 'en' }, word.note)) : null,
-    word.conflicts.length > 0
-      ? h(
-          'section',
-          { class: 'card' },
-          h('h2', {}, 'Suggestions from later packs (existing values kept)'),
-          h(
-            'ul',
-            {},
-            word.conflicts.map((c) =>
-              h('li', {}, h('code', {}, c.field), `: kept “${show(c.current)}”; suggested “${show(c.incoming)}”`),
-            ),
-          ),
-        )
-      : null,
-    h('h2', {}, `Sentences (${word.sentences.length})`),
-    h(
-      'ol',
-      { class: 'sentences' },
-      word.sentences.map((s) =>
-        h(
-          'li',
-          { class: s.hidden ? 'hidden-sentence' : '' },
-          h('p', {}, markedText(s.en, 'en')),
-          h('p', { class: 'muted' }, markedText(s.cs, 'cs')),
-          h(
-            'p',
-            { class: 'muted small' },
-            [s.origin, s.location, s.source_title, s.hidden ? 'hidden' : null].filter(Boolean).join(' · '),
-          ),
-        ),
-      ),
-    ),
-  );
-}
-
-/**
- * @param {HTMLElement} root
- * @param {string} id
- * @param {import('../router.js').IsCurrent} isCurrent
- */
-export async function renderWord(root, id, isCurrent) {
-  mount(root, h('p', { class: 'muted' }, 'Loading…'));
-  const answer = /** @type {import('../api.js').ApiResult<WordView>} */ (await getJson(`/api/words/${id}`));
-  if (!isCurrent()) return;
-  if (!answer.ok) {
-    mount(root, h('p', {}, h('a', { class: 'back-link', href: '#/words' }, '← Words')), h('p', { class: 'error' }, answer.message));
-    return;
-  }
-  mount(root, wordView(answer.data));
 }

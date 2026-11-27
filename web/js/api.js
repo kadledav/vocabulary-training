@@ -214,3 +214,19 @@ export function patchJson(url, body) {
     body: JSON.stringify(body),
   });
 }
+
+/**
+ * `DELETE` with an empty JSON body (the server's CSRF guard asks every
+ * state-changing request for a JSON content type, design §9.3).
+ *
+ * @template T
+ * @param {string} url
+ * @returns {Promise<ApiResult<T>>}
+ */
+export function deleteJson(url) {
+  return call(url, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: '{}',
+  });
+}

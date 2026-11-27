@@ -30,7 +30,7 @@ use vocab_pack::validate::{
     MAX_LIST_ITEMS, owner_form, owner_list_item, owner_sentence, owner_word_edit,
 };
 
-use super::merge::find_word;
+use super::identity::find_word;
 use super::{WordId, scalar};
 
 /// Why an owner change was not made. The messages are for the owner.
