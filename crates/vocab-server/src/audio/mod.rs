@@ -152,6 +152,11 @@ pub struct ClipRef {
     pub other_voice: bool,
     /// Some word of it is pronounced by a guess, not from a dictionary.
     pub approximate: bool,
+    /// Every word of it is spoken as a word: the TTS service said that it
+    /// read none letter by letter. False when it did, or when that is not
+    /// known (a clip made before v0.3.0). A clip that is not may say a
+    /// Spelling question's answer letter by letter (R-58).
+    pub whole_words: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -661,13 +666,18 @@ impl Audio {
                     .await
                     .map_err(|err| std::io::Error::other(err.to_string()))??;
                 let (duration, approximate) = (clip.duration_ms, clip.approximate);
+                let made = queue::Made {
+                    bytes: i64::try_from(bytes).unwrap_or(i64::MAX),
+                    duration_ms: duration,
+                    approximate,
+                    spelled: clip.spelled,
+                };
                 let hash = job.hash.clone();
-                let size = i64::try_from(bytes).unwrap_or(i64::MAX);
                 let replaced = self
                     .inner
                     .db
                     .write(move |tx| {
-                        queue::mark_ready(tx, &hash, size, duration, approximate, &now)?;
+                        queue::mark_ready(tx, &hash, made, &now)?;
                         queue::delete_replaced(tx, &hash).map_err(DbError::from)
                     })
                     .await?;
@@ -679,6 +689,7 @@ impl Audio {
                     bytes,
                     audio_ms = duration,
                     approximate,
+                    spelled = clip.spelled,
                     replaced = replaced.len(),
                     took_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                     "audio clip ready"
@@ -748,6 +759,7 @@ impl Audio {
                         ready: false,
                         other_voice: false,
                         approximate: false,
+                        whole_words: false,
                     };
                     let (Some(versions), Some(text)) = (versions.as_ref(), key::spoken(raw)) else {
                         return Ok(none);
@@ -759,6 +771,7 @@ impl Audio {
                             .map(|state| queue::Playable {
                                 hash,
                                 approximate: state.approximate,
+                                whole_words: state.whole_words,
                             });
                         // Else an older version's clip until this one is made.
                         let playable = match current {
@@ -771,6 +784,7 @@ impl Audio {
                                 ready: true,
                                 other_voice: other,
                                 approximate: playable.approximate,
+                                whole_words: playable.whole_words,
                             });
                         }
                     }

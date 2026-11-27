@@ -8,6 +8,8 @@ use rusqlite::Connection;
 use vocab_server::db::{Db, DbError};
 
 const DB_FILE: &str = "vocabulary.sqlite";
+/// The schema version of this build (the number of migrations).
+const LATEST: u32 = 8;
 const FIXTURE: &str = include_str!("fixtures/schema_v1_synthetic.sql");
 
 /// Every table of design §4.2.
@@ -73,7 +75,7 @@ fn r85_empty_database_migrates_to_v1_with_foreign_keys_and_integrity_ok() {
     let version: u32 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("user_version");
-    assert_eq!(version, 7);
+    assert_eq!(version, LATEST);
 
     let mut stmt = conn
         .prepare("SELECT name, strict FROM pragma_table_list WHERE schema = 'main' AND name NOT LIKE 'sqlite_%' ORDER BY name")
@@ -264,7 +266,7 @@ fn r85_reopening_is_idempotent() {
     let version: u32 = inspect(&data)
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("user_version");
-    assert_eq!(version, 7);
+    assert_eq!(version, LATEST);
 }
 
 #[test]
@@ -277,7 +279,7 @@ fn r85_newer_schema_is_refused() {
     match Db::open(&data) {
         Err(DbError::SchemaTooNew {
             found: 99,
-            known: 7,
+            known: LATEST,
         }) => {}
         other => panic!("expected SchemaTooNew, got {other:?}"),
     }
@@ -349,7 +351,7 @@ fn r85_v1_database_with_data_migrates_to_v2() {
     let version: u32 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("user_version");
-    assert_eq!(version, 7);
+    assert_eq!(version, LATEST);
     let (headword, spelling): (String, Option<i64>) = conn
         .query_row(
             "SELECT headword, spelling FROM word WHERE id = 1",
@@ -403,7 +405,7 @@ fn r85_v2_database_with_data_migrates_to_v3() {
     let version: u32 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("user_version");
-    assert_eq!(version, 7);
+    assert_eq!(version, LATEST);
     let (items, with_format): (i64, i64) = conn
         .query_row(
             "SELECT count(*), count(format) FROM session_item",
@@ -463,7 +465,7 @@ fn r85_v4_database_with_data_migrates_to_v5() {
     let version: u32 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("user_version");
-    assert_eq!(version, 7);
+    assert_eq!(version, LATEST);
     let defaulted: Vec<(String, bool)> = conn
         .prepare("SELECT slug, title_defaulted FROM source ORDER BY id")
         .expect("prepare")
@@ -845,15 +847,16 @@ fn form_rows(conn: &Connection, condition: &str) -> Vec<String> {
     .collect()
 }
 
-/// Migrations 0006 and 0007 (M6, M7; R-04, R-85) on a database of the
-/// released schema (version 5, v0.1.1) holding the synthetic fixture
+/// Migrations 0006–0008 (M6, M7, M10; R-04, R-58, R-85) on a database of
+/// the released schema (version 5, v0.1.1) holding the synthetic fixture
 /// (words, forms, sentences, cards, reviews, clips, suggestions): every
 /// word's key is its first pack spelling, every stored form is kept and not
-/// removed, the id floors start at the stored ids, the constraints hold.
+/// removed, the id floors start at the stored ids, no stored clip claims to
+/// spell nothing out (unknown), the constraints hold.
 /// (The version-5 database is built from the migrations' SQL; the Rust data
 /// step of 0005 only re-keys sentences and plays no part here.)
 #[test]
-fn r04_released_v5_database_with_data_migrates_to_v7() {
+fn r04_r58_released_v5_database_with_data_migrates_to_the_latest() {
     let (_root, data) = data_dir();
     let (forms_before, counts_before) = {
         let conn = v4_database(&data);
@@ -872,7 +875,7 @@ fn r04_released_v5_database_with_data_migrates_to_v7() {
     let version: u32 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("user_version");
-    assert_eq!(version, 7);
+    assert_eq!(version, LATEST);
     assert_eq!(form_rows(&conn, "removed = 0"), forms_before);
     assert_eq!(table_counts(&conn), counts_before, "no row lost");
     let unmatched: i64 = conn
@@ -892,6 +895,23 @@ fn r04_released_v5_database_with_data_migrates_to_v7() {
         .query_row("SELECT COUNT(*) FROM word", [], |r| r.get(0))
         .expect("count");
     assert_eq!(spellings, words);
+    let clips: i64 = conn
+        .query_row("SELECT COUNT(*) FROM audio_clip", [], |r| r.get(0))
+        .expect("count");
+    let unknown: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM audio_clip WHERE spelled IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .expect("count");
+    assert!(clips > 0, "the fixture has clips");
+    assert_eq!(unknown, clips, "whether an old clip spells is unknown");
+    assert!(
+        conn.execute("UPDATE audio_clip SET spelled = -1", [])
+            .is_err(),
+        "CHECK enforced"
+    );
     conn.pragma_update(None, "foreign_keys", "ON").expect("fk");
     assert!(
         conn.execute("UPDATE word_form SET removed = 2", [])

@@ -190,6 +190,7 @@ async fn r40_a_valid_request_returns_audio_with_the_documented_headers() {
     for name in [
         "x-duration-ms",
         "x-approximate",
+        "x-words-spelled",
         "x-voice",
         "x-frontend",
         "x-engine",

@@ -48,6 +48,9 @@ pub struct Job {
 pub struct Playable {
     pub hash: String,
     pub approximate: bool,
+    /// Every word was spoken as a word: the service said no word of it was
+    /// read letter by letter (false when some was, or it is not known).
+    pub whole_words: bool,
 }
 
 /// The stored state of one clip.
@@ -55,6 +58,9 @@ pub struct Playable {
 pub struct ClipState {
     pub ready: bool,
     pub approximate: bool,
+    /// Every word was spoken as a word: the service said no word of it was
+    /// read letter by letter (false when some was, or it is not known).
+    pub whole_words: bool,
 }
 
 /// Clip counts for Settings.
@@ -171,13 +177,14 @@ pub fn ready_by_text(
     text: &str,
 ) -> rusqlite::Result<Option<Playable>> {
     conn.query_row(
-        "SELECT hash, approximate FROM audio_clip WHERE voice = ?1 AND text = ?2 \
+        "SELECT hash, approximate, spelled IS 0 FROM audio_clip WHERE voice = ?1 AND text = ?2 \
          AND status = 'ready' ORDER BY updated_at DESC, hash LIMIT 1",
         params![voice, text],
         |row| {
             Ok(Playable {
                 hash: row.get(0)?,
                 approximate: row.get::<_, i64>(1)? > 0,
+                whole_words: row.get(2)?,
             })
         },
     )
@@ -226,18 +233,29 @@ pub fn next_due_at(conn: &Connection) -> rusqlite::Result<Option<String>> {
     )
 }
 
-pub fn mark_ready(
-    tx: &Transaction<'_>,
-    hash: &str,
-    bytes: i64,
-    duration_ms: i64,
-    approximate: i64,
-    now: &str,
-) -> rusqlite::Result<()> {
+/// What the service said about a finished clip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Made {
+    pub bytes: i64,
+    pub duration_ms: i64,
+    /// Words pronounced by a guess.
+    pub approximate: i64,
+    /// Words read letter by letter (`None`: the service did not say).
+    pub spelled: Option<i64>,
+}
+
+pub fn mark_ready(tx: &Transaction<'_>, hash: &str, made: Made, now: &str) -> rusqlite::Result<()> {
     tx.execute(
         "UPDATE audio_clip SET status = 'ready', bytes = ?2, duration_ms = ?3, approximate = ?4, \
-         last_error = NULL, next_attempt_at = NULL, updated_at = ?5 WHERE hash = ?1",
-        params![hash, bytes, duration_ms, approximate, now],
+         spelled = ?5, last_error = NULL, next_attempt_at = NULL, updated_at = ?6 WHERE hash = ?1",
+        params![
+            hash,
+            made.bytes,
+            made.duration_ms,
+            made.approximate,
+            made.spelled,
+            now
+        ],
     )?;
     Ok(())
 }
@@ -301,12 +319,13 @@ pub fn retry_failed(tx: &Transaction<'_>, now: &str) -> rusqlite::Result<usize> 
 
 pub fn clip_state(conn: &Connection, hash: &str) -> rusqlite::Result<Option<ClipState>> {
     conn.query_row(
-        "SELECT status, approximate FROM audio_clip WHERE hash = ?1",
+        "SELECT status, approximate, spelled IS 0 FROM audio_clip WHERE hash = ?1",
         [hash],
         |row| {
             Ok(ClipState {
                 ready: row.get::<_, String>(0)? == "ready",
                 approximate: row.get::<_, i64>(1)? > 0,
+                whole_words: row.get(2)?,
             })
         },
     )
