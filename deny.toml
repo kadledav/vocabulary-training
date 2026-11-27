@@ -13,7 +13,16 @@ all-features = true
 # Advisories are reported, but updates still respect the 14-day rule (R-90):
 # a fix only lands once its release is old enough.
 yanked = "deny"
-ignore = []
+ignore = [
+    # `url` 2.5.8: stack overflow in `Url::origin()` on nested `blob:` URLs.
+    # Here `url` comes only from `ureq`, a BUILD dependency of
+    # `sherpa-onnx-sys` (its build script's downloader): it is in no shipped
+    # binary, and no build downloads anything (SHERPA_ONNX_LIB_DIR points at
+    # the checksum-verified libraries), so the function never sees untrusted
+    # input. The fix, `url` 2.5.9, was published 2026-11-20 and may be used
+    # from 2026-12-05 (14-day rule, R-90): update then and remove this entry.
+    { id = "RUSTSEC-2026-0592", reason = "build-only dependency of sherpa-onnx-sys; fixed release is younger than 14 days until 2026-12-05" },
+]
 
 [licenses]
 allow = [
