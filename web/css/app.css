@@ -1954,21 +1954,21 @@ button.listen-big.needs-tap {
   text-decoration-thickness: 2px;
 }
 
+/* The letters the word needs where the answer went wrong: bold and
+   underlined in the text colour (green would say "right"); every mark is
+   an error, in the error colour. */
 .diff-wrong .diff-correct,
 .diff-missing .diff-correct {
-  color: var(--ok);
+  color: var(--text);
   font-weight: 700;
   text-decoration: underline;
   text-decoration-thickness: 2px;
 }
 
 .diff-wrong .diff-mark,
-.diff-extra .diff-mark {
-  color: var(--rate-5);
-}
-
+.diff-extra .diff-mark,
 .diff-missing .diff-mark {
-  color: var(--ok);
+  color: var(--rate-5);
 }
 
 .diff-missing .diff-typed,

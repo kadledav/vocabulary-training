@@ -222,11 +222,17 @@ export function spellingQuestion(item, { onListen, listen }) {
   );
 }
 
-/** How a letter shows in the diff: a space as ␣, a gap as ·. */
-/** @param {string | null} ch */
+/**
+ * How a letter shows in the diff: a space as ␣, a gap as ·, and anything
+ * else that would show as nothing (other white space, a format character
+ * the comparison keeps) as �, never as an empty cell.
+ *
+ * @param {string | null} ch
+ */
 function diffLetter(ch) {
   if (ch === null) return '·';
-  return ch === ' ' ? '␣' : ch;
+  if (ch === ' ') return '␣';
+  return /^[\p{Z}\p{C}]$/u.test(ch) ? '\ufffd' : ch;
 }
 
 /** The symbol under a column: not colour alone (design §6.8). */
