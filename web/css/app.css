@@ -2007,6 +2007,17 @@ ul.conflicts {
   list-style: none;
   padding: 0;
   margin: 0;
+  /* A long unbroken title or headword wraps (as on Words) instead of
+     scrolling the page sideways. */
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+ul.source-progress > li,
+ul.leeches > li,
+ul.conflicts > li,
+ul.conflicts > li > * {
+  min-width: 0;
 }
 
 ul.source-progress > li + li,

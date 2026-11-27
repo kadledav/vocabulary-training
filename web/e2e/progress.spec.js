@@ -8,6 +8,7 @@
  */
 
 import { readFile } from 'node:fs/promises';
+import { DatabaseSync } from 'node:sqlite';
 
 import { expect, seedHistory, test, waitGuard } from './fixtures.js';
 
@@ -56,6 +57,21 @@ test('R-72 Progress shows each number with what it means', async ({ page, app, p
   await expectNoSidewaysScroll(page);
   // No streaks, scores or goals (R-74).
   await expect(page.locator('main')).not.toContainText(/streak|points|score/i);
+});
+
+test('R-72 Progress wraps a long unbroken title or headword on a phone', async ({ page, app, pageErrors }) => {
+  void pageErrors;
+  await seedHistory(app);
+  const db = new DatabaseSync(app.dbPath);
+  const long = 'Supercalifragilisticexpialidociouslyunbreakabletitle'.repeat(3);
+  db.prepare("UPDATE source SET title = ? WHERE title = 'An E2E Test Novel'").run(long);
+  db.prepare("UPDATE word SET headword = ? WHERE headword = 'brontle'").run(`brontle${'x'.repeat(90)}`);
+  db.close();
+  await page.setViewportSize({ width: 375, height: 812 });
+  await page.goto(`${app.url}/#/progress`);
+  await expect(page.getByTestId('source-progress').filter({ hasText: long })).toBeVisible();
+  await expect(page.getByTestId('leech')).toContainText('brontlexxx');
+  await expectNoSidewaysScroll(page);
 });
 
 test('R-55 a problem word on Progress: keep, undo, lower usefulness, suspend', async ({ page, app, pageErrors }, info) => {
