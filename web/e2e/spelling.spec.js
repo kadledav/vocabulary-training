@@ -85,8 +85,14 @@ async function expectQuestion(page, headword) {
   await expect(page.getByTestId('headword')).toHaveCount(0);
   await expect(page.getByTestId('sentence-en')).toHaveCount(0);
   await expect(page.getByTestId('cloze')).toHaveCount(0);
-  const html = await page.locator('.practice-body, .practice-bottom, .practice-top').evaluateAll((els) => els.map((e) => e.outerHTML).join(''));
-  expect(html.toLowerCase()).not.toContain(headword);
+  // Every text and every attribute value of the card, its bar and its top.
+  const shown = await page.locator('.practice-body, .practice-bottom, .practice-top').evaluateAll((els) =>
+    els
+      .flatMap((e) => [e, ...e.querySelectorAll('*')])
+      .flatMap((n) => [n.textContent ?? '', ...[...n.attributes].map((a) => a.value)])
+      .join(' '),
+  );
+  expect(shown.toLowerCase()).not.toContain(headword);
   expect((await page.title()).toLowerCase()).not.toContain(headword);
 }
 
