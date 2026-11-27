@@ -65,8 +65,10 @@ pub fn history(conn: &Connection, word: WordId) -> rusqlite::Result<Vec<HistoryR
 /// reviewed. An Understand card becomes a new word again (introduced
 /// through the new-word quota, its format chosen again at its first
 /// review); a Produce or Spelling card is due tomorrow, like a freshly
-/// unlocked one. Its reviews stay in the history. Returns the card, `None`
-/// when the word has no card of that kind.
+/// unlocked one. Its reviews stay in the history. A card introduced today
+/// keeps today as its introduction day: it already used one of today's
+/// new-word slots, and resetting it must not free that slot (R-54).
+/// Returns the card, `None` when the word has no card of that kind.
 pub fn reset_card(
     tx: &Transaction<'_>,
     word: WordId,
@@ -79,10 +81,11 @@ pub fn reset_card(
     };
     let changed = tx.execute(
         "UPDATE card SET format = NULL, state = 'new', stability = NULL, difficulty = NULL, \
-         due_day = ?3, last_review_day = NULL, last_review_at = NULL, introduced_day = NULL, \
+         due_day = ?3, last_review_day = NULL, last_review_at = NULL, \
+         introduced_day = CASE WHEN introduced_day = ?4 THEN introduced_day END, \
          reps = 0, lapses = 0, consecutive_fives = 0, leech = 'none', leech_lapses_at_ack = 0 \
          WHERE word_id = ?1 AND kind = ?2",
-        params![word.get(), kind.as_str(), due],
+        params![word.get(), kind.as_str(), due, now.day],
     )?;
     if changed == 0 {
         return Ok(None);

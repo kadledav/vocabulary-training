@@ -690,7 +690,11 @@ async fn r04_reset_card_forgets_the_learning_state_but_keeps_the_history() {
     let card = &view["cards"][0];
     assert_eq!(card["state"], "new");
     assert!(card["stability"].is_null() && card["due_day"].is_null());
-    assert!(card["introduced_day"].is_null() && card["format"].is_null());
+    assert!(card["format"].is_null());
+    assert_eq!(
+        card["introduced_day"], "2026-11-20",
+        "introduced today: it keeps today's new-word slot"
+    );
     assert_eq!(card["reps"], 0);
     assert_eq!(view["status"], "new");
     assert_eq!(

@@ -74,8 +74,12 @@ pub fn word_status(cards: &[&Card]) -> WordStatus {
     }
 }
 
-/// The earliest due day of the word's cards that are practised.
-fn next_due(cards: &[&Card]) -> Option<StudyDay> {
+/// The earliest due day of the word's cards that are practised (none
+/// while the word is suspended: no card of it is practised, design §6.4).
+fn next_due(word_suspended: bool, cards: &[&Card]) -> Option<StudyDay> {
+    if word_suspended {
+        return None;
+    }
     cards
         .iter()
         .filter(|c| !c.suspended)
@@ -141,7 +145,7 @@ pub fn word_list(conn: &Connection, query: &WordListQuery) -> Result<Vec<WordLis
             let cards = by_word.get(&word.id).map_or(&[][..], Vec::as_slice);
             WordListRow {
                 status: word_status(cards),
-                next_due: next_due(cards),
+                next_due: next_due(word.suspended, cards),
                 word,
             }
         })
@@ -320,6 +324,7 @@ mod tests {
         let mut b = card(CardKind::Produce, CardState::Review, Some(9.0));
         b.due_day = Some("2026-12-01".parse().expect("day"));
         b.suspended = true;
-        assert_eq!(next_due(&[&a, &b]), a.due_day);
+        assert_eq!(next_due(false, &[&a, &b]), a.due_day);
+        assert_eq!(next_due(true, &[&a, &b]), None, "a suspended word");
     }
 }

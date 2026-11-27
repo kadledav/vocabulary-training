@@ -1786,6 +1786,7 @@ fn api_error(err: &ApiError) -> Response {
             SessionError::ReviewIdReused => conflict("review_id_reused"),
             SessionError::ReviewUndone => conflict("review_undone"),
             SessionError::NothingToUndo => conflict("nothing_to_undo"),
+            SessionError::CardChangedSince => conflict("card_changed"),
             SessionError::Random(_) | SessionError::Scheduler(_) | SessionError::Sqlite(_) => {
                 internal_error(err)
             }

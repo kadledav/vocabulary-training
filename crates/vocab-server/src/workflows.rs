@@ -39,6 +39,7 @@ use crate::importer::{
     Via,
 };
 use crate::scheduler::{self, CardKind};
+use crate::session;
 use crate::undo::{self, UndoError, UndoToken};
 
 #[derive(Debug, thiserror::Error)]
@@ -395,9 +396,11 @@ pub fn word_action(
             if catalog::word_traits(tx, id)?.is_none() {
                 return Err(EditError::WordNotFound.into());
             }
-            if scheduler::reset_card(tx, id, kind, now)?.is_none() {
+            let Some(card) = scheduler::reset_card(tx, id, kind, now)? else {
                 return Err(WorkflowError::NoSuchCard(kind));
-            }
+            };
+            // An item queued for the card's old state is not practised.
+            session::withdraw_card(tx, card.id)?;
         }
     }
     refresh_cards(tx, id, now)

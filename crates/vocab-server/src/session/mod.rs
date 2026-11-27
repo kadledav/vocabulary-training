@@ -28,7 +28,7 @@ pub use build::{
 pub use queue::{finish, rate, undo_last};
 pub use view::{
     AnswerView, BlockSummary, FinishedBlocks, ItemCard, ItemView, LookAgain, RateResult,
-    SessionView, StartResult, UndoResult, current, finished_blocks,
+    SessionView, StartResult, UndoResult, current, finished_blocks, withdraw_card,
 };
 
 use crate::catalog::SourceId;
@@ -255,6 +255,10 @@ pub enum SessionError {
     ReviewUndone,
     #[error("nothing to undo in this block")]
     NothingToUndo,
+    /// The card of the last rating was changed since (reset in word
+    /// detail): restoring the state before the rating would undo that too.
+    #[error("the last rating cannot be undone: its card was reset since")]
+    CardChangedSince,
     #[error("{0}")]
     Invalid(String),
     #[error("random source failed: {0}")]

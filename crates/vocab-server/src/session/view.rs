@@ -159,13 +159,41 @@ fn item_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ItemRow> {
     })
 }
 
-/// Items of a block in queue order.
+/// Items of a block in queue order: every answered item, and the
+/// unanswered ones that may still be practised ([`still_practised`]). A
+/// change of the word after the block was built (suspended, goal or
+/// spelling switched off, a low-priority word excluded) leaves the stored
+/// item alone, so an Undo or "unsuspend" brings it back (design §6.4: a
+/// suspended word's cards are excluded from sessions).
 pub fn items(conn: &Connection, id: &SessionId) -> rusqlite::Result<Vec<ItemRow>> {
     let mut stmt = conn.prepare(
         "SELECT id, ord, card_id, origin, sentence_id, review_id, format FROM session_item \
          WHERE session_id = ?1 ORDER BY ord, id",
     )?;
-    stmt.query_map([id.as_str()], item_row)?.collect()
+    let rows: Vec<ItemRow> = stmt
+        .query_map([id.as_str()], item_row)?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut out = Vec::with_capacity(rows.len());
+    for item in rows {
+        if item.review_id.is_some() || still_practised(conn, &item)? {
+            out.push(item);
+        }
+    }
+    Ok(out)
+}
+
+/// May the unanswered `item` still be practised? Its card and word exist
+/// and are not suspended, and a new item's word may still be introduced.
+fn still_practised(conn: &Connection, item: &ItemRow) -> rusqlite::Result<bool> {
+    let Some(card) = scheduler::card(conn, item.card_id)? else {
+        return Ok(false);
+    };
+    let Some(word) = catalog::word_traits(conn, card.word_id)? else {
+        return Ok(false);
+    };
+    Ok(!card.suspended
+        && !word.suspended
+        && (item.origin != ItemOrigin::New || word.introducible()))
 }
 
 /// The block row.
@@ -245,13 +273,25 @@ pub fn finished_blocks(conn: &Connection, day: StudyDay) -> rusqlite::Result<Fin
     )
 }
 
-/// Unanswered items of a block.
+/// Unanswered items of a block that may still be practised.
 pub fn remaining(conn: &Connection, id: &SessionId) -> rusqlite::Result<u32> {
-    conn.query_row(
-        "SELECT COUNT(*) FROM session_item WHERE session_id = ?1 AND review_id IS NULL",
-        [id.as_str()],
-        |row| row.get(0),
-    )
+    Ok(count(
+        items(conn, id)?
+            .iter()
+            .filter(|item| item.review_id.is_none())
+            .count(),
+    ))
+}
+
+/// Take the unanswered items of `card` out of the active blocks: its
+/// learning state was reset, so what they were built for no longer holds.
+pub fn withdraw_card(tx: &Connection, card: CardId) -> rusqlite::Result<()> {
+    tx.execute(
+        "DELETE FROM session_item WHERE card_id = ?1 AND review_id IS NULL \
+         AND session_id IN (SELECT id FROM practice_session WHERE status = 'active')",
+        [card.get()],
+    )?;
+    Ok(())
 }
 
 fn accept_set(word: &WordPresentation, sentence: Option<&PresentedSentence>) -> Vec<String> {

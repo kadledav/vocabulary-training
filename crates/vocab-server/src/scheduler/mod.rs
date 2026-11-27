@@ -28,7 +28,7 @@ pub use owner::{
 };
 pub use review::{
     AnswerMatch, RawGrade, ReviewInput, ReviewOutcome, StoredReview, UndoOutcome, UnlockedCard,
-    find_review, raw_grade, record_review, review_outcome, undo_review,
+    card_as_rated, find_review, raw_grade, record_review, review_outcome, undo_review,
 };
 
 use crate::catalog::WordTraits;
