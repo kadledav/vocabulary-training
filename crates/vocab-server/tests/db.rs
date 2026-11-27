@@ -802,6 +802,28 @@ fn r02_migration_flags_general_vocabulary_as_a_defaulted_title() {
     );
 }
 
+/// Row counts of the tables whose data an upgrade must keep.
+fn table_counts(conn: &Connection) -> Vec<(&'static str, i64)> {
+    [
+        "word",
+        "word_form",
+        "word_item",
+        "sentence",
+        "card",
+        "review_log",
+        "audio_clip",
+        "field_conflict",
+    ]
+    .into_iter()
+    .map(|table| {
+        let n = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .expect("count");
+        (table, n)
+    })
+    .collect()
+}
+
 fn form_rows(conn: &Connection, condition: &str) -> Vec<String> {
     conn.prepare(&format!(
         "SELECT word_id, form, form_key, common, position FROM word_form \
@@ -823,26 +845,27 @@ fn form_rows(conn: &Connection, condition: &str) -> Vec<String> {
     .collect()
 }
 
-/// Migration 0007 (M7, R-04) on a database at version 6 holding the
-/// synthetic fixture: every word's key is its first pack spelling, every
-/// stored form is kept and not removed, the constraints hold. (The version-6
-/// database is built from the migrations' SQL; the Rust data step of 0005
-/// only re-keys sentences and plays no part here.)
+/// Migrations 0006 and 0007 (M6, M7; R-04, R-85) on a database of the
+/// released schema (version 5, v0.1.1) holding the synthetic fixture
+/// (words, forms, sentences, cards, reviews, clips, suggestions): every
+/// word's key is its first pack spelling, every stored form is kept and not
+/// removed, the id floors start at the stored ids, the constraints hold.
+/// (The version-5 database is built from the migrations' SQL; the Rust data
+/// step of 0005 only re-keys sentences and plays no part here.)
 #[test]
-fn r04_v6_database_with_data_migrates_to_v7() {
+fn r04_released_v5_database_with_data_migrates_to_v7() {
     let (_root, data) = data_dir();
-    let forms_before = {
+    let (forms_before, counts_before) = {
         let conn = v4_database(&data);
-        for sql in [
-            include_str!("../migrations/0005_review_round_1.sql"),
-            include_str!("../migrations/0006_audio.sql"),
-        ] {
-            conn.execute_batch(sql).expect("migration");
-        }
-        conn.pragma_update(None, "user_version", 6)
+        conn.execute_batch(include_str!("../migrations/0005_review_round_1.sql"))
+            .expect("migration");
+        conn.pragma_update(None, "user_version", 5)
             .expect("version");
-        form_rows(&conn, "1")
+        (form_rows(&conn, "1"), table_counts(&conn))
     };
+    for (table, n) in &counts_before {
+        assert!(*n > 0, "the fixture has {table}");
+    }
     assert!(!forms_before.is_empty(), "the fixture has forms");
     drop(Db::open(&data).expect("migrates"));
     let conn = inspect(&data);
@@ -851,6 +874,7 @@ fn r04_v6_database_with_data_migrates_to_v7() {
         .expect("user_version");
     assert_eq!(version, 7);
     assert_eq!(form_rows(&conn, "removed = 0"), forms_before);
+    assert_eq!(table_counts(&conn), counts_before, "no row lost");
     let unmatched: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM word w LEFT JOIN word_pack_spelling p \
