@@ -41,7 +41,8 @@ design's choice works; three findings change details of §10 (below).
 
 ## Decisions
 
-- **fp32** (`model.onnx`), not int8: int8 is 2.4× slower on this CPU (dynamic
+- **fp32** (`model.onnx`), not int8 (changed in v0.2.1 for memory: int8,
+  see "Small memory" below): int8 is 2.4× slower on this CPU (dynamic
   quantisation kernels) for 0.2 GB less memory; fp32 is well inside the
   design threshold. On x86 with VNNI int8 might be faster; the CI smoke
   test on amd64 shows the time per clip in the log (`synthesis_ms`), and the
@@ -164,3 +165,103 @@ letter is right for the acronym). Still spelled in the synthetic list (US):
 "frisson", "pococurante", "tatterdemalion", "cack-handed" (its part
 "cack"). The owner's data was read locally for these counts only; nothing
 of it is in the repository.
+
+## Small memory (2026-11-21, v0.2.1)
+
+The owner's home server has little free RAM; the 0.2.0 container kept the
+fp32 model loaded all the time (567 MiB idle, up to 980 MiB). Decision:
+the smallest setup that still speaks English well, same Kokoro voices and
+pronunciations; speed does not matter (clips are made once, in the
+background). Target: the whole app under 400 MB.
+
+**Setup of the measurements:** the image in the Podman VM of the spike
+(linux/arm64, Apple M5 Pro), hardened as in Compose, `--cpus 1` unless
+noted; memory is the container's cgroup (`memory.current`/`memory.peak`,
+`anon` of `memory.stat`), not in-process counters; texts synthetic (the
+smoke test's sentences and words, the 598-character text, the worst
+accepted texts). "Fresh" = a new container per text (one request after the
+start). amd64 is not measured here (the CI smoke test prints its numbers).
+
+### What each lever does
+
+| Lever | Measured | Kept |
+|---|---|---|
+| int8 model instead of fp32 (2 threads, model loaded at start) | anon after start 573 → 324 MiB; after the sentences 637 → 388; after the 598-char text 768 → 525; after the worst texts 942 → 712. Sentences 1.1–1.5 s → 1.6–2.0 s, words 0.4 → 0.5–0.6 s | yes |
+| 1 instead of 2 inference threads (int8) | same memory (324/388/525/712 MiB); sentences 1.6–2.0 → 1.9–2.4 s, the 598-char text 15 → 18–22 s | yes (1 thread, 1 CPU) |
+| Compact lexicons (one string and a sorted index instead of hash maps) | lexicons ~80 → ~20 MiB RSS, load 130 ms; container with model, after start, 325 → 271 MiB. Phonemes and tallies of every lexicon and CMUdict word (both accents) byte-identical | yes (front-end id unchanged by it) |
+| Chunk length 150 / 100 / 75 / 50 symbols (fresh, int8, 1 thread, hash-map lexicons) | a sentence: 384 / 384 / 384 / 370 MiB; the 598-char text 524 / 524 / 411 / 432; compounds up to 600 characters 702 / 534 / 499 / 412; spelled 64-letter word 510 / 442 / 405 / 417 | 100 (a sentence of up to ~17 words stays one chunk; longer ones are cut at a pause); front-end `g2p-4` |
+| One engine call per chunk instead of one for all | same memory (470 vs 474 MiB for the 598-char text), same audio duration (±1 ms) | needed for the next row |
+| New ONNX Runtime session only before a longer chunk | no help: the 598-char text (sentence-long chunks) still 464 MiB | no |
+| New session for every chunk, dropped after it | the 598-char text 464 → 406 MiB, compounds 474 → 413; +0.35 s per chunk (words 0.6 → 1.0 s, sentences +0.3 s) | yes |
+| Engine process started on demand, ended after `VOCAB_TTS_IDLE_SECONDS` | container 1–3 MiB (anon ≤ 2 MiB) after the start self-test and after the idle time; the start self-test (both voices) takes ~1.5 s | yes (default 180 s) |
+| ONNX Runtime options (arena, memory pattern, mmap of the model) | not in the public API of the pinned `sherpa-onnx` 2.0.1 (`OfflineTtsModelConfig` has threads, provider, debug only) | not available |
+| Lexicons loaded per request, dropped before the engine runs | would save ~20 MiB of the peak for ~130 ms per clip | not done |
+| glibc malloc tuning (`MALLOC_ARENA_MAX`, thresholds) | not measured | — |
+
+Why so much more than the file: the int8 model file is 109 MiB, the loaded
+model ~233 MiB of RSS (ONNX Runtime's initialised and pre-packed weights);
+a chunk's working memory comes on top (60–150 MiB, growing with its length,
+and with every further chunk a session runs: hence the fresh session).
+
+### Final setup
+
+int8 model, 1 thread (`cpus: 1`), chunks of ≤ 100 symbols, a fresh session
+per chunk, an engine process that ends 180 s after the last request,
+`mem_limit` 512 MB (peak 415 MiB + 23 %; no swap). Above the limit the
+kernel kills only the engine process: that clip fails as a crash
+(`500 engine_crashed`, three of them and the app marks it "crashed the
+audio service"), the service stays up.
+
+| Container memory (cgroup) | 0.2.0 (fp32, 2 threads) | 0.2.1 |
+|---|---|---|
+| Idle (after the start, and after the idle time) | 567 MiB | 1–3 MiB (anon ≤ 2 MiB) |
+| Start self-test (model loaded once, then released) | — | peak 274 MiB |
+| Between clips while the engine process lives | — | 155–230 MiB (lexicons and freed heap) |
+| Peak: 12 words and sentences in a row | ~895 MiB (anon 637) | 349 MiB |
+| Peak: one sentence (fresh) | — | 328–377 MiB |
+| Peak: the 598-character text | 760 MiB | 406 MiB |
+| Peak: everything, worst accepted texts included | 980 MiB | 415 MiB |
+| Image (linux/arm64) | 437 MB | 226 MB |
+
+| Time, 1 thread (int8) | `--cpus 1` (= unrestricted for one thread) | `--cpus 0.5` | 0.2.0, 2 threads |
+|---|---|---|---|
+| Sentence (11–13 words) | 2.2–2.7 s | 5.0–6.0 s | 1.1–1.5 s |
+| Word | 0.9–1.0 s | 2.0–2.3 s | 0.4 s |
+| The 598-character text | 19.8–19.9 s | 44–57 s | 10.6 s |
+| Worst accepted text (600 characters of compounds) | 23 s | 67 s | 12 s |
+| First request after an idle time (lexicons + model) | +0.5 s | +1–2 s | — |
+
+300 clips (100 words, 200 sentences): ~10 min at one core here, ~22 min at
+half a core; if a NAS core is 3–5 times slower (not measured), 30–60 min
+at one core.
+
+Two containers (app and TTS under the Compose limits, one import of 30
+synthetic words with three sentences each, 120 clips, `VOCAB_TTS_IDLE_SECONDS=30`):
+all 120 clips ready, none failed, one engine process for all of them; the
+TTS container peaked at 399 MiB (sampled every second: at most 372 MiB),
+the app container at 21 MiB (during the import; 6–7 MiB otherwise). Idle
+before and 30 s after the last clip: TTS 1 MiB, app 7 MiB. So the whole
+app is far under 400 MB while idle, and about 405–420 MiB (425–440 MB)
+at the peak of clip making: under 400 MB is not reached while clips are
+being made. (The run shared the CPU with a build, so its 11 minutes are no
+speed figure.)
+
+Samples (6 sentences, 6 words, US and UK voice; fp32 of 0.2.0 vs. this
+setup; ffmpeg on the decoded MP3s): durations equal within ±0.1 s except
+the one 21-word sentence that is now cut at its comma (±0.3 s); loudness
+−16.0 … −16.9 LUFS (0.2.0) and −16.0 … −16.8 LUFS (0.2.1); no clipping
+(highest sample −1.6 dBFS, highest true peak −1.4 dBTP; 0.2.0: −1.5 dBFS,
+−1.2 dBTP). Whether int8 sounds as good is the owner's call (the samples
+are outside the repository).
+
+### Timeouts
+
+The longest accepted text takes ~20 s here at one thread and ~40 s at half
+a CPU (`--cpus 0.5`); a NAS core may be several times slower, and the first
+request after an idle time loads lexicons and model first. So: the
+service's request timeout is 600 s (was 60), the app waits 630 s for a clip
+(was 75) and a timeout costs the clip an attempt (retried 30 s … 24 h
+later), never a crash; the engine process gets 120 s to load; a crash is
+only an engine process that died (`engine_crashed`) or a connection that
+broke. The 2 GiB clip cache cap, input limits, long-token and crash-loop
+protections are unchanged.

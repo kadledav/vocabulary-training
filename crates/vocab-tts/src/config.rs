@@ -4,7 +4,8 @@
 //! |---|---|---|
 //! | `VOCAB_TTS_LISTEN` | `0.0.0.0:8090` | listen address |
 //! | `VOCAB_TTS_MODEL_DIR` | `/model` | `model.onnx`, `voices.bin`, `tokens.txt`, the two lexicons |
-//! | `VOCAB_TTS_THREADS` | `2` | inference threads (1–16) |
+//! | `VOCAB_TTS_THREADS` | `1` | inference threads (1–16) |
+//! | `VOCAB_TTS_IDLE_SECONDS` | `180` | the engine process ends after this long without a request, and its memory goes back to the system (0–86400; 0: after every request) |
 //! | `VOCAB_TTS_LOG_LEVEL` | `info` | `error`, `warn`, `info`, `debug`, `trace` |
 //!
 //! Any other `VOCAB_TTS_*` variable (a typo) and any invalid value is a
@@ -14,18 +15,32 @@
 use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 const LISTEN_ENV: &str = "VOCAB_TTS_LISTEN";
 const MODEL_DIR_ENV: &str = "VOCAB_TTS_MODEL_DIR";
 const THREADS_ENV: &str = "VOCAB_TTS_THREADS";
+const IDLE_ENV: &str = "VOCAB_TTS_IDLE_SECONDS";
 const LOG_LEVEL_ENV: &str = "VOCAB_TTS_LOG_LEVEL";
-const KNOWN: [&str; 4] = [LISTEN_ENV, MODEL_DIR_ENV, THREADS_ENV, LOG_LEVEL_ENV];
+const KNOWN: [&str; 5] = [
+    LISTEN_ENV,
+    MODEL_DIR_ENV,
+    THREADS_ENV,
+    IDLE_ENV,
+    LOG_LEVEL_ENV,
+];
 const PREFIX: &str = "VOCAB_TTS_";
 
 const DEFAULT_LISTEN: &str = "0.0.0.0:8090";
 const DEFAULT_MODEL_DIR: &str = "/model";
-const DEFAULT_THREADS: u16 = 2;
+/// One thread: the clips are made in the background, so speed matters
+/// less than leaving the server's other CPU to everything else.
+const DEFAULT_THREADS: u16 = 1;
 const MAX_THREADS: u16 = 16;
+/// A few minutes: a batch of clips (one after another, milliseconds apart)
+/// keeps one engine process; it ends soon after the batch.
+const DEFAULT_IDLE: Duration = Duration::from_secs(180);
+const MAX_IDLE_SECS: u64 = 86_400;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ConfigError {
@@ -43,6 +58,8 @@ pub struct Config {
     pub listen: SocketAddr,
     pub model_dir: PathBuf,
     pub threads: u16,
+    /// How long the engine process stays after the last request.
+    pub idle: Duration,
     pub log_level: tracing::Level,
 }
 
@@ -94,6 +111,18 @@ impl Config {
                     message: "must be a whole number from 1 to 16",
                 })?,
         };
+        let idle = match text(IDLE_ENV)? {
+            None => DEFAULT_IDLE,
+            Some(v) => v
+                .parse::<u64>()
+                .ok()
+                .filter(|n| *n <= MAX_IDLE_SECS)
+                .map(Duration::from_secs)
+                .ok_or(ConfigError::Invalid {
+                    key: IDLE_ENV,
+                    message: "must be a whole number of seconds from 0 to 86400",
+                })?,
+        };
         let log_level = match text(LOG_LEVEL_ENV)? {
             None => tracing::Level::INFO,
             Some(v) => v.parse().map_err(|_| ConfigError::Invalid {
@@ -105,6 +134,7 @@ impl Config {
             listen,
             model_dir,
             threads,
+            idle,
             log_level,
         })
     }
@@ -132,7 +162,8 @@ mod tests {
         .expect("test setup");
         assert_eq!(config.listen, "0.0.0.0:8090".parse().expect("test setup"));
         assert_eq!(config.model_dir, PathBuf::from("/model"));
-        assert_eq!(config.threads, 2);
+        assert_eq!(config.threads, 1);
+        assert_eq!(config.idle, Duration::from_secs(180));
         assert_eq!(config.log_level, tracing::Level::INFO);
     }
 
@@ -142,12 +173,14 @@ mod tests {
             ("VOCAB_TTS_LISTEN", "127.0.0.1:9000"),
             ("VOCAB_TTS_MODEL_DIR", "/opt/model"),
             ("VOCAB_TTS_THREADS", "4"),
+            ("VOCAB_TTS_IDLE_SECONDS", "0"),
             ("VOCAB_TTS_LOG_LEVEL", "debug"),
         ])
         .expect("test setup");
         assert_eq!(config.listen, "127.0.0.1:9000".parse().expect("test setup"));
         assert_eq!(config.model_dir, PathBuf::from("/opt/model"));
         assert_eq!(config.threads, 4);
+        assert_eq!(config.idle, Duration::ZERO);
         assert_eq!(config.log_level, tracing::Level::DEBUG);
     }
 
@@ -162,6 +195,9 @@ mod tests {
             ("VOCAB_TTS_THREADS", "0"),
             ("VOCAB_TTS_THREADS", "17"),
             ("VOCAB_TTS_THREADS", "two"),
+            ("VOCAB_TTS_IDLE_SECONDS", "86401"),
+            ("VOCAB_TTS_IDLE_SECONDS", "-1"),
+            ("VOCAB_TTS_IDLE_SECONDS", "3m"),
             ("VOCAB_TTS_LOG_LEVEL", "loud"),
         ] {
             assert!(

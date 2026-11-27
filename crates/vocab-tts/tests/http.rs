@@ -9,7 +9,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use common::{Call, FakeEngine, SYMBOLS, app, app_with, error_code, send, speak_request};
 use vocab_tts::phonemize::{Lexicon, Phonemizer, parse_symbols};
-use vocab_tts::speaker::Speaker;
+use vocab_tts::speaker::{Local, Speaker};
 use vocab_tts::speech::Voice;
 
 #[tokio::test]
@@ -95,7 +95,7 @@ async fn r42_voices_are_listed() {
         serde_json::json!({ "voices": [
             { "id": "af_heart", "accent": "en-US", "default": true },
             { "id": "bf_emma", "accent": "en-GB", "default": false },
-        ], "frontend": vocab_tts::phonemize::FRONTEND_VERSION, "engine": "kokoro-multi-lang-v1_0+sherpa-onnx-2.0.1"})
+        ], "frontend": vocab_tts::phonemize::FRONTEND_VERSION, "engine": "kokoro-int8-multi-lang-v1_0+sherpa-onnx-2.0.1"})
     );
 }
 
@@ -110,7 +110,8 @@ async fn r83_healthz_and_unknown_routes() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, br#"{"status":"ok"}"#);
+    // The in-process pipeline runs all the time.
+    assert_eq!(body, br#"{"engine":"running","status":"ok"}"#);
     let (status, _, body) = send(
         &app,
         Request::get("/v1/other")
@@ -399,7 +400,7 @@ async fn r84_text_that_would_take_too_long_to_speak_is_unprocessable() {
         calls: Arc::clone(&calls),
         gate: None,
     };
-    let app = vocab_tts::http::app(Speaker::new(phonemizer, Box::new(engine), 1));
+    let app = vocab_tts::http::app(Speaker::new(Local::new(phonemizer, Box::new(engine)), 1));
     let text = vec!["zz"; 20].join(" ");
     let (status, _, body) = send(&app, speak_request(&format!(r#"{{"text": "{text}"}}"#))).await;
     assert_eq!(

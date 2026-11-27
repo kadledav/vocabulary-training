@@ -17,6 +17,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use tokio::sync::Notify;
+
 #[cfg(vocab_tts_engine)]
 mod kokoro;
 
@@ -25,20 +27,30 @@ use crate::postprocess::Pcm;
 use crate::speech::{Speed, Voice};
 
 /// File names in the model directory (the Dockerfile copies them there).
-const MODEL: &str = "model.onnx";
+/// The int8 model: a third of the fp32 model's memory, same voices, about
+/// 2.4 times slower (docs/design/tts-spike.md, "Small memory").
+const MODEL: &str = "model.int8.onnx";
 const VOICES: &str = "voices.bin";
 const SYMBOLS: &str = "tokens.txt";
-/// Voices of `kokoro-multi-lang-v1_0` (its `speaker_names` metadata).
+/// Voices of `kokoro-int8-multi-lang-v1_0` (its `speaker_names` metadata,
+/// the same as the fp32 model's).
 const SPEAKERS: usize = 54;
-/// Identifies engine, model and voices in clip keys of the app: a change
-/// here makes the app generate its clips again.
-pub const ENGINE_VERSION: &str = "kokoro-multi-lang-v1_0+sherpa-onnx-2.0.1";
+/// Identifies engine, model (with its variant: int8, not fp32) and voices
+/// in clip keys of the app: a change here makes the app generate its clips
+/// again.
+pub const ENGINE_VERSION: &str = "kokoro-int8-multi-lang-v1_0+sherpa-onnx-2.0.1";
 
 /// Set when nobody waits for the audio any more (the request timed out or
 /// the client went away): work that has not started is skipped, and the
-/// engine stops after the chunk it is on.
+/// engine stops after the chunk it is on (an engine process is stopped).
 #[derive(Debug, Clone, Default)]
-pub struct Cancel(Arc<AtomicBool>);
+pub struct Cancel(Arc<CancelState>);
+
+#[derive(Debug, Default)]
+struct CancelState {
+    cancelled: AtomicBool,
+    wake: Notify,
+}
 
 impl Cancel {
     pub fn new() -> Self {
@@ -46,11 +58,21 @@ impl Cancel {
     }
 
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::SeqCst);
+        self.0.cancelled.store(true, Ordering::SeqCst);
+        self.0.wake.notify_waiters();
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
+        self.0.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Resolves once [`Cancel::cancel`] was called.
+    pub async fn cancelled(&self) {
+        let woken = self.0.wake.notified();
+        // Registered before the check: a cancel in between still wakes it.
+        if !self.is_cancelled() {
+            woken.await;
+        }
     }
 }
 
@@ -74,7 +96,7 @@ pub enum EngineError {
     Missing(PathBuf),
     #[error("sherpa-onnx could not load the Kokoro model from {} (see the lines above from sherpa-onnx)", .0.display())]
     Load(PathBuf),
-    #[error("the model has {found} voices, expected {SPEAKERS} (kokoro-multi-lang-v1_0)")]
+    #[error("the model has {found} voices, expected {SPEAKERS} (kokoro-int8-multi-lang-v1_0)")]
     WrongModel { found: i32 },
     #[error("the engine produced no audio")]
     NoAudio,

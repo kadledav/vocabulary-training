@@ -26,8 +26,9 @@ exactly, use:
      `cmake/deps.txt` of the ONNX Runtime tag.
 3. **Kokoro-82M v1.0** as packaged by sherpa-onnx (weights, voices,
    lexicons; Apache-2.0):
-   - https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-multi-lang-v1_0.tar.bz2
-     sha256 `60703707bc05ccd48d60e1eb723f38b07d6e474795a0b6a588d7220400e0f7a4`
+   - https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-int8-multi-lang-v1_0.tar.bz2
+     sha256 `72c347230107ef8a31098ec4d468a605244beef5f1ed00db97efa13518800653`
+     (the int8-quantised weights)
    - upstream: https://huggingface.co/hexgrad/Kokoro-82M
 4. **CMUdict** (BSD-2-Clause), the fallback pronunciation dictionary:
    - https://raw.githubusercontent.com/cmusphinx/cmudict/74790861f652b15e4ac49015a90074ad62a27690/cmudict.dict

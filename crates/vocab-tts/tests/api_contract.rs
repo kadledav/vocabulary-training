@@ -362,8 +362,7 @@ async fn r24_no_text_in_the_logs_on_any_path() {
         }
     }
     let failing = vocab_tts::http::app(vocab_tts::speaker::Speaker::new(
-        phonemizer(),
-        Box::new(Failing),
+        vocab_tts::speaker::Local::new(phonemizer(), Box::new(Failing)),
         1,
     ));
     let (status, _, _) = send(

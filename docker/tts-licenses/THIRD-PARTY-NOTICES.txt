@@ -94,7 +94,7 @@ Components (name, version, licence expression -> licence(s) used):
   kissfft (in the sherpa-onnx static libraries): BSD-3-Clause -> BSD-3-Clause
   utf8proc 2.12.0 (in the sherpa-onnx static libraries): MIT AND Unicode-3.0 -> MIT AND Unicode-3.0
   LAME 3.100 (bundled by mp3lame-sys, linked statically): LGPL-2.0-or-later -> LGPL-2.0-or-later
-  Kokoro-82M v1.0 model, voices and US/UK lexicons (kokoro-multi-lang-v1_0): Apache-2.0 -> Apache-2.0
+  Kokoro-82M v1.0 model, voices and US/UK lexicons (kokoro-int8-multi-lang-v1_0): Apache-2.0 -> Apache-2.0
   CMUdict (cmusphinx/cmudict at 74790861): BSD-2-Clause -> BSD-2-Clause
 
 Notes:
@@ -1466,7 +1466,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 
 ==============================================================================
-Used by: sherpa-onnx 2.0.1, sherpa-onnx-sys 2.0.1, sherpa-onnx static libraries 2.0.1, kaldi-native-fbank, kaldi-decoder, kaldifst, OpenFst, simple-sentencepiece (in the sherpa-onnx static libraries), Kokoro-82M v1.0 model, voices and US/UK lexicons (kokoro-multi-lang-v1_0)
+Used by: sherpa-onnx 2.0.1, sherpa-onnx-sys 2.0.1, sherpa-onnx static libraries 2.0.1, kaldi-native-fbank, kaldi-decoder, kaldifst, OpenFst, simple-sentencepiece (in the sherpa-onnx static libraries), Kokoro-82M v1.0 model, voices and US/UK lexicons (kokoro-int8-multi-lang-v1_0)
 ==============================================================================
 
 

@@ -40,7 +40,7 @@ class ImagePrograms(unittest.TestCase):
             ("usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.33", True, ELF),
             ("lib/ld-linux-aarch64.so.1", True, ELF),
             ("lib64/ld-linux-x86-64.so.2", True, ELF),
-            ("model/model.onnx", True, b"\x08\x07\x12\x07"),
+            ("model/model.int8.onnx", True, b"\x08\x07\x12\x07"),
             ("licenses/SOURCE.md", True, b"# Co"),
             ("etc/passwd", True, b"root"),
         ]
@@ -90,9 +90,28 @@ class Memory(unittest.TestCase):
         self.assertEqual(smoke.memory_bytes("512kB / 1GB"), 512_000)
         self.assertIsNone(smoke.memory_bytes("--"))
 
+    def test_r83_cgroup_numbers(self):
+        stat = "anon 4194304\nfile 121634816\nkernel 917504\nanon_thp 0\nfile_mapped 0\n"
+        self.assertEqual(
+            smoke.cgroup_numbers("130023424\n", "400556032\n", stat),
+            {"current": 130023424, "peak": 400556032, "anon": 4194304, "file": 121634816},
+        )
+        # Older kernels have no memory.peak.
+        self.assertEqual(smoke.cgroup_numbers("1048576", None, "anon 1\n"), {"current": 1048576, "anon": 1})
+        self.assertEqual(smoke.mib({"current": 3 << 20, "anon": 1 << 20}), "current 3 MiB, anon 1 MiB")
+
     def test_r83_limit_covers_the_measured_peak(self):
-        # docs/design/tts-spike.md: about 0.91 GB peak for the longest text.
-        self.assertGreater(smoke.MEMORY_LIMIT_BYTES, 910_000_000 * 1.3)
+        # docs/design/tts-spike.md, "Small memory": a peak of 415 MiB for
+        # the worst accepted texts in one engine process (arm64; amd64 is
+        # measured by CI), plus a margin.
+        self.assertGreater(smoke.MEMORY_LIMIT_BYTES, 415 * 2**20 * 1.2)
+        self.assertLess(smoke.MEMORY_LIMIT_BYTES, 1280 * 2**20)
+
+    def test_r83_the_smoke_test_runs_under_the_compose_limit(self):
+        compose = (TOOLS.parent / "deploy" / "docker-compose.example.yml").read_text()
+        tts = compose.split("  vocabulary-tts:\n", 1)[1]
+        self.assertIn(f"    mem_limit: {smoke.MEMORY_LIMIT}\n", tts)
+        self.assertEqual(smoke.MEMORY_LIMIT_BYTES, int(smoke.MEMORY_LIMIT.rstrip("m")) * 2**20)
 
 
 if __name__ == "__main__":

@@ -23,7 +23,7 @@
 mod arpabet;
 mod numbers;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -41,14 +41,16 @@ const FALLBACK: &str = "cmudict.dict";
 /// Version of this front-end: part of the app's clip identity, so a change
 /// in how text becomes phonemes regenerates the clips. Bump it with every
 /// change of the rules or the dictionaries.
-pub const FRONTEND_VERSION: &str = "g2p-3";
+pub const FRONTEND_VERSION: &str = "g2p-4";
 /// Phoneme symbols per chunk the engine synthesises in one pass (Kokoro's
 /// context is 510). The engine's memory grows with the chunk length and
-/// with every new chunk shape (measured in the image: idle 576 MiB, after
-/// one chunk of 150 symbols 753 MiB, of 300 symbols 998 MiB, after two
-/// different 300-symbol chunks 1353 MiB — over the 1280 MB limit), so
-/// chunks stay short; a sentence of up to ~25 words is one chunk.
-const MAX_CHUNK_SYMBOLS: usize = 150;
+/// with every new chunk shape (int8 model, one fresh engine process, the
+/// worst accepted text of 150-symbol chunks: +380 MiB over the loaded
+/// model, of 100-symbol chunks +210 MiB, of 75 +170 MiB), so chunks stay
+/// short. 100 symbols: a sentence of up to ~17 words is one chunk, a longer
+/// one is cut at its last pause (comma, semicolon, …) before the limit, or
+/// else between two words.
+const MAX_CHUNK_SYMBOLS: usize = 100;
 /// Where a chunk that must be cut ends best: at its last pause.
 const CUT_MARKS: [char; 5] = [',', ';', ':', '—', '…'];
 /// Stress and length marks: not sounds (skipped when looking at the last
@@ -56,13 +58,113 @@ const CUT_MARKS: [char; 5] = [',', ';', ':', '—', '…'];
 const MARKS: [char; 3] = ['ˈ', 'ˌ', 'ː'];
 
 /// A pronunciation lexicon: lowercase word -> phoneme symbols.
+///
+/// Compact, because it is most of the service's own memory: all words and
+/// phonemes are in one string, with an index sorted by word into it
+/// (12 bytes per entry instead of two heap strings and a hash slot). Both
+/// Kokoro lexicons and the fallback dictionaries take about 20 MiB of RSS
+/// in the image, hash maps took about 80 MiB. Built without a heap
+/// allocation per entry, so loading leaves no fragmented heap behind.
 pub struct Lexicon {
-    entries: HashMap<String, String>,
+    text: String,
+    /// One entry per word, sorted by word.
+    index: Vec<Entry>,
+}
+
+/// Where one entry's word and its phonemes (right after the word) are in
+/// the lexicon's text.
+#[derive(Debug, Clone, Copy)]
+struct Entry {
+    start: u32,
+    word_len: u32,
+    phonemes_len: u32,
+}
+
+impl Entry {
+    fn word(self, text: &str) -> &str {
+        let start = self.start as usize;
+        &text[start..start + self.word_len as usize]
+    }
+
+    fn phonemes(self, text: &str) -> &str {
+        let start = self.start as usize + self.word_len as usize;
+        &text[start..start + self.phonemes_len as usize]
+    }
 }
 
 impl fmt::Debug for Lexicon {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Lexicon({} entries)", self.entries.len())
+        write!(f, "Lexicon({} entries)", self.len())
+    }
+}
+
+/// Collects entries in order; [`LexiconBuilder::finish`] keeps the last
+/// entry of a word, as a map would.
+#[derive(Debug, Default)]
+struct LexiconBuilder {
+    text: String,
+    index: Vec<Entry>,
+}
+
+/// Why an entry was not added.
+enum Skipped {
+    NoPhonemes,
+    TooLarge,
+}
+
+impl LexiconBuilder {
+    /// Add `word` (lowercased) with the concatenation of `phonemes`.
+    fn insert<'a>(
+        &mut self,
+        word: &str,
+        phonemes: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(), Skipped> {
+        let start = self.text.len();
+        self.text.push_str(&word.to_lowercase());
+        let word_end = self.text.len();
+        for symbols in phonemes {
+            self.text.push_str(symbols);
+        }
+        let end = self.text.len();
+        let result = if end == word_end {
+            Err(Skipped::NoPhonemes)
+        } else if u32::try_from(end).is_err() {
+            Err(Skipped::TooLarge)
+        } else {
+            // Every offset is at most `end`, which fits (checked above).
+            let offset = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+            self.index.push(Entry {
+                start: offset(start),
+                word_len: offset(word_end - start),
+                phonemes_len: offset(end - word_end),
+            });
+            Ok(())
+        };
+        if result.is_err() {
+            self.text.truncate(start);
+        }
+        result
+    }
+
+    fn finish(self) -> Lexicon {
+        let Self {
+            mut text,
+            mut index,
+        } = self;
+        // Stable: the entries of one word stay in insertion order.
+        index.sort_by(|a, b| a.word(&text).cmp(b.word(&text)));
+        let mut unique: Vec<Entry> = Vec::with_capacity(index.len());
+        for entry in index {
+            match unique.last_mut() {
+                Some(last) if last.word(&text) == entry.word(&text) => *last = entry,
+                _ => unique.push(entry),
+            }
+        }
+        text.shrink_to_fit();
+        Lexicon {
+            text,
+            index: unique,
+        }
     }
 }
 
@@ -93,32 +195,45 @@ impl Lexicon {
     /// Parse lines `word sym sym …` (one symbol per field; a later entry
     /// for the same word replaces an earlier one, as in sherpa-onnx).
     pub fn parse(text: &str) -> Result<Self, FormatError> {
-        let mut entries = HashMap::new();
+        let mut builder = LexiconBuilder::default();
+        builder.text.reserve(text.len());
         for (index, line) in text.lines().enumerate() {
             let mut fields = line.split_whitespace();
             let Some(word) = fields.next() else {
                 continue; // blank line
             };
-            let phonemes: String = fields.collect();
-            if phonemes.is_empty() {
-                return Err(FormatError {
+            builder
+                .insert(word, fields)
+                .map_err(|skipped| FormatError {
                     line: index + 1,
-                    message: "a word without phonemes",
-                });
-            }
-            entries.insert(word.to_lowercase(), phonemes);
+                    message: match skipped {
+                        Skipped::NoPhonemes => "a word without phonemes",
+                        Skipped::TooLarge => "the lexicon is larger than 4 GiB",
+                    },
+                })?;
         }
-        if entries.is_empty() {
+        if builder.index.is_empty() {
             return Err(FormatError {
                 line: 0,
                 message: "the lexicon is empty",
             });
         }
-        Ok(Self { entries })
+        Ok(builder.finish())
+    }
+
+    fn empty() -> Self {
+        LexiconBuilder::default().finish()
+    }
+
+    fn len(&self) -> usize {
+        self.index.len()
     }
 
     fn get(&self, word: &str) -> Option<&str> {
-        self.entries.get(word).map(String::as_str)
+        self.index
+            .binary_search_by(|entry| entry.word(&self.text).cmp(word))
+            .ok()
+            .map(|found| self.index[found].phonemes(&self.text))
     }
 }
 
@@ -172,7 +287,7 @@ impl fmt::Debug for Phonemizer {
 }
 
 /// Where the pronunciations of a text's words came from (word counts).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Tally {
     /// From the voice's own lexicon (also numbers read as words).
     pub lexicon: usize,
@@ -253,17 +368,14 @@ enum Piece {
 impl Phonemizer {
     /// The Kokoro lexicons of both accents, no fallback dictionary.
     pub fn new(us: Lexicon, gb: Lexicon, symbols: HashSet<char>) -> Self {
-        let empty = || Lexicon {
-            entries: HashMap::new(),
-        };
         Self {
             us: Dictionaries {
                 lexicon: us,
-                fallback: empty(),
+                fallback: Lexicon::empty(),
             },
             gb: Dictionaries {
                 lexicon: gb,
-                fallback: empty(),
+                fallback: Lexicon::empty(),
             },
             symbols,
         }
@@ -273,13 +385,17 @@ impl Phonemizer {
     /// entries its lexicon lacks, converted to misaki notation.
     pub fn with_fallback(mut self, cmudict: &str) -> Self {
         for (dictionaries, accent) in [(&mut self.us, Accent::Us), (&mut self.gb, Accent::Gb)] {
+            let mut fallback = LexiconBuilder::default();
             for line in cmudict.lines() {
                 if let Some((word, phonemes)) = arpabet::entry(line, accent)
                     && dictionaries.lexicon.get(&word).is_none()
                 {
-                    dictionaries.fallback.entries.insert(word, phonemes);
+                    // A converted entry always has phonemes (one or more
+                    // per ARPAbet phone); the dictionary is far below 4 GiB.
+                    let _ = fallback.insert(&word, [phonemes.as_str()]);
                 }
             }
+            dictionaries.fallback = fallback.finish();
         }
         self
     }
@@ -314,10 +430,7 @@ impl Phonemizer {
 
     /// Entries of the fallback dictionaries (US, UK), for the start log.
     pub fn fallback_sizes(&self) -> (usize, usize) {
-        (
-            self.us.fallback.entries.len(),
-            self.gb.fallback.entries.len(),
-        )
+        (self.us.fallback.len(), self.gb.fallback.len())
     }
 
     /// The phonemes of `text` in the given accent.
@@ -998,8 +1111,10 @@ a ˈ A
     #[test]
     fn r40_no_chunk_exceeds_the_limit_even_for_one_huge_word() {
         let mut chunks = Chunks::default();
+        // Five and a half chunks long: the comma after it still fits.
+        let huge = "b".repeat(MAX_CHUNK_SYMBOLS * 5 + MAX_CHUNK_SYMBOLS / 2);
         chunks.word("həlˈO");
-        chunks.word(&"ab".repeat(400));
+        chunks.word(&huge);
         chunks.pause(',');
         chunks.word("kˈæt");
         let done = chunks.finish();
@@ -1011,7 +1126,7 @@ a ˈ A
             .iter()
             .map(|c| c.chars().filter(|c| *c != ' ').count())
             .sum();
-        assert_eq!(symbols, 5 + 800 + 1 + 4);
+        assert_eq!(symbols, 5 + huge.len() + 1 + 4);
         // Hyphenated compounds and long numbers are several words each.
         for text in [["zxc"; 10].join("-"), "zxc".repeat(21)] {
             let p = us(&text);
@@ -1028,7 +1143,9 @@ a ˈ A
     #[test]
     fn r40_a_long_chunk_is_cut_at_its_last_pause() {
         let mut chunks = Chunks::default();
-        let word = "a".repeat(40);
+        // Three words and a comma fit in a chunk, four do not.
+        let word = "a".repeat(MAX_CHUNK_SYMBOLS / 4 + 3);
+        let w = word.len();
         for _ in 0..2 {
             chunks.word(&word);
         }
@@ -1040,7 +1157,7 @@ a ˈ A
         let done = chunks.finish();
         assert_eq!(done.len(), 2, "{done:?}");
         assert!(done[0].ends_with(','), "{done:?}");
-        assert_eq!(done[0].chars().count(), 82);
+        assert_eq!(done[0].chars().count(), 2 * w + 2);
         assert_eq!(done[1], format!("{word} {word}"));
         // No pause to cut at: the chunk ends before the word.
         let mut chunks = Chunks::default();
@@ -1050,7 +1167,7 @@ a ˈ A
         let done = chunks.finish();
         assert_eq!(
             done.iter().map(|c| c.chars().count()).collect::<Vec<_>>(),
-            [122, 40]
+            [3 * w + 2, w]
         );
     }
 

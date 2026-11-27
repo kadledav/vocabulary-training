@@ -31,7 +31,15 @@ Checks:
   and never kill the service, overlong words and numbers are refused with
   422, oversize/invalid/markup/non-JSON input is refused with 4xx, the process
   runs as UID 65532, the container's memory stays under the limit (not
-  OOM-killed) and the log never contains the spoken text.
+  OOM-killed) and the log never contains the spoken text;
+* memory (the model is loaded only while there is work, in an engine
+  process that ends when idle): after the start self-test and again after
+  the idle time (VOCAB_TTS_IDLE_SECONDS, short here) `/healthz` says the
+  engine is stopped and the container's anonymous memory (cgroup
+  `memory.stat`) is under IDLE_ANON_LIMIT; all of the above runs under
+  MEMORY_LIMIT. The cgroup numbers (current, peak, anon, file) are printed
+  at each step; where the cgroup cannot be read (not Linux, not Docker or
+  Podman) the memory checks are skipped, not failed.
 
 Every check runs even after a failure; dependents of a failed check are
 reported as skipped. Exit status non-zero if any check failed. Never pulls
@@ -59,11 +67,17 @@ import gha
 UID = "65532"
 PORT = "8090"
 SECURITY = ["--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--user", f"{UID}:{UID}"]
-# The Compose limits (deploy/docker-compose.example.yml); the spike measured
-# a peak of about 0.8 GiB (docs/design/tts-spike.md).
-MEMORY_LIMIT = "1280m"
-MEMORY_LIMIT_BYTES = 1280 * 1024 * 1024
-LIMITS = ["--memory", MEMORY_LIMIT, "--memory-swap", MEMORY_LIMIT, "--cpus", "2", "--pids-limit", "64"]
+# The Compose limits (deploy/docker-compose.example.yml; measured peak and
+# margin in docs/design/tts-spike.md, "Small memory").
+MEMORY_LIMIT = "512m"
+MEMORY_LIMIT_BYTES = 512 * 1024 * 1024
+LIMITS = ["--memory", MEMORY_LIMIT, "--memory-swap", MEMORY_LIMIT, "--cpus", "1", "--pids-limit", "64"]
+# The engine process ends after this long without work (the default is
+# minutes; short here so the test sees it).
+IDLE_SECONDS = 5
+# Anonymous memory of the container with no engine process: the HTTP front
+# alone (a few MiB).
+IDLE_ANON_LIMIT = 48 * 1024 * 1024
 LOG_TAIL = 30
 TARGET_LUFS = -16.0
 # Synthetic texts; a distinctive word to look for in the logs.
@@ -101,7 +115,7 @@ ALLOWED_EXECUTABLE = "vocab-tts"
 # libssl, …) and its dynamic loader: ELF, but not programs one can run.
 SHARED_LIBRARY = re.compile(r"^(?:usr/)?lib(?:64)?/(?:[^/]+/)*(?:[^/]*\.so(?:\.[0-9.]+)?|ld-linux[^/]*)$")
 ELF_MAGIC = b"\x7fELF"
-MODEL_FILES = ["model.onnx", "voices.bin", "tokens.txt", "lexicon-us-en.txt", "lexicon-gb-en.txt", "cmudict.dict"]
+MODEL_FILES = ["model.int8.onnx", "voices.bin", "tokens.txt", "lexicon-us-en.txt", "lexicon-gb-en.txt", "cmudict.dict"]
 LICENSE_FILES = ["LICENSE.txt", "THIRD-PARTY-NOTICES.txt", "SOURCE.md", "cmudict-LICENSE.txt",
                  "onnxruntime-ThirdPartyNotices.txt"]
 
@@ -242,6 +256,24 @@ def memory_bytes(text: str) -> int | None:
     return int(float(m.group(1)) * unit) if unit else None
 
 
+def cgroup_numbers(current: str, peak: str | None, stat: str) -> dict[str, int]:
+    """Bytes from a cgroup v2 memory controller: `memory.current`,
+    `memory.peak` (when the kernel has it) and `anon` / `file` of
+    `memory.stat`."""
+    numbers = {"current": int(current.strip())}
+    if peak is not None and peak.strip():
+        numbers["peak"] = int(peak.strip())
+    for line in stat.splitlines():
+        key, _, value = line.partition(" ")
+        if key in ("anon", "file"):
+            numbers[key] = int(value)
+    return numbers
+
+
+def mib(numbers: dict[str, int]) -> str:
+    return ", ".join(f"{key} {value / 2**20:.0f} MiB" for key, value in numbers.items())
+
+
 # ── HTTP ─────────────────────────────────────────────────────────────────────
 
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -276,6 +308,67 @@ def wait_healthy(base: str, name: str, timeout: float = 180) -> int:
             break
         time.sleep(0.5)
     return status
+
+
+# Where a container's cgroup is: Docker (systemd and cgroupfs drivers), Podman.
+CGROUP_DIRS = ["/sys/fs/cgroup/system.slice/docker-{id}.scope", "/sys/fs/cgroup/docker/{id}",
+               "/sys/fs/cgroup/machine.slice/libpod-{id}.scope"]
+
+
+def read_cgroup(container: str) -> dict[str, int] | None:
+    """The container's cgroup memory numbers, read on this machine (Linux)
+    or, for Podman on a Mac, inside the Podman machine; None if unreadable."""
+    cid = docker("inspect", "--format", "{{.Id}}", container, check=False).stdout.strip()
+    if not re.fullmatch(r"[0-9a-f]{64}", cid):
+        return None
+    for template in CGROUP_DIRS:
+        path = template.format(id=cid)
+        files = [f"{path}/memory.current", f"{path}/memory.stat", f"{path}/memory.peak"]
+        if sys.platform == "linux":
+            if not os.path.isfile(files[0]):
+                continue
+            try:
+                texts = [open(f).read() if os.path.isfile(f) else None for f in files]
+            except OSError:
+                continue
+        elif engine() == "podman":
+            script = f"cat {files[0]} && echo === && cat {files[1]} && echo === && (cat {files[2]} 2>/dev/null || true)"
+            result = docker("machine", "ssh", script, check=False, timeout=60)
+            if result.returncode != 0 or "===" not in result.stdout:
+                continue
+            texts = result.stdout.split("===\n")
+        else:
+            return None
+        try:
+            return cgroup_numbers(texts[0], texts[2] if len(texts) > 2 else None, texts[1])
+        except (ValueError, TypeError, IndexError):
+            return None
+    return None
+
+
+def engine_state(base: str) -> str:
+    """`engine` of /healthz: "running" or "stopped" (or what went wrong)."""
+    try:
+        status, _, body = http("GET", f"{base}/healthz")
+        return json.loads(body).get("engine", "?") if status == 200 else f"status {status}"
+    except (urllib.error.URLError, ConnectionError, OSError, ValueError) as err:
+        return f"unreachable: {err}"
+
+
+def memory_check(name: str, when: str, idle: bool) -> None:
+    """Print the cgroup numbers; when `idle`, the anonymous memory must be
+    the front's alone."""
+    numbers = read_cgroup(name)
+    if numbers is None:
+        print(f"memory {when}: cgroup not readable here; docker stats: "
+              f"{docker('stats', '--no-stream', '--format', '{{.MemUsage}}', name, check=False).stdout.strip()}")
+        if idle:
+            skip([f"memory {when}: anonymous memory under {IDLE_ANON_LIMIT >> 20} MiB"], "cgroup not readable here")
+        return
+    print(f"memory {when}: {mib(numbers)}")
+    if idle:
+        check(numbers.get("anon", IDLE_ANON_LIMIT) < IDLE_ANON_LIMIT,
+              f"memory {when}: anonymous memory under {IDLE_ANON_LIMIT >> 20} MiB", mib(numbers))
 
 
 def container_log(name: str) -> str:
@@ -355,7 +448,8 @@ def offline_checks(image: str, name: str) -> None:
 
 def api_checks(image: str, name: str) -> None:
     started = guarded("api container", lambda: docker(
-        "run", "-d", "--pull=never", "--name", name, "-p", f"127.0.0.1::{PORT}", *SECURITY, *LIMITS, image))
+        "run", "-d", "--pull=never", "--name", name, "-p", f"127.0.0.1::{PORT}", *SECURITY, *LIMITS,
+        "-e", f"VOCAB_TTS_IDLE_SECONDS={IDLE_SECONDS}", image))
     if not started:
         skip(["API checks"], "the container did not start")
         docker("rm", "-f", name, check=False)
@@ -372,6 +466,9 @@ def api_checks(image: str, name: str) -> None:
         status, _, body = http("GET", f"{base}/v1/voices")
         ids = [v.get("id") for v in json.loads(body).get("voices", [])] if status == 200 else []
         check(ids == ["af_heart", "bf_emma"], "/v1/voices lists the US and the UK voice", f"{status} {ids}")
+        state = engine_state(base)
+        check(state == "stopped", "after the start self-test the engine process is stopped", state)
+        memory_check(name, "after the start (idle)", idle=True)
 
         for label, payload, min_ms, max_ms in [
             ("a sentence (US voice)", {"text": SENTENCE}, 2500, 8000),
@@ -431,6 +528,12 @@ def api_checks(image: str, name: str) -> None:
         for label, (status, _, body), expected in refused:
             check(status == expected, f"refused: {label} ({expected})", f"{status} {body[:200]!r}")
 
+        memory_check(name, "after all requests", idle=False)
+        deadline = time.monotonic() + IDLE_SECONDS + 30
+        while (state := engine_state(base)) != "stopped" and time.monotonic() < deadline:
+            time.sleep(1)
+        check(state == "stopped", f"the engine process ends after {IDLE_SECONDS} s without work", state)
+        memory_check(name, "after the idle time", idle=True)
         result = docker("exec", name, "/vocab-tts", "healthcheck", check=False)
         check(result.returncode == 0, "the healthcheck subcommand passes", one_line(result.stderr + result.stdout))
         uids = process_uids(docker(*top_args(name)).stdout)

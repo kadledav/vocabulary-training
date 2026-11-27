@@ -1,29 +1,33 @@
 //! Command line entry point of the TTS service.
 //!
 //! Subcommands:
-//! * `serve` (default): load the lexicons and the model, check that the
-//!   engine speaks, then serve HTTP.
+//! * `serve` (default): the HTTP front; it checks once that the engine
+//!   speaks (a self-test in an engine process), then serves HTTP. The engine
+//!   process runs only while there is work (`vocab_tts::worker`).
+//! * `worker`: the engine process (started by `serve`, not by hand).
 //! * `healthcheck`: `GET /healthz` on the local listener; exit 0 when
 //!   healthy (the runtime image has no shell or curl).
 
 use std::process::ExitCode;
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
 use vocab_tts::config::Config;
-use vocab_tts::engine;
 use vocab_tts::http;
-use vocab_tts::phonemize::Phonemizer;
 use vocab_tts::speaker::Speaker;
 use vocab_tts::speech::{SpeakText, Speed, Voice};
+use vocab_tts::worker::{self, Worker, WorkerCommand};
 
 const USAGE: &str = "usage: vocab-tts [serve | healthcheck]
 
-  serve        load the model and serve the TTS API (default)
+  serve        serve the TTS API (default); the model is loaded in an
+               engine process while there is work
   healthcheck  GET /healthz on the local listener; exit code 0 when healthy
 
 Configuration (environment): $VOCAB_TTS_LISTEN (default 0.0.0.0:8090),
-$VOCAB_TTS_MODEL_DIR (default /model), $VOCAB_TTS_THREADS (default 2),
-$VOCAB_TTS_LOG_LEVEL (default info). No secrets.";
+$VOCAB_TTS_MODEL_DIR (default /model), $VOCAB_TTS_THREADS (default 1),
+$VOCAB_TTS_IDLE_SECONDS (default 180), $VOCAB_TTS_LOG_LEVEL (default info).
+No secrets.";
 
 /// Requests that may wait while one is being synthesised (the app sends
 /// one at a time; a few more absorb retries and manual checks).
@@ -40,6 +44,7 @@ fn main() -> ExitCode {
         .as_slice()
     {
         [] | ["serve"] => serve(),
+        [worker::SUBCOMMAND] => run_worker(),
         ["healthcheck"] => healthcheck(),
         ["help" | "-h" | "--help"] => {
             println!("{USAGE}");
@@ -77,6 +82,21 @@ fn healthcheck() -> ExitCode {
     }
 }
 
+/// The engine process: its stdout is the protocol, so it logs to stderr.
+fn run_worker() -> ExitCode {
+    let config = match load_config() {
+        Ok(config) => config,
+        Err(code) => return code,
+    };
+    tracing_subscriber::fmt()
+        .with_max_level(config.log_level)
+        .with_target(false)
+        .with_ansi(false)
+        .with_writer(std::io::stderr)
+        .init();
+    worker::run(&config.model_dir, config.threads)
+}
+
 fn serve() -> ExitCode {
     let config = match load_config() {
         Ok(config) => config,
@@ -87,10 +107,10 @@ fn serve() -> ExitCode {
         .with_target(false)
         .with_ansi(false)
         .init();
-    let speaker = match load_speaker(&config) {
-        Ok(speaker) => speaker,
-        Err(message) => {
-            tracing::error!("{message}");
+    let command = match WorkerCommand::this_binary() {
+        Ok(command) => command,
+        Err(err) => {
+            tracing::error!(error = %err, "cannot find this program to start the engine process");
             return ExitCode::FAILURE;
         }
     };
@@ -106,15 +126,31 @@ fn serve() -> ExitCode {
         }
     };
     let result = runtime.block_on(async {
+        let worker = Worker::new(command, config.idle);
+        worker.watch_idle();
+        let speaker = Speaker::new(Arc::clone(&worker) as _, WAITING_REQUESTS);
+        if let Err(message) = self_test(&speaker).await {
+            tracing::error!("{message}");
+            return Ok(false);
+        }
+        // Nothing to do yet: give the memory back until the first request.
+        worker.release().await;
         let listener = tokio::net::TcpListener::bind(config.listen).await?;
-        tracing::info!(listen = %listener.local_addr()?, "serving");
-        http::serve(listener, http::app(speaker), shutdown_signal()).await
+        tracing::info!(
+            listen = %listener.local_addr()?,
+            threads = config.threads,
+            idle_s = config.idle.as_secs(),
+            "serving"
+        );
+        http::serve(listener, http::app(speaker), shutdown_signal()).await?;
+        Ok::<_, std::io::Error>(true)
     });
     match result {
-        Ok(()) => {
+        Ok(true) => {
             tracing::info!("stopped");
             ExitCode::SUCCESS
         }
+        Ok(false) => ExitCode::FAILURE,
         Err(err) => {
             tracing::error!(error = %err, "server failed");
             ExitCode::FAILURE
@@ -122,29 +158,14 @@ fn serve() -> ExitCode {
     }
 }
 
-/// Lexicons, model, and a self-test of every voice; any failure is a clear
-/// startup error.
-fn load_speaker(config: &Config) -> Result<std::sync::Arc<Speaker>, String> {
-    let started = Instant::now();
-    let phonemizer = Phonemizer::load(&config.model_dir)
-        .map_err(|err| format!("cannot load the lexicons: {err}"))?;
-    let lexicons_ms = started.elapsed().as_millis();
-    let started = Instant::now();
-    let engine = engine::load(&config.model_dir, config.threads)
-        .map_err(|err| format!("cannot load the model: {err}"))?;
-    tracing::info!(
-        model_dir = %config.model_dir.display(),
-        threads = config.threads,
-        lexicons_ms,
-        fallback_entries = ?phonemizer.fallback_sizes(),
-        model_ms = started.elapsed().as_millis(),
-        "model loaded"
-    );
-    let speaker = Speaker::new(phonemizer, engine, WAITING_REQUESTS);
-    let text = SpeakText::new(SELF_TEST_TEXT).map_err(|err| err.to_string())?;
+/// Every voice speaks once, in an engine process, through the same path as
+/// a request: lexicons, model and the process protocol work.
+async fn self_test(speaker: &Arc<Speaker>) -> Result<(), String> {
     for voice in Voice::ALL {
+        let text = SpeakText::new(SELF_TEST_TEXT).map_err(|err| err.to_string())?;
         let spoken = speaker
-            .speak_now(&text, voice, Speed::NORMAL)
+            .speak(text, voice, Speed::NORMAL)
+            .await
             .map_err(|err| format!("self-test with voice {} failed: {err}", voice.id()))?;
         tracing::info!(
             voice = voice.id(),
@@ -153,7 +174,7 @@ fn load_speaker(config: &Config) -> Result<std::sync::Arc<Speaker>, String> {
             "self-test passed"
         );
     }
-    Ok(speaker)
+    Ok(())
 }
 
 /// Resolves on SIGTERM (`docker stop`) or Ctrl-C.

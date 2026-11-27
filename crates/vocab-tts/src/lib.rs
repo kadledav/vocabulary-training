@@ -9,7 +9,9 @@
 //! Modules: `config` (environment), `speech` (validated request values),
 //! `phonemize` (text to phonemes, US/UK lexicons), `engine` (Kokoro behind
 //! the `Synthesizer` trait), `postprocess` (trim, loudness, MP3), `speaker`
-//! (the pipeline, one synthesis at a time), `http` (API, limits, logs).
+//! (the pipeline, one synthesis at a time), `worker` (the engine process:
+//! the model is in memory only while there is work), `http` (API, limits,
+//! logs).
 
 pub mod config;
 pub mod engine;
@@ -18,3 +20,4 @@ pub mod phonemize;
 pub mod postprocess;
 pub mod speaker;
 pub mod speech;
+pub mod worker;
