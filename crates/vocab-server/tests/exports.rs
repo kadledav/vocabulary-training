@@ -16,6 +16,7 @@ use rusqlite::Connection;
 use rusqlite::types::Value as SqlValue;
 use serde_json::{Value, json};
 use tower::ServiceExt;
+use vocab_server::config::Limits;
 
 const BOOK: &str = "test-export-book";
 
@@ -601,4 +602,118 @@ async fn r72_r86_large_history_progress_is_fast_and_the_export_streams_one_at_a_
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     assert!(counts.contains_key("ok"), "a later export runs");
+}
+
+/// `PRAGMA wal_checkpoint(PASSIVE)` on a connection of its own: (busy,
+/// frames in the WAL, frames checkpointed).
+fn checkpoint(env: &Env) -> (i64, i64, i64) {
+    env.sql()
+        .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .expect("checkpoint")
+}
+
+#[tokio::test]
+async fn r86_a_stalled_download_is_broken_off_and_never_holds_the_snapshot() {
+    let idle_ms = 300;
+    let env = common::env_with_limits(&Limits {
+        export_idle_ms: idle_ms,
+        ..Limits::default()
+    });
+    large_history(&env);
+
+    // A client that never reads its download.
+    let stalled = env
+        .router
+        .clone()
+        .oneshot(
+            Request::get("/api/export/full")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(stalled.status(), StatusCode::OK);
+    let length: usize = stalled.headers()[header::CONTENT_LENGTH]
+        .to_str()
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .expect("Content-Length");
+    let (status, body) = env.get("/api/export/full").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+
+    // The database snapshot is already given back while the download
+    // stalls: what is written now can be checkpointed completely.
+    env.exec("UPDATE card SET reps = reps + 1");
+    let (busy, frames, done) = checkpoint(&env);
+    assert_eq!(busy, 0);
+    assert!(frames > 0);
+    assert_eq!(frames, done, "every WAL frame checkpointed");
+
+    // The stalled download is broken off after the idle timeout and the
+    // next export runs.
+    let started = Instant::now();
+    let next = loop {
+        let (status, _, bytes) = download(&env, "/api/export/full").await;
+        if status == StatusCode::OK {
+            break bytes;
+        }
+        assert!(
+            started.elapsed().as_millis() < u128::from(idle_ms) + 2000,
+            "still busy after {} ms",
+            started.elapsed().as_millis()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    };
+    let export: Value = serde_json::from_slice(&next).expect("complete JSON");
+    assert_eq!(export["words"]["rows"].as_array().map(Vec::len), Some(5000));
+
+    // The stalled client gets a broken body, never a complete-looking file.
+    let broken = to_bytes(stalled.into_body(), 512 << 20).await;
+    assert!(broken.is_err(), "the stalled download must not end cleanly");
+    assert!(length > 0);
+}
+
+#[tokio::test]
+async fn r86_a_slow_but_steady_download_is_never_cut_off() {
+    use http_body_util::BodyExt;
+    let idle_ms = 200;
+    let env = common::env_with_limits(&Limits {
+        export_idle_ms: idle_ms,
+        ..Limits::default()
+    });
+    large_history(&env);
+    let response = env
+        .router
+        .clone()
+        .oneshot(
+            Request::get("/api/export/full")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+    let mut bytes = Vec::new();
+    let started = Instant::now();
+    let mut frames = 0;
+    while let Some(frame) = body.frame().await {
+        let frame = frame.expect("no error while the client keeps reading");
+        if let Ok(data) = frame.into_data() {
+            bytes.extend_from_slice(&data);
+        }
+        frames += 1;
+        // Several idle timeouts in all, each step well within one.
+        if frames <= 25 {
+            tokio::time::sleep(std::time::Duration::from_millis(idle_ms / 3)).await;
+        }
+    }
+    assert!(started.elapsed().as_millis() > u128::from(idle_ms) * 4);
+    let export: Value = serde_json::from_slice(&bytes).expect("complete JSON");
+    assert_eq!(
+        export["reviews"]["rows"].as_array().map(Vec::len),
+        Some(100_000)
+    );
 }

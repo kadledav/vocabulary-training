@@ -62,11 +62,13 @@ tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "std"] }
 # NFC normalisation for identity keys and stored text (design §5.3).
 unicode-normalization = "=0.1.26"
+# Anonymous temporary file the full export is spooled to (vocab-server);
+# also the test harness's temporary directories.
+tempfile = "=3.27.0"
 # dev-dependencies
 # Schema <-> importer conformance test (design §5.2). Default features off:
 # no HTTP/file resolving of $refs, the schema is self-contained.
 jsonschema = { version = "=0.60.2", default-features = false }
-tempfile = "=3.27.0"
 tower = { version = "=0.5.3", default-features = false, features = ["util"] }
 
 [workspace.lints.rust]

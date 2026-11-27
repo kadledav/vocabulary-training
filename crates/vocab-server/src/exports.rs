@@ -9,7 +9,8 @@
 //!   row to any [`Write`], never collected, so the HTTP layer can stream it.
 
 use std::collections::HashSet;
-use std::io::Write;
+use std::fs::File;
+use std::io::{BufWriter, Seek, Write};
 
 use rusqlite::Connection;
 use serde::Serialize;
@@ -85,6 +86,10 @@ pub enum ExportError {
     Io(#[from] std::io::Error),
     #[error("encoding the export: {0}")]
     Json(#[from] serde_json::Error),
+    /// Spooling the full export would leave less than
+    /// [`SPOOL_RESERVE_BYTES`] free next to the database.
+    #[error("not enough free disk space to prepare the export")]
+    NoSpace,
 }
 
 impl From<TableError> for ExportError {
@@ -203,4 +208,116 @@ pub fn write_full(conn: &Connection, out: impl Write, now: &Moment) -> Result<()
     tables.out.write_all(b"\n}\n")?;
     tables.out.flush()?;
     Ok(())
+}
+
+/// Free space the spooled full export leaves untouched on the database's
+/// filesystem: the database (its WAL, a migration) needs room more than a
+/// download does.
+pub const SPOOL_RESERVE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// A [`Write`] that refuses to grow past `budget` bytes.
+#[derive(Debug)]
+struct Bounded<W: Write> {
+    out: W,
+    written: u64,
+    budget: u64,
+    over: bool,
+}
+
+impl<W: Write> Write for Bounded<W> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
+        if self.written.saturating_add(len) > self.budget {
+            self.over = true;
+            return Err(std::io::ErrorKind::StorageFull.into());
+        }
+        let n = self.out.write(data)?;
+        self.written += u64::try_from(n).unwrap_or(u64::MAX);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.out.flush()
+    }
+}
+
+/// The full export, written completely to `file` and rewound to its start
+/// (ready to be sent), with its length.
+#[derive(Debug)]
+pub struct Spooled {
+    pub file: File,
+    pub len: u64,
+}
+
+/// Write the full export (as [`write_full`]) to the empty scratch `file`
+/// on a filesystem with `free_bytes` free, so the database snapshot it
+/// reads is given back as soon as the export is written, not when a slow
+/// client has downloaded it (design §8.1). Stops with
+/// [`ExportError::NoSpace`] before the export would leave less than
+/// [`SPOOL_RESERVE_BYTES`] free.
+pub fn spool_full(
+    conn: &Connection,
+    file: File,
+    free_bytes: u64,
+    now: &Moment,
+) -> Result<Spooled, ExportError> {
+    let mut out = BufWriter::new(Bounded {
+        out: file,
+        written: 0,
+        budget: free_bytes.saturating_sub(SPOOL_RESERVE_BYTES),
+        over: false,
+    });
+    let written = write_full(conn, &mut out, now);
+    let over = out.get_ref().over;
+    match written {
+        Err(_) if over => return Err(ExportError::NoSpace),
+        Err(err) => return Err(err),
+        Ok(()) => {}
+    }
+    let bounded = out.into_inner().map_err(|err| err.into_error())?;
+    let mut file = bounded.out;
+    file.rewind()?;
+    Ok(Spooled {
+        file,
+        len: bounded.written,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn moment() -> Moment {
+        let rule = crate::clock::DayRule::new("UTC", 4).expect("rule");
+        Moment::of("2026-11-20T09:00:00Z".parse().expect("time"), &rule)
+    }
+
+    #[test]
+    fn r86_spool_is_complete_and_rewound_or_refused_without_room() {
+        let dir = tempfile::tempdir().expect("dir");
+        drop(Db::open(dir.path()).expect("db"));
+        let db_conn = Connection::open(dir.path().join("vocabulary.sqlite")).expect("conn");
+        let now = moment();
+        let spooled = spool_full(
+            &db_conn,
+            tempfile::tempfile().expect("file"),
+            SPOOL_RESERVE_BYTES + (1 << 20),
+            &now,
+        )
+        .expect("spooled");
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut { spooled.file }, &mut text).expect("read");
+        assert_eq!(u64::try_from(text.len()).ok(), Some(spooled.len));
+        let value: Value = serde_json::from_str(&text).expect("complete JSON");
+        assert_eq!(value["format"], FULL_FORMAT);
+
+        // Too little room: refused, never a cut-off file passed on.
+        let refused = spool_full(
+            &db_conn,
+            tempfile::tempfile().expect("file"),
+            SPOOL_RESERVE_BYTES + 100,
+            &now,
+        );
+        assert!(matches!(refused, Err(ExportError::NoSpace)), "{refused:?}");
+    }
 }

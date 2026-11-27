@@ -185,7 +185,19 @@ impl Db {
         known_version()
     }
 
-    /// Run long read-only work (a streamed export) on a connection of its
+    /// Scratch space on the database's own filesystem (the data directory,
+    /// writable wherever the database is): an anonymous temporary file
+    /// (unlinked at once, so it is gone when closed, even after a crash, and
+    /// never shows up next to the database) and the bytes that filesystem
+    /// has free for it. Blocking: call it from blocking work.
+    pub fn scratch_file(&self) -> std::io::Result<(std::fs::File, u64)> {
+        let dir = self.path.parent().unwrap_or_else(|| Path::new("."));
+        let stat = rustix::fs::statvfs(dir).map_err(std::io::Error::from)?;
+        let free = stat.f_bavail.saturating_mul(stat.f_frsize);
+        Ok((tempfile::tempfile_in(dir)?, free))
+    }
+
+    /// Run long read-only work (an export) on a connection of its
     /// own, so the shared connection stays free for everything else. The
     /// closure sees one consistent snapshot (WAL: writers go on meanwhile)
     /// and the connection is opened read-only.

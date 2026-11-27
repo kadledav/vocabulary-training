@@ -162,6 +162,9 @@ pub struct AppState {
     /// One full export at a time (it streams after its request slot is
     /// given back, design §8.1).
     export_turn: Arc<Semaphore>,
+    /// A full export download that takes no chunk for this long is broken
+    /// off (set by [`app`] from the limits).
+    export_idle: Duration,
 }
 
 impl AppState {
@@ -183,6 +186,7 @@ impl AppState {
             body_read_timeout: limits.request_timeout(),
             audio: None,
             export_turn: Arc::new(Semaphore::new(1)),
+            export_idle: limits.export_idle(),
         }
     }
 
@@ -499,6 +503,7 @@ pub fn app(state: AppState, limits: &Limits) -> Router {
         import_body_bytes: limits.import_body_bytes,
         import_wait: limits.slot_wait(),
         body_read_timeout: limits.request_timeout(),
+        export_idle: limits.export_idle(),
         ..state
     };
     let standard = TimeoutPolicy {
@@ -1917,92 +1922,43 @@ const EXPORT_CHUNK_BYTES: usize = 64 * 1024;
 /// Chunks waiting for a slow client (memory per export: about this many
 /// chunks, whatever the export's size).
 const EXPORT_CHUNKS_QUEUED: usize = 4;
-/// A full export that takes longer (a client reading very slowly) is cut
-/// off: its own database connection and the export turn are given back.
-const EXPORT_DEADLINE: Duration = Duration::from_secs(600);
 
-/// Sends what the full export writes to the response body, chunk by chunk,
-/// from the blocking thread that reads the database.
-struct ChunkWriter {
-    sender: Option<http_body_util::channel::Sender<axum::body::Bytes, std::io::Error>>,
-    buffer: Vec<u8>,
-    runtime: tokio::runtime::Handle,
-    deadline: tokio::time::Instant,
-}
-
-impl std::fmt::Debug for ChunkWriter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ChunkWriter")
-            .field("buffered", &self.buffer.len())
-            .finish_non_exhaustive()
-    }
-}
-
-impl ChunkWriter {
-    fn send(&mut self) -> std::io::Result<()> {
-        if self.buffer.is_empty() {
-            return Ok(());
-        }
-        let chunk = axum::body::Bytes::from(std::mem::replace(
-            &mut self.buffer,
-            Vec::with_capacity(EXPORT_CHUNK_BYTES),
-        ));
-        let Some(sender) = self.sender.as_mut() else {
-            return Err(std::io::ErrorKind::BrokenPipe.into());
+/// Send the spooled export `file` to the body `sender` chunk by chunk
+/// (blocking: it runs on the blocking pool). A chunk the client does not
+/// take within `idle` (a stalled download) stops the download; a download
+/// that keeps moving is never cut off, however long it takes.
+fn send_spooled(
+    mut file: std::fs::File,
+    sender: &mut http_body_util::channel::Sender<axum::body::Bytes, std::io::Error>,
+    runtime: &tokio::runtime::Handle,
+    idle: Duration,
+) -> std::io::Result<()> {
+    let mut buffer = vec![0; EXPORT_CHUNK_BYTES];
+    loop {
+        let n = match std::io::Read::read(&mut file, &mut buffer) {
+            Ok(0) => return Ok(()),
+            Ok(n) => n,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
         };
-        let deadline = self.deadline;
-        match self
-            .runtime
-            .block_on(tokio::time::timeout_at(deadline, sender.send_data(chunk)))
-        {
-            Ok(Ok(())) => Ok(()),
+        let chunk = axum::body::Bytes::copy_from_slice(&buffer[..n]);
+        match runtime.block_on(tokio::time::timeout(idle, sender.send_data(chunk))) {
+            Ok(Ok(())) => {}
             // The client went away.
-            Ok(Err(_)) => Err(std::io::ErrorKind::BrokenPipe.into()),
-            Err(_) => Err(std::io::ErrorKind::TimedOut.into()),
+            Ok(Err(_)) => return Err(std::io::ErrorKind::BrokenPipe.into()),
+            Err(_) => return Err(std::io::ErrorKind::TimedOut.into()),
         }
-    }
-
-    /// End the body with an error: the client sees a broken download, never
-    /// a complete-looking file.
-    fn abort(&mut self, err: std::io::Error) {
-        if let Some(sender) = self.sender.take() {
-            sender.abort(err);
-        }
-    }
-
-    /// The export is complete: end the body normally.
-    fn finish(&mut self) {
-        self.sender = None;
-    }
-}
-
-impl Drop for ChunkWriter {
-    /// Dropped before [`ChunkWriter::finish`] (the export never ran, or
-    /// panicked): the download fails instead of ending cleanly.
-    fn drop(&mut self) {
-        self.abort(std::io::Error::other("the export did not complete"));
-    }
-}
-
-impl Write for ChunkWriter {
-    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        self.buffer.extend_from_slice(data);
-        if self.buffer.len() >= EXPORT_CHUNK_BYTES {
-            self.send()?;
-        }
-        Ok(data.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.send()
     }
 }
 
 /// `GET /api/export/full`: everything as one JSON download (R-86, design
-/// §8.1), streamed: a separate read-only connection reads one consistent
-/// snapshot row by row while the client downloads, so neither the export
-/// nor the shared connection is held by a slow download. One export at a
-/// time (`503 busy` otherwise); cut off after 10 minutes.
+/// §8.1). A separate read-only connection writes one consistent snapshot
+/// to an anonymous file next to the database (`507 no_space` when that
+/// would leave too little free), the snapshot is given back at once, and
+/// the file is then streamed: a slow download holds neither the snapshot
+/// (WAL checkpoints go on) nor the shared connection. One export at a time
+/// (`503 busy` otherwise); a download that stalls for the idle timeout is
+/// broken off (never a complete-looking file) and gives the turn back.
 async fn export_full(State(state): State<AppState>) -> Response {
     let Ok(turn) = Arc::clone(&state.export_turn).try_acquire_owned() else {
         return busy(
@@ -2011,33 +1967,48 @@ async fn export_full(State(state): State<AppState>) -> Response {
         );
     };
     let now = state.moment();
-    let (sender, body) = http_body_util::channel::Channel::<axum::body::Bytes, std::io::Error>::new(
-        EXPORT_CHUNKS_QUEUED,
-    );
-    let mut writer = ChunkWriter {
-        sender: Some(sender),
-        buffer: Vec::with_capacity(EXPORT_CHUNK_BYTES),
-        runtime: tokio::runtime::Handle::current(),
-        deadline: tokio::time::Instant::now() + EXPORT_DEADLINE,
-    };
     let db = state.db.clone();
-    tokio::spawn(async move {
+    let spooled = state
+        .db
+        .read_detached(move |conn| {
+            let (file, free) = db.scratch_file().map_err(ExportError::from)?;
+            exports::spool_full(conn, file, free, &now).map_err(ApiError::from)
+        })
+        .await;
+    let spooled = match spooled {
+        Ok(spooled) => spooled,
+        Err(ApiError::Export(ExportError::NoSpace)) => {
+            return error_response(
+                StatusCode::INSUFFICIENT_STORAGE,
+                "no_space",
+                "The server has too little free disk space to prepare the export.",
+            );
+        }
+        Err(err) => return api_error(&err),
+    };
+    let (mut sender, body) =
+        http_body_util::channel::Channel::<axum::body::Bytes, std::io::Error>::new(
+            EXPORT_CHUNKS_QUEUED,
+        );
+    let runtime = tokio::runtime::Handle::current();
+    let idle = state.export_idle;
+    tokio::task::spawn_blocking(move || {
         let _turn = turn;
-        let result = db
-            .read_detached(move |conn| {
-                let written = exports::write_full(conn, &mut writer, &now);
-                match &written {
-                    Ok(()) => writer.finish(),
-                    Err(err) => writer.abort(std::io::Error::other(err.to_string())),
-                }
-                written
-            })
-            .await;
-        if let Err(err) = result {
-            tracing::warn!(error = %err, "full export stopped");
+        match send_spooled(spooled.file, &mut sender, &runtime, idle) {
+            // Dropping the sender ends the body normally.
+            Ok(()) => drop(sender),
+            Err(err) => {
+                tracing::warn!(error = %err, "full export download stopped");
+                // The client sees a broken download, never a complete-looking
+                // file.
+                sender.abort(err);
+            }
         }
     });
     let mut response = Body::new(body).into_response();
+    if let Ok(len) = HeaderValue::from_str(&spooled.len.to_string()) {
+        response.headers_mut().insert(header::CONTENT_LENGTH, len);
+    }
     download_headers(&mut response, &format!("vocab-export-{}.json", now.day));
     response
 }
