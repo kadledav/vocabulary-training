@@ -15,7 +15,7 @@ import { leechActions } from '../leech.js';
 
 /**
  * @typedef {import('../session.js').Item} Item
- * @typedef {{ action: import('../progress-model.js').LeechActionName, text: string }} LeechDone
+ * @typedef {{ action: import('../progress-model.js').LeechActionName, text: string, undo: string | null }} LeechDone
  */
 
 /**
@@ -66,9 +66,9 @@ export function leechPanel(item, done, onDone, isCurrent) {
       choices,
       leechActions(
         { id: word.id, headword: word.headword, usefulness: answer.data.usefulness, goal: answer.data.effective_goal },
-        ({ action, text }) => {
+        ({ action, text, answer: done }) => {
           facts.delete(word.id);
-          onDone({ action, text });
+          onDone({ action, text, undo: typeof done.undo === 'string' ? done.undo : null });
         },
       ),
     );

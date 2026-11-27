@@ -32,8 +32,8 @@ pub use progress::{
     DayActivity, RecallTally, acknowledge_leech, activity, export, leech_flagged, recall_tallies,
 };
 pub use review::{
-    AnswerMatch, LeechReason, RawGrade, ReviewInput, ReviewOutcome, StoredReview, UndoOutcome,
-    UnlockedCard, card_as_rated, find_review, raw_grade, record_review, review_outcome,
+    AnswerMatch, LeechReason, RatingUndo, RawGrade, ReviewInput, ReviewOutcome, StoredReview,
+    UndoOutcome, UnlockedCard, find_review, rating_undo, raw_grade, record_review, review_outcome,
     undo_review,
 };
 

@@ -463,16 +463,37 @@ pub fn record_review(
     })
 }
 
-/// Is the card of review `id` still as that rating left it (its latest
-/// review is this one)? Not after "Reset card": undoing the rating would
-/// then bring back the state the owner reset.
-pub fn card_as_rated(conn: &Connection, id: ReviewId) -> rusqlite::Result<bool> {
-    conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM review_log r JOIN card c ON c.id = r.card_id \
-         WHERE r.id = ?1 AND c.last_review_at IS r.reviewed_at)",
-        [id.0],
-        |row| row.get(0),
-    )
+/// Can review `id` be undone, as far as its card goes?
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RatingUndo {
+    /// The card is as that rating left it.
+    Possible,
+    /// The card was changed since ("Reset card", or reviewed again):
+    /// undoing would bring back the state the owner reset.
+    CardChanged,
+    /// A problem-word choice acknowledged the card after this rating
+    /// (design §6.5): undoing the rating would take back the
+    /// acknowledgement but leave the choice. The choice's own Undo comes
+    /// first.
+    LeechChoiceSince,
+}
+
+/// Whether review `id` can be undone (see [`RatingUndo`]).
+pub fn rating_undo(conn: &Connection, id: ReviewId) -> rusqlite::Result<RatingUndo> {
+    let found: Option<(bool, bool)> = conn
+        .query_row(
+            "SELECT c.last_review_at IS r.reviewed_at, \
+               COALESCE(c.leech_acked_after >= r.id, 0) \
+             FROM review_log r JOIN card c ON c.id = r.card_id WHERE r.id = ?1",
+            [id.0],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    Ok(match found {
+        Some((true, false)) => RatingUndo::Possible,
+        Some((true, true)) => RatingUndo::LeechChoiceSince,
+        _ => RatingUndo::CardChanged,
+    })
 }
 
 /// Undo one review (design §6.7.9): the card's scheduling state is

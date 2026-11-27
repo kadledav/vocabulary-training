@@ -18,6 +18,17 @@ import { leechChoices, leechDoneText, lowerUsefulness } from './progress-model.j
  */
 
 /**
+ * Undo a choice (`token`: the `undo` of its answer): the word and its cards
+ * exactly as before (`409 undo_unavailable` once the word changed since).
+ *
+ * @param {number} id the word
+ * @param {string} token
+ */
+export function undoLeechChoice(id, token) {
+  return postJson(`/api/words/${id}/undo`, { token });
+}
+
+/**
  * The choice buttons for word `word`.
  *
  * @param {{ id: number, headword: string, usefulness: number, goal: 'active' | 'recognise' }} word

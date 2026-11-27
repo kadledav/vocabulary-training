@@ -339,6 +339,12 @@ pub enum SessionError {
     /// detail): restoring the state before the rating would undo that too.
     #[error("the last rating cannot be undone: its card was reset since")]
     CardChangedSince,
+    /// A problem-word choice was made after the last rating (design §6.5):
+    /// its Undo comes first.
+    #[error(
+        "You chose what to do with this problem word after this rating. Undo that choice first, then the rating."
+    )]
+    LeechChoiceSince,
     #[error("{0}")]
     Invalid(String),
     #[error("random source failed: {0}")]

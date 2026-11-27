@@ -95,10 +95,13 @@ pub fn activity(
 /// The owner saw the leech screen of word `word` and chose what to do
 /// (design §6.5): every flagged card of the word becomes `acknowledged`
 /// and counts its lapses from now on, so four further lapses flag it
-/// again. Returns how many cards were flagged.
+/// again. The card's ratings so far cannot be undone while the choice
+/// stands (`leech_acked_after`, see [`super::rating_undo`]). Returns how
+/// many cards were flagged.
 pub fn acknowledge_leech(tx: &Transaction<'_>, word: WordId) -> rusqlite::Result<usize> {
     tx.execute(
-        "UPDATE card SET leech = 'acknowledged', leech_lapses_at_ack = lapses \
+        "UPDATE card SET leech = 'acknowledged', leech_lapses_at_ack = lapses, \
+         leech_acked_after = (SELECT MAX(r.id) FROM review_log r WHERE r.card_id = card.id) \
          WHERE word_id = ?1 AND leech = 'flagged'",
         [word.get()],
     )
@@ -168,6 +171,7 @@ mod tests {
             leech,
             leech_lapses_at_ack: at_ack,
             suspended: false,
+            leech_acked_after: None,
         }
     }
 

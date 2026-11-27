@@ -283,6 +283,7 @@ mod tests {
             leech: LeechState::None,
             leech_lapses_at_ack: 0,
             suspended: false,
+            leech_acked_after: None,
         };
         let m = Model::default_parameters();
         assert_eq!(m.priority(&card, &word(10), day), 0.0);

@@ -611,3 +611,141 @@ async fn r55_a_suspended_card_or_word_is_no_problem_word_anywhere() {
     assert_eq!(status, StatusCode::OK);
     assert!(problem_everywhere(&env, "quebec").await);
 }
+
+// ── a leech choice and the rating before it: Undo order (design §6.5) ───────
+
+/// The word's Understand card and suspension as one comparable line.
+fn leech_state(env: &Env, headword: &str) -> String {
+    env.sql()
+        .query_row(
+            "SELECT c.state || ' lapses=' || c.lapses || ' ' || c.leech || ' ack=' || \
+               c.leech_lapses_at_ack || ' word_suspended=' || w.suspended \
+             FROM card c JOIN word w ON w.id = c.word_id \
+             WHERE w.headword = ?1 AND c.kind = 'understand'",
+            [headword],
+            |row| row.get(0),
+        )
+        .expect("state")
+}
+
+/// A block with `headword` (due, three lapses: one more flags it), rated
+/// 5 so the card is flagged. Returns (word id, session id).
+async fn flagged_by_a_rating(env: &Env, headword: &str) -> (i64, String) {
+    env.import(BOOK_A, vec![word(headword, 6, 3)]).await;
+    understand(env, headword, 3.0, "2026-11-20", "2026-11-01", 8, 3, "none");
+    let (status, start) = env.post("/api/sessions", &json!({ "kind": "start" })).await;
+    assert_eq!(status, StatusCode::OK, "{start}");
+    let session = start["session"]["id"].as_str().expect("id").to_owned();
+    rate(env, &session, 5).await;
+    assert!(leech_state(env, headword).contains("flagged"));
+    (env.word_id(headword).await.get(), session)
+}
+
+async fn rate(env: &Env, session: &str, grade: u8) {
+    let (_, current) = env.get("/api/sessions/current").await;
+    let item = current["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|i| i["answered"].is_null())
+        .expect("an item to rate")
+        .clone();
+    let n = env.int("SELECT COUNT(*) FROM review_log");
+    let (status, body) = env
+        .post(
+            &format!("/api/sessions/{session}/reviews"),
+            &json!({
+                "client_review_id": format!("00000000-0000-4000-8000-{n:012}"),
+                "item_id": item["item_id"],
+                "raw_grade": grade,
+                "hint_used": false,
+                "duration_ms": 1000,
+                "client_ts": "2026-11-20T09:00:00Z",
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+async fn undo_rating(env: &Env, session: &str) -> (StatusCode, Value) {
+    env.post(&format!("/api/sessions/{session}/undo"), &json!({}))
+        .await
+}
+
+async fn undo_choice(env: &Env, id: i64, token: &str) -> (StatusCode, Value) {
+    env.post(&format!("/api/words/{id}/undo"), &json!({ "token": token }))
+        .await
+}
+
+#[tokio::test]
+async fn r55_a_choice_after_the_flagging_rating_is_undone_first_in_either_order() {
+    let env = env();
+    let (status, _) = env
+        .request("PATCH", "/api/settings", Some(&json!({ "new_per_day": 0 })))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Order 1: the choice's Undo, then the rating's.
+    let (romeo, session) = flagged_by_a_rating(&env, "romeo").await;
+    let before = "review lapses=3 none ack=0 word_suspended=0";
+    let (status, view) = action(&env, romeo, json!({ "action": "leech_suspend" })).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    let token = view["undo"].as_str().expect("token").to_owned();
+    let (status, body) = undo_choice(&env, romeo, &token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(leech_state(&env, "romeo").ends_with("flagged ack=0 word_suspended=0"));
+    let (status, body) = undo_rating(&env, &session).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(leech_state(&env, "romeo"), before);
+
+    // Order 2: the rating's Undo first is refused with a clear reason and
+    // changes nothing; the choice's Undo, then the rating's, work.
+    rate(&env, &session, 5).await;
+    let (status, view) = action(&env, romeo, json!({ "action": "leech_suspend" })).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    let token = view["undo"].as_str().expect("token").to_owned();
+    let chosen = leech_state(&env, "romeo");
+    let (status, body) = undo_rating(&env, &session).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "leech_choice_first");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("Undo that choice first")),
+        "{body}"
+    );
+    assert_eq!(leech_state(&env, "romeo"), chosen, "nothing changed");
+    let (status, body) = undo_choice(&env, romeo, &token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = undo_rating(&env, &session).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(leech_state(&env, "romeo"), before);
+}
+
+#[tokio::test]
+async fn r55_a_rating_after_the_choice_is_undone_first() {
+    // A card flagged on an earlier day: the choice comes on the answer
+    // side, before this block's rating of it.
+    let env = env();
+    let id = flagged_word(&env, "sierra", 6).await;
+    let (_, start) = env.post("/api/sessions", &json!({ "kind": "start" })).await;
+    let session = start["session"]["id"].as_str().expect("id").to_owned();
+    let (status, view) = action(&env, id, json!({ "action": "leech_keep" })).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    let token = view["undo"].as_str().expect("token").to_owned();
+    let chosen = leech_state(&env, "sierra");
+    rate(&env, &session, 2).await;
+    // The choice's Undo would guess (the card was rated since): refused.
+    let (status, body) = undo_choice(&env, id, &token).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    // LIFO: the rating, then (a fresh choice and) its Undo.
+    let (status, body) = undo_rating(&env, &session).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(leech_state(&env, "sierra"), chosen);
+    let (status, view) = action(&env, id, json!({ "action": "leech_suspend" })).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    let token = view["undo"].as_str().expect("token").to_owned();
+    let (status, body) = undo_choice(&env, id, &token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(leech_state(&env, "sierra"), chosen);
+}

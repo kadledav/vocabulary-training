@@ -10,9 +10,9 @@
  * carrying meaning. No streaks, scores or goals (R-74).
  */
 
-import { getJson, postJson } from '../api.js';
+import { getJson } from '../api.js';
 import { h, mount, svg } from '../dom.js';
-import { leechActions } from '../leech.js';
+import { leechActions, undoLeechChoice } from '../leech.js';
 import {
   STATUS_PARTS,
   activitySummary,
@@ -172,7 +172,7 @@ export function renderProgress(root, isCurrent) {
             typeof token === 'string'
               ? () =>
                   void (async () => {
-                    const answer = await postJson(`/api/words/${entry.id}/undo`, { token });
+                    const answer = await undoLeechChoice(entry.id, token);
                     if (!isCurrent()) return;
                     if (!answer.ok) toast.show({ text: `Could not undo: ${answer.message}`, ms: TOAST_MS });
                     void load();

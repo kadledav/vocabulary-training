@@ -1823,6 +1823,7 @@ fn api_error(err: &ApiError) -> Response {
             SessionError::ReviewUndone => conflict("review_undone"),
             SessionError::NothingToUndo => conflict("nothing_to_undo"),
             SessionError::CardChangedSince => conflict("card_changed"),
+            SessionError::LeechChoiceSince => conflict("leech_choice_first"),
             SessionError::Random(_) | SessionError::Scheduler(_) | SessionError::Sqlite(_) => {
                 internal_error(err)
             }

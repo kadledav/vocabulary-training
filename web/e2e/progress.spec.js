@@ -137,6 +137,53 @@ test('R-55 suspending on the leech screen takes the card out of the block', asyn
   expect(rows[0].suspended).toBe(true);
 });
 
+test('R-55 a choice in practice can be undone where it was made, before or after the rating', async ({ page, app, pageErrors }, info) => {
+  void pageErrors;
+  await seedHistory(app);
+  await app.api('PATCH', '/api/settings', { new_per_day: 0 });
+  const id = (await app.api('GET', '/api/words?q=brontle'))[0].id;
+  const leechOf = async () => (await app.api('GET', `/api/words/${id}`)).cards[0].leech;
+  await page.goto(`${app.url}/#/`);
+  await press(page.getByTestId('start'), info);
+  await press(page.getByTestId('reveal'), info);
+  const panel = page.getByTestId('leech-panel');
+
+  // A mis-tap on "Suspend word": the toast's Undo brings the card back,
+  // on its answer side with the choices.
+  await press(panel.getByTestId('leech-suspend'), info);
+  await expect(page.getByText('Block complete')).toBeVisible();
+  const toast = page.getByTestId('toast');
+  await expect(toast).toContainText('Suspended');
+  await press(toast.getByRole('button', { name: 'Undo' }), info);
+  await expect(page.getByTestId('toast')).toContainText('Choice undone');
+  await expect(panel.getByTestId('leech-suspend')).toBeVisible();
+  expect((await app.api('GET', '/api/words?q=brontle'))[0].suspended).toBe(false);
+  expect(await leechOf()).toBe('flagged');
+
+  // The same with ↶ (the choice is the latest thing done).
+  await press(panel.getByTestId('leech-suspend'), info);
+  await expect(page.getByText('Block complete')).toBeVisible();
+  await expect(page.getByTestId('undo')).toHaveAttribute('aria-label', 'Undo the problem-word choice (U)');
+  await press(page.getByTestId('undo'), info);
+  await expect(panel.getByTestId('leech-suspend')).toBeVisible();
+  expect((await app.api('GET', '/api/words?q=brontle'))[0].suspended).toBe(false);
+
+  // Keep practising, then rate: ↶ takes back the rating first, then the
+  // choice.
+  await press(panel.getByTestId('leech-keep'), info);
+  await expect(page.getByTestId('leech-done')).toContainText('Kept as it is.');
+  await waitGuard();
+  await press(page.getByRole('button', { name: /^Rate 2,/ }), info);
+  await expect(page.getByText('Block complete')).toBeVisible();
+  await expect(page.getByTestId('undo')).toHaveAttribute('aria-label', 'Undo last rating (U)');
+  await press(page.getByTestId('undo'), info);
+  await expect(page.getByTestId('leech-done')).toContainText('Kept as it is.');
+  expect(await leechOf()).toBe('acknowledged');
+  await press(page.getByTestId('undo'), info);
+  await expect(panel.getByTestId('leech-keep')).toBeVisible();
+  expect(await leechOf()).toBe('flagged');
+});
+
 test('R-55 Words points problem words to Progress', async ({ page, app, pageErrors }, info) => {
   void pageErrors;
   await seedHistory(app);

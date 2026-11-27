@@ -305,6 +305,7 @@ mod tests {
             leech: LeechState::None,
             leech_lapses_at_ack: 0,
             suspended: false,
+            leech_acked_after: None,
         }
     }
 
