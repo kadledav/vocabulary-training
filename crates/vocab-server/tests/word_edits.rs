@@ -432,14 +432,45 @@ async fn r04_removed_items_and_forms_never_come_back_but_can_be_added_again() {
         view["items"]["forms"][1]["common"], true,
         "the owner's flag"
     );
-    // Adding what is already there changes nothing.
-    let (status, _) = env
+    // Adding what is already there (another case) is refused, naming it;
+    // nothing changes.
+    let (status, body) = env
         .post(
             &format!("/api/words/{id}/items"),
             &json!({ "kind": "czech", "value": "UKOLÉBAT" }),
         )
         .await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "item_exists");
+    assert_eq!(
+        body["error"]["message"],
+        "\"ukolébat\" is already in the list."
+    );
+    // A form that is there with the same flag likewise; with the other flag
+    // the flag changes (and offers an Undo).
+    let (status, body) = env
+        .post(
+            &format!("/api/words/{id}/items"),
+            &json!({ "kind": "form", "value": "Lulled" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let (status, view) = env
+        .post(
+            &format!("/api/words/{id}/items"),
+            &json!({ "kind": "form", "value": "lulled", "common": false }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["items"]["forms"][0]["common"], false);
+    assert!(view["undo"].is_string());
+    let (status, _) = env
+        .post(
+            &format!("/api/words/{id}/items"),
+            &json!({ "kind": "accepted", "value": "LULLED" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "the owner's accepted answer");
     assert_eq!(
         detail(&env, id).await["items"]["czech"]
             .as_array()

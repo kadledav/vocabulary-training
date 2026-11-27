@@ -65,6 +65,9 @@ pub enum EditError {
     LastCzech,
     #[error("A list holds at most {MAX_LIST_ITEMS} items.")]
     TooManyItems,
+    /// The list already has an item with the same key (`stored`: as shown).
+    #[error("\"{0}\" is already in the list.")]
+    ItemExists(String),
     #[error("database: {0}")]
     Sqlite(#[from] rusqlite::Error),
 }
@@ -263,8 +266,10 @@ impl ListKind {
 }
 
 /// Add an item to a list (`common` only for forms, default true). An item
-/// that is already there is left as it is; one the owner removed earlier
-/// comes back.
+/// that is already there (same key: case and spacing do not count) is
+/// refused with [`EditError::ItemExists`]; one the owner removed earlier
+/// comes back. For a form that is there with the other `common` flag, the
+/// flag is changed.
 pub fn add_item(
     tx: &Transaction<'_>,
     id: WordId,
@@ -283,19 +288,21 @@ pub fn add_item(
     let key = item_key(&value);
     let kinds = kind.item_kinds();
     let mut stmt = tx.prepare(
-        "SELECT kind, removed FROM word_item WHERE word_id = ?1 AND value_key = ?2 \
+        "SELECT kind, removed, value FROM word_item WHERE word_id = ?1 AND value_key = ?2 \
          ORDER BY removed, kind",
     )?;
-    let rows: Vec<(String, bool)> = stmt
-        .query_map(params![id.get(), key], |row| Ok((row.get(0)?, row.get(1)?)))?
+    let rows: Vec<(String, bool, String)> = stmt
+        .query_map(params![id.get(), key], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
         .collect::<Result<_, _>>()?;
-    let rows: Vec<(String, bool)> = rows
+    let rows: Vec<(String, bool, String)> = rows
         .into_iter()
-        .filter(|(k, _)| kinds.contains(&k.as_str()))
+        .filter(|(k, _, _)| kinds.contains(&k.as_str()))
         .collect();
     match rows.first() {
-        Some((_, false)) => return Ok(()),
-        Some((stored, true)) => {
+        Some((_, false, shown)) => return Err(EditError::ItemExists(shown.clone())),
+        Some((stored, true, _)) => {
             tx.execute(
                 "UPDATE word_item SET removed = 0 WHERE word_id = ?1 AND kind = ?2 AND value_key = ?3",
                 params![id.get(), stored, key],
@@ -338,15 +345,18 @@ fn add_form(
 ) -> Result<(), EditError> {
     let form = owner_form(form).map_err(|issue| invalid(&[issue]))?;
     let key = item_key(&form);
-    let stored: Option<bool> = tx
+    let stored: Option<(bool, bool, String)> = tx
         .query_row(
-            "SELECT removed FROM word_form WHERE word_id = ?1 AND form_key = ?2",
+            "SELECT removed, common, form FROM word_form WHERE word_id = ?1 AND form_key = ?2",
             params![id.get(), key],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
     match stored {
-        // Already there: the owner's `common` flag wins.
+        Some((false, stored_common, shown)) if stored_common == common => {
+            return Err(EditError::ItemExists(shown));
+        }
+        // Removed, or there with the other flag: back, with the owner's flag.
         Some(_) => {
             tx.execute(
                 "UPDATE word_form SET removed = 0, common = ?3 WHERE word_id = ?1 AND form_key = ?2",

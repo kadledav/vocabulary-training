@@ -1284,6 +1284,7 @@ fn edit_error(err: &WorkflowError) -> Response {
             EditError::Invalid(_) => answer(StatusCode::UNPROCESSABLE_ENTITY, "invalid"),
             EditError::LastCzech => answer(StatusCode::UNPROCESSABLE_ENTITY, "last_czech"),
             EditError::TooManyItems => answer(StatusCode::UNPROCESSABLE_ENTITY, "too_many_items"),
+            EditError::ItemExists(_) => answer(StatusCode::CONFLICT, "item_exists"),
             EditError::HeadwordTaken(_) | EditError::SpellingTaken { .. } => {
                 answer(StatusCode::CONFLICT, "headword_taken")
             }
