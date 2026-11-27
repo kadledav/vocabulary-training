@@ -1225,6 +1225,94 @@ class Cache(unittest.TestCase):
         self.assertNotIn("cached(", inspect.getsource(dep_age.action_published))
 
 
+class RegistryGet(unittest.TestCase):
+    """registry_get: redirects, Authorization scoping, retries (no network)."""
+
+    REG = "registry-1.docker.io"
+    URL = f"https://{REG}/v2/library/x/blobs/sha256:abc"
+
+    def setUp(self):
+        dep_age._registry_tokens.clear()
+        dep_age._registry_tokens[(self.REG, "library/x")] = "TOK"
+        self.calls: list[tuple[str, dict]] = []
+        patches = [mock.patch.object(dep_age, "_registry_opener", mock.Mock(open=self.open)),
+                   mock.patch.object(dep_age.time, "sleep")]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self.script: list = []
+
+    def open(self, req, timeout=None):
+        self.calls.append((req.full_url, {k.lower(): v for k, v in req.header_items()}))
+        step = self.script.pop(0)
+        if isinstance(step, BaseException):
+            raise step
+        return io.BytesIO(step)
+
+    @staticmethod
+    def http(code, location=None, url="https://x/", challenge=None):
+        import email.message
+
+        headers = email.message.Message()
+        if location:
+            headers["Location"] = location
+        if challenge:
+            headers["WWW-Authenticate"] = challenge
+        return dep_age.urllib.error.HTTPError(url, code, "m", headers, io.BytesIO(b""))
+
+    def get(self):
+        return dep_age.registry_get(self.REG, "library/x", "blobs/sha256:abc", "application/json")
+
+    def test_cross_host_redirect_drops_authorization(self):
+        self.script = [self.http(307, "https://storage.example/obj?sig=SECRET"), b"body"]
+        self.assertEqual(self.get(), b"body")
+        self.assertEqual(self.calls[0][1]["authorization"], "Bearer TOK")
+        self.assertEqual(self.calls[1][0], "https://storage.example/obj?sig=SECRET")
+        self.assertNotIn("authorization", self.calls[1][1])
+
+    def test_same_host_redirect_keeps_authorization(self):
+        self.script = [self.http(302, f"https://{self.REG}/other"), b"body"]
+        self.assertEqual(self.get(), b"body")
+        self.assertEqual(self.calls[1][1]["authorization"], "Bearer TOK")
+
+    def test_non_https_redirect_is_refused(self):
+        self.script = [self.http(302, "http://storage.example/obj")]
+        with self.assertRaisesRegex(dep_age.LookupFailed, "non-https"):
+            self.get()
+        self.assertEqual(len(self.calls), 1)
+
+    def test_too_many_redirects_are_refused(self):
+        self.script = [self.http(302, "https://s.example/a")] * (dep_age.MAX_REDIRECTS + 1)
+        with self.assertRaisesRegex(dep_age.LookupFailed, "redirects"):
+            self.get()
+
+    def test_transient_failures_are_retried(self):
+        self.script = [self.http(503), TimeoutError("slow"), b"ok"]
+        self.assertEqual(self.get(), b"ok")
+        self.assertEqual(len(self.calls), 3)
+
+    def test_redirect_target_400_fails_without_query_string(self):
+        redirect = self.http(307, "https://storage.example/obj?sig=SECRET")
+        self.script = [redirect, self.http(400)]
+        with self.assertRaises(dep_age.LookupFailed) as ctx:
+            self.get()
+        message = str(ctx.exception)
+        self.assertIn("HTTP 400", message)
+        self.assertIn("storage.example", message)
+        self.assertNotIn("SECRET", message)
+        self.assertNotIn("?", message)
+
+    def test_401_challenge_fetches_a_token_and_retries(self):
+        dep_age._registry_tokens.clear()
+        challenge = 'Bearer realm="https://auth.example/token",service="r"'
+        self.script = [self.http(401, challenge=challenge), self.http(503), b"ok"]
+        with mock.patch.object(dep_age, "fetch_json", return_value={"token": "NEW"}) as fj:
+            self.assertEqual(self.get(), b"ok")
+        self.assertIn("auth.example/token", fj.call_args.args[0])
+        self.assertEqual(self.calls[-1][1]["authorization"], "Bearer NEW")
+        self.assertNotIn("authorization", self.calls[0][1])
+
+
 class ImageDates(unittest.TestCase):
     """image_published / debian_published against faked registries."""
 

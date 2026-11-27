@@ -26,6 +26,8 @@ deliberate shell obfuscation is out of scope (review covers that).
   workflow or compose file builds with `file:` / `dockerfile:`):
     - every `FROM` / `COPY --from` image must be `name:tag@sha256:<digest>`
       (or an earlier stage, or `scratch`)                            -> registry
+      (registry requests retry transient failures; the registry token is never
+      sent to another host a blob redirect points at, https only)
     - `apt-get install` only with exact `package=version` pins       -> snapshot.debian.org
       (dated by its first appearance for every built architecture,
       DEBIAN_ARCHES) and, for a real install, a preceding dry-run proof
@@ -192,25 +194,36 @@ def fetch(url: str, *, min_interval: float = 0.0, headers: dict[str, str] | None
         time.sleep(wait)
     req_headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
     req_headers.update(headers or {})
+    def once() -> bytes:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=req_headers), timeout=60) as resp:
+            return resp.read()
+
+    return _retrying(lambda: f"GET {url}", once, host)
+
+
+def _retrying(label, once, host: str) -> bytes:
+    """Run `once()` (returns the body or raises urllib errors), retrying 429/5xx,
+    URLError and timeouts up to 5 attempts with backoff; any other failure is a
+    LookupFailed. `label()` names the request in messages (never a query string
+    that may carry a signature)."""
     delay = 2.0
     for attempt in range(5):
         _last_request[host] = time.monotonic()
         try:
-            with urllib.request.urlopen(urllib.request.Request(url, headers=req_headers), timeout=60) as resp:
-                return resp.read()
+            return once()
         except urllib.error.HTTPError as err:
             if err.code in (429, 500, 502, 503, 504) and attempt < 4:
                 time.sleep(delay)
                 delay *= 2
                 continue
-            raise LookupFailed(f"GET {url}: HTTP {err.code}", err.code) from err
+            raise LookupFailed(f"{label()}: HTTP {err.code}", err.code) from err
         except (urllib.error.URLError, TimeoutError) as err:
             if attempt < 4:
                 time.sleep(delay)
                 delay *= 2
                 continue
-            raise LookupFailed(f"GET {url}: {err}") from err
-    raise LookupFailed(f"GET {url}: retries exhausted")
+            raise LookupFailed(f"{label()}: {err}") from err
+    raise LookupFailed(f"{label()}: retries exhausted")
 
 
 def fetch_json(url: str, **kwargs) -> object:
@@ -1053,22 +1066,74 @@ def split_image(name: str) -> tuple[str, str]:
 _registry_tokens: dict[tuple[str, str], str] = {}
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Hand redirects back as HTTPError so registry_get can follow them itself."""
+
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+_registry_opener = urllib.request.build_opener(_NoRedirect)
+MAX_REDIRECTS = 3
+
+
+class _Challenge(Exception):
+    """The registry answered 401 with a WWW-Authenticate header."""
+
+
+def _registry_once(url: str, headers: dict[str, str], where: list[str]) -> bytes:
+    """One attempt: GET `url`, following up to MAX_REDIRECTS https redirects. The
+    registry token goes only to the registry's own host: a redirect to another
+    host (Docker Hub's pre-signed storage URLs answer HTTP 400 when they also
+    get an Authorization header) is followed without it. `where` records the
+    host of the last hop for messages."""
+    headers = dict(headers)
+    origin = urllib.parse.urlsplit(url).netloc.lower()
+    current = url
+    for _ in range(MAX_REDIRECTS + 1):
+        where[:] = [urllib.parse.urlsplit(current).netloc]
+        try:
+            with _registry_opener.open(urllib.request.Request(current, headers=headers), timeout=60) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as err:
+            if err.code not in (301, 302, 303, 307, 308):
+                if err.code == 401 and current == url:
+                    raise _Challenge(err.headers.get("WWW-Authenticate", "") if err.headers else "") from err
+                raise
+            location = err.headers.get("Location") if err.headers else None
+            if not location:
+                raise
+            current = urllib.parse.urljoin(current, location)
+            parts = urllib.parse.urlsplit(current)
+            if parts.scheme != "https":
+                raise LookupFailed(f"GET {url}: redirect to a non-https URL ({parts.scheme}://{parts.netloc}) refused") from err
+            if parts.netloc.lower() != origin:
+                headers.pop("Authorization", None)
+    raise LookupFailed(f"GET {url}: more than {MAX_REDIRECTS} redirects")
+
+
 def registry_get(registry: str, repo: str, path: str, accept: str) -> bytes:
     """GET https://<registry>/v2/<repo>/<path>, with an anonymous pull token
-    when the registry asks for one (WWW-Authenticate: Bearer …)."""
+    when the registry asks for one (WWW-Authenticate: Bearer …). Transient
+    failures are retried like fetch(); redirects see _registry_once."""
     url = f"https://{registry}/v2/{repo}/{path}"
+    where: list[str] = []
+
+    def label() -> str:
+        host = where[0] if where else registry
+        return f"GET {url}" + (f" (via redirect to {host})" if host.lower() != registry.lower() else "")
+
     for _ in range(2):
         headers = {"User-Agent": USER_AGENT, "Accept": accept}
         token = _registry_tokens.get((registry, repo))
         if token:
             headers["Authorization"] = f"Bearer {token}"
         try:
-            with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=60) as resp:
-                return resp.read()
-        except urllib.error.HTTPError as err:
-            challenge = err.headers.get("WWW-Authenticate", "") if err.headers else ""
-            if err.code != 401 or not challenge.lower().startswith("bearer ") or token:
-                raise LookupFailed(f"GET {url}: HTTP {err.code}") from err
+            return _retrying(label, lambda: _registry_once(url, headers, where), registry)
+        except _Challenge as err:
+            challenge = str(err)
+            if not challenge.lower().startswith("bearer ") or token:
+                raise LookupFailed(f"GET {url}: HTTP 401") from err
             params = dict(re.findall(r'(\w+)="([^"]*)"', challenge))
             realm = params.pop("realm", "")
             if not realm.startswith("https://"):
@@ -1079,8 +1144,6 @@ def registry_get(registry: str, repo: str, path: str, accept: str) -> bytes:
             if not token:
                 raise LookupFailed(f"GET {url}: no registry token") from err
             _registry_tokens[(registry, repo)] = token
-        except (urllib.error.URLError, TimeoutError) as err:
-            raise LookupFailed(f"GET {url}: {err}") from err
     raise LookupFailed(f"GET {url}: not authorised")
 
 
