@@ -109,7 +109,7 @@ async fn r84_whitespace_is_normalised_and_invisible_characters_removed() {
     }
     let calls = calls.lock().expect("test setup");
     assert_eq!(calls.len(), 6);
-    assert!(calls.iter().all(|c| c.chunks == calls[0].chunks));
+    assert!(calls.iter().all(|c| c.chunk == calls[0].chunk));
 }
 
 #[tokio::test]
@@ -353,10 +353,9 @@ async fn r24_no_text_in_the_logs_on_any_path() {
     impl vocab_tts::engine::Synthesizer for Failing {
         fn synthesize(
             &mut self,
-            _: &vocab_tts::phonemize::Phonemes,
+            _: &str,
             _: vocab_tts::speech::Voice,
             _: vocab_tts::speech::Speed,
-            _: &vocab_tts::engine::Cancel,
         ) -> Result<vocab_tts::postprocess::Pcm, vocab_tts::engine::EngineError> {
             Err(vocab_tts::engine::EngineError::NoAudio)
         }

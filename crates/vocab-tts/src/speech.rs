@@ -213,6 +213,14 @@ impl Speed {
     pub fn get(self) -> f32 {
         self.0
     }
+
+    /// How much longer a phoneme sounds than at normal speed (at least 1:
+    /// faster speech is not counted as shorter). The engine's working
+    /// memory and the clip's length grow with the audio of a chunk, so the
+    /// limits on symbols are divided by this.
+    pub fn stretch(self) -> f32 {
+        (1.0 / self.0).max(1.0)
+    }
 }
 
 #[cfg(test)]
@@ -337,5 +345,14 @@ mod tests {
         for bad in [0.49, 1.51, 0.0, -1.0, f64::NAN, f64::INFINITY] {
             assert_eq!(Speed::new(bad), Err(SpeedError), "{bad}");
         }
+    }
+
+    #[test]
+    fn r84_slower_speech_stretches_every_phoneme() {
+        let stretch = |v: f64| Speed::new(v).expect("test setup").stretch();
+        assert_eq!(stretch(1.0), 1.0);
+        assert_eq!(stretch(1.5), 1.0);
+        assert_eq!(stretch(0.5), 2.0);
+        assert!((stretch(0.8) - 1.25).abs() < 1e-6);
     }
 }

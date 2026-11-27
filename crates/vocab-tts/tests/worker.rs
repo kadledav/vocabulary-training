@@ -37,10 +37,9 @@ fn fake(script: &str, idle: Duration) -> Arc<Worker> {
     worker
 }
 
-/// Says ready, then answers every line (after a line that is not
-/// protocol, which is skipped).
+/// Says ready, then answers every line (after a sign of life).
 const ANSWERS: &str =
-    r#"printf '%s\n' "$1"; while read -r line; do printf 'noise\n%s\n' "$2"; done"#;
+    r#"printf '%s\n' "$1"; while read -r line; do printf '{"working":{}}\n%s\n' "$2"; done"#;
 
 async fn say(speaker: &Arc<Speaker>) -> Result<vocab_tts::speaker::Spoken, SpeakError> {
     let text = SpeakText::new("hello").expect("test setup");
@@ -99,33 +98,40 @@ async fn r83_a_failed_start_is_an_error_and_unhealthy_not_a_hang() {
         "exit 3",
         // It says something else.
         r#"printf '{"hello":1}\n'"#,
+        // It is killed while loading (as by the OOM killer under a low
+        // memory limit).
+        "kill -9 $$",
     ] {
         let worker = fake(script, Duration::from_secs(60));
         let speaker = Speaker::new(Arc::clone(&worker) as _, 0);
         let result = tokio::time::timeout(Duration::from_secs(10), say(&speaker))
             .await
             .expect("no hang");
+        // Not a failure of the text: the engine is unavailable.
         assert!(
-            matches!(result, Err(SpeakError::Worker(_))),
+            matches!(result, Err(SpeakError::Unavailable(_))),
             "{script}: {result:?}"
         );
         assert!(!worker.healthy(), "{script}");
         assert!(!worker.is_running().await, "{script}");
-        // The HTTP side: the request fails, /healthz says so.
+        // The HTTP side: 503 with a distinct code and Retry-After (the app
+        // waits without counting it against the text); /healthz says so.
         let app = vocab_tts::http::app(Arc::clone(&speaker));
-        let (status, _, body) = send(&app, speak_request(r#"{"text": "hello"}"#)).await;
+        let (status, headers, body) = send(&app, speak_request(r#"{"text": "hello"}"#)).await;
         assert_eq!(
             (status, error_code(&body).as_str()),
-            (StatusCode::INTERNAL_SERVER_ERROR, "synthesis_failed")
+            (StatusCode::SERVICE_UNAVAILABLE, "engine_unavailable")
         );
+        assert_eq!(headers[axum::http::header::RETRY_AFTER], "60");
         let request = axum::http::Request::get("/healthz")
             .body(axum::body::Body::empty())
             .expect("test setup");
-        let (status, _, body) = send(&app, request).await;
+        let (status, headers, body) = send(&app, request).await;
         assert_eq!(
             (status, error_code(&body).as_str()),
             (StatusCode::SERVICE_UNAVAILABLE, "engine_failed")
         );
+        assert_eq!(headers[axum::http::header::RETRY_AFTER], "60");
     }
 }
 
@@ -193,4 +199,74 @@ async fn r83_abandoned_work_stops_the_engine_process() {
     // The slot is free again: the next request is not busy.
     let next = tokio::time::timeout(Duration::from_millis(500), say(&speaker)).await;
     assert!(next.is_err(), "it reached the (new, silent) engine process");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r83_output_that_is_not_the_protocol_is_a_fast_error_not_a_hang() {
+    for script in [
+        // A whole line of something else before the answer.
+        r#"printf '%s\n' "$1"; read -r line; printf 'noise\n%s\n' "$2"; sleep 60"#,
+        // A partial line (no line break) right before the answer: the
+        // answer is glued to it.
+        r#"printf '%s\n' "$1"; read -r line; printf 'noise%s\n' "$2"; sleep 60"#,
+    ] {
+        let worker = fake(script, Duration::from_secs(60));
+        let speaker = Speaker::new(Arc::clone(&worker) as _, 0);
+        let started = std::time::Instant::now();
+        // (A partial line and then nothing waits for the silence limit:
+        // see the unit tests of `worker`.)
+        let result = tokio::time::timeout(Duration::from_secs(5), say(&speaker))
+            .await
+            .expect("no hang");
+        assert!(
+            matches!(&result, Err(SpeakError::Worker(message)) if message.contains("not the protocol")),
+            "{script}: {result:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(3), "{script}");
+        assert!(!worker.is_running().await, "{script}: stopped");
+        assert!(worker.healthy(), "{script}: it started fine");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r83_shutting_down_kills_the_engine_and_answers_at_once() {
+    // Ready, then speaks for a long time.
+    let worker = fake(
+        r#"printf '%s\n' "$1"; read -r line; sleep 60"#,
+        Duration::from_secs(60),
+    );
+    let speaker = Speaker::new(Arc::clone(&worker) as _, 2);
+    let app = vocab_tts::http::app(Arc::clone(&speaker));
+    let first = tokio::spawn({
+        let app = app.clone();
+        async move { send(&app, speak_request(r#"{"text": "hello"}"#)).await }
+    });
+    // Wait until the engine process runs the request.
+    for _ in 0..50 {
+        if speaker.engine_running() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let started = std::time::Instant::now();
+    speaker.shut_down();
+    let (status, headers, body) = tokio::time::timeout(Duration::from_secs(3), first)
+        .await
+        .expect("answered at once")
+        .expect("test setup");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(
+        (status, error_code(&body).as_str()),
+        (StatusCode::SERVICE_UNAVAILABLE, "shutting_down")
+    );
+    assert_eq!(headers[axum::http::header::RETRY_AFTER], "60");
+    assert!(!worker.is_running().await, "the engine process was killed");
+    // Nothing new starts.
+    let (status, _, body) = send(&app, speak_request(r#"{"text": "hello"}"#)).await;
+    assert_eq!(
+        (status, error_code(&body).as_str()),
+        (StatusCode::SERVICE_UNAVAILABLE, "shutting_down")
+    );
+    assert!(!worker.is_running().await);
 }
