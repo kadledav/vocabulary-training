@@ -401,6 +401,29 @@ test('R-58 R-70 Enter on ▶ Listen plays the word and leaves the focus on it', 
   await expect.poll(() => spoken(page)).toEqual(['glimmerous']);
 });
 
+test('R-58 an invisible character typed is not a mistake; a hopeless answer is summed up briefly', async ({ page, app, pageErrors }) => {
+  void pageErrors;
+  await waitingSpelling(app, ['glimmerous', 'brontle']);
+  await startSpellingBlock(page, app);
+  // A zero-width space and a right-to-left override in a right spelling.
+  await input(page).fill('\u202eglim\u200bmerous');
+  await page.getByTestId('check').click();
+  const result = page.getByTestId('check-result');
+  await expect(result).toHaveAttribute('data-match', 'exact');
+  await advanceClock(page, 650);
+  await page.getByRole('button', { name: /^Rate 2,/ }).click();
+  await expect(page.getByTestId('progress')).toHaveText('2 / 2');
+  await advanceClock(page, 300);
+  await input(page).fill('q'.repeat(300));
+  await page.getByTestId('check').click();
+  await expect(result).toHaveAttribute('data-match', 'none');
+  const summary = await result.locator('.sr-only').textContent();
+  expect(summary).toBe('very different from the word, which is spelled “brontle”: b, r, o, n, t, l, e');
+  await advanceClock(page, 650);
+  await page.getByRole('button', { name: /^Rate 4,/ }).click();
+  await expect.poll(() => storedReviews(app).map((r) => r[3])).toEqual(['glimmerous', 'q'.repeat(300)]);
+});
+
 test.describe('with a TTS service that spells a word out', () => {
   /** @type {Awaited<ReturnType<typeof startFakeTts>>} */
   let tts;
