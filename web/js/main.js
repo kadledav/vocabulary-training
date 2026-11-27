@@ -14,6 +14,7 @@ import { startRouter } from './router.js';
 import { renderImport } from './screens/import.js';
 import { renderLogin } from './screens/login.js';
 import { renderPractice } from './screens/practice.js';
+import { renderProgress } from './screens/progress.js';
 import { renderSettings } from './screens/settings.js';
 import { renderSummary } from './screens/summary.js';
 import { renderToday } from './screens/today.js';
@@ -37,6 +38,7 @@ function nav(name) {
     { class: 'top', 'aria-label': 'Main' },
     link('#/', 'Today', 'home'),
     link('#/words', 'Words', 'words'),
+    link('#/progress', 'Progress', 'progress'),
     link('#/import', 'Import', 'import'),
     link('#/settings', 'Settings', 'settings'),
   );
@@ -86,6 +88,9 @@ if (root) {
         break;
       case 'words':
         renderWords(content, isCurrent);
+        break;
+      case 'progress':
+        renderProgress(content, isCurrent);
         break;
       case 'word':
         void renderWord(content, route.params.id, isCurrent);

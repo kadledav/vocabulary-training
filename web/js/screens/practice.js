@@ -32,6 +32,7 @@ import { clipFor, clipsFor, playClip, preloadClips, stopClip } from '../clips.js
 import { h, mount } from '../dom.js';
 import { keyAction, keyTarget } from '../keys.js';
 import { answerView, checkResult, criterion, produceQuestion, questionView, revealLabel, typedHint } from '../practice/card.js';
+import { leechPanel } from '../practice/leech-panel.js';
 import {
   TYPED_MAX,
   answersFor,
@@ -236,6 +237,13 @@ export function renderPractice(root, isCurrent) {
   /** Check results of this visit by item (undo returns to the checked answer). */
   /** @type {Map<number, Check>} */
   const checks = new Map();
+  /**
+   * Leech screens answered in this visit, by item (design §6.5): the panel
+   * then shows only the confirmation.
+   *
+   * @type {Map<number, import('../practice/leech-panel.js').LeechDone>}
+   */
+  const leechDone = new Map();
   /** Items whose typed answer was added to the accepted answers. */
   /** @type {Set<number>} */
   const acceptedItems = new Set();
@@ -640,6 +648,9 @@ export function renderPractice(root, isCurrent) {
     const check = isTyped(item) ? state.check : null;
     mount(
       body,
+      state.phase === 'answer' && (item.card.leech_flagged || leechDone.has(item.item_id))
+        ? leechPanel(item, leechDone.get(item.item_id) ?? null, (done) => void afterLeechChoice(item, done), isCurrent)
+        : null,
       answerView(item, {
         audio,
         moreOpen: state.moreOpen,
@@ -1013,6 +1024,29 @@ export function renderPractice(root, isCurrent) {
     }
     state.session = answer.data;
     return true;
+  };
+
+  /**
+   * A choice on the leech screen of `item` was saved: load the block again
+   * (a suspended word, or a Produce card of a word now recognise-only,
+   * leaves it) and stay on this answer side while the item is still to be
+   * rated; otherwise go on to the next card.
+   *
+   * @param {Item} item
+   * @param {import('../practice/leech-panel.js').LeechDone} done
+   */
+  const afterLeechChoice = async (item, done) => {
+    leechDone.set(item.item_id, done);
+    if (!(await refresh())) return;
+    const still = state.session?.items.find((i) => i.item_id === item.item_id && i.answered === null) ?? null;
+    if (still && state.item?.item_id === item.item_id) {
+      state.item = still;
+      render();
+      announce(done.text);
+    } else if (!still) {
+      announce(done.text);
+      advance();
+    }
   };
 
   const reload = async () => {

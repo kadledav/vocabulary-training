@@ -6,7 +6,7 @@
 
 import path from 'node:path';
 
-import { expect, startBookBlock, test, waitGuard, waitingProduce } from './fixtures.js';
+import { expect, seedHistory, startBookBlock, test, waitGuard, waitingProduce } from './fixtures.js';
 
 const dir = process.env.SCREENSHOT_DIR;
 
@@ -243,5 +243,36 @@ for (const theme of /** @type {const} */ (['dark', 'light'])) {
     await page.getByRole('button', { name: 'Raise usefulness' }).click();
     await expect(page.getByTestId('toast')).toBeVisible();
     await shot('10-toast-undo');
+  });
+}
+
+/** M9: Progress, the leech screen in practice and the exports in Settings. */
+for (const theme of /** @type {const} */ (['dark', 'light'])) {
+  test(`M9 Progress, leech and export screens, ${theme}`, async ({ page, app }, info) => {
+    test.skip(!dir, 'set SCREENSHOT_DIR to take screenshots');
+    const shot = (/** @type {string} */ name, fullPage = false) =>
+      page.screenshot({ path: path.join(/** @type {string} */ (dir), `m9-${info.project.name}-${theme}-${name}.png`), fullPage });
+    await app.api('PATCH', '/api/settings', { theme, new_per_day: 0 });
+    await seedHistory(app);
+    await page.goto(`${app.url}/#/`);
+    await expect(page.getByTestId('problem-words')).toBeVisible();
+    await shot('1-today');
+    await page.goto(`${app.url}/#/progress`);
+    await expect(page.getByTestId('leech')).toBeVisible();
+    await shot('2-progress');
+    await shot('2-progress-full', true);
+    await page.getByTestId('leech').getByTestId('leech-usefulness').click();
+    await page.getByTestId('leech').scrollIntoViewIfNeeded();
+    await shot('3-progress-leech-lower');
+    await page.goto(`${app.url}/#/`);
+    await page.getByTestId('start').click();
+    await page.getByTestId('reveal').click();
+    await expect(page.getByTestId('leech-panel')).toContainText('Keep practising');
+    await shot('4-practice-leech-panel');
+    await page.goto(`${app.url}/#/settings`);
+    await page.getByTestId('show-feedback').click();
+    await expect(page.getByTestId('feedback-text')).toBeVisible();
+    await page.getByRole('heading', { name: 'Export' }).scrollIntoViewIfNeeded();
+    await shot('5-settings-export');
   });
 }

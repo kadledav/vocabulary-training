@@ -57,6 +57,7 @@ test('R-74 routes of the practice screens', () => {
   assert.deepEqual(parseRoute('#/'), { name: 'home', params: {} });
   assert.deepEqual(parseRoute('#/practice'), { name: 'practice', params: {} });
   assert.deepEqual(parseRoute('#/summary'), { name: 'summary', params: {} });
+  assert.deepEqual(parseRoute('#/progress'), { name: 'progress', params: {} });
   assert.deepEqual(parseRoute('#/settings'), { name: 'settings', params: {} });
   assert.deepEqual(parseRoute('#/words/12'), { name: 'word', params: { id: '12' } });
   assert.deepEqual(parseRoute('#/practice/x'), { name: 'not-found', params: {} });

@@ -186,6 +186,48 @@ export async function waitingProduce(app, headwords) {
 }
 
 /**
+ * `day` plus `n` days (`YYYY-MM-DD`).
+ *
+ * @param {string} day
+ * @param {number} n
+ */
+function addDays(day, n) {
+  const date = new Date(`${day}T12:00:00Z`);
+  date.setUTCDate(date.getUTCDate() + n);
+  return date.toISOString().slice(0, 10);
+}
+
+/**
+ * A known, a familiar and a problem word (brontle, due today), two new
+ * words; two recall tests yesterday (one passed). Returns the study day.
+ *
+ * @param {import('./fixtures.js').App} app
+ */
+export async function seedHistory(app) {
+  const today = (await app.api('GET', '/api/today')).study_day;
+  const db = new DatabaseSync(app.dbPath);
+  const card = db.prepare(
+    `UPDATE card SET state = 'review', format = ?, stability = ?, difficulty = 5.0, due_day = ?,
+       last_review_day = ?, introduced_day = ?, reps = ?, lapses = ?, leech = ?
+     WHERE kind = 'understand' AND word_id = (SELECT id FROM word WHERE headword = ?)`,
+  );
+  const yesterday = addDays(today, -1);
+  card.run('sentence', 30.0, addDays(today, 3), yesterday, addDays(today, -20), 5, 0, 'none', 'glimmerous');
+  card.run('sentence', 10.0, addDays(today, 1), yesterday, addDays(today, -40), 6, 1, 'none', 'quabble');
+  card.run('word_only', 2.0, today, yesterday, addDays(today, -40), 9, 4, 'flagged', 'brontle');
+  const review = db.prepare(
+    `INSERT INTO review_log (client_review_id, card_id, reviewed_at, review_day, raw_grade, fsrs_rating,
+       format, elapsed_days, before_json)
+     SELECT ?, c.id, ?, ?, ?, 3, 'sentence', ?, '{"state":"review"}'
+     FROM card c JOIN word w ON w.id = c.word_id WHERE w.headword = ? AND c.kind = 'understand'`,
+  );
+  review.run('test-e2e-review-1', `${yesterday}T10:00:00Z`, yesterday, 2, 5, 'glimmerous');
+  review.run('test-e2e-review-2', `${yesterday}T10:01:00Z`, yesterday, 4, 3, 'quabble');
+  db.close();
+  return today;
+}
+
+/**
  * Start a block in the book's scope from the Today screen.
  *
  * @param {import('@playwright/test').Page} page

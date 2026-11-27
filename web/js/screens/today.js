@@ -200,6 +200,16 @@ export function renderToday(root, isCurrent) {
             ),
           ),
         ),
+        // A quiet pointer, no badge or alert (R-55, R-74).
+        (today.problem_words ?? 0) > 0
+          ? h(
+              'p',
+              { class: 'muted small', 'data-testid': 'problem-words' },
+              `${plural(today.problem_words ?? 0, 'problem word')}: `,
+              h('a', { href: '#/progress' }, 'see Progress'),
+              '.',
+            )
+          : null,
       ),
     );
   };

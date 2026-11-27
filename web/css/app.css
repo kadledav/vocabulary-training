@@ -1839,3 +1839,259 @@ button.accept-typed {
 button.rate.suggested {
   box-shadow: 0 0 0 3px var(--bg), 0 0 0 5px var(--rate);
 }
+
+/* ── Progress (design §7.1 screen 9) ─────────────────────────────────────── */
+
+.progress .card {
+  margin-bottom: 1rem;
+}
+
+.progress h2 {
+  margin-top: 0;
+}
+
+/* Charts: SVG scaled to the column, never wider (no sideways scrolling).
+   Colours from the theme; every chart repeats its numbers as text. */
+svg.chart {
+  display: block;
+  width: 100%;
+  height: auto;
+  margin: 0.5rem 0;
+}
+
+svg.chart .bar {
+  fill: var(--accent);
+}
+
+svg.chart .baseline,
+svg.meter .meter-track {
+  fill: var(--surface-2);
+}
+
+svg.chart text {
+  fill: var(--muted);
+  font-size: 10px;
+  font-family: inherit;
+}
+
+svg.chart text.chart-value {
+  fill: var(--text);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+svg.status-chart {
+  height: 0.9rem;
+  border-radius: 0.25rem;
+}
+
+svg.meter {
+  height: 1rem;
+}
+
+svg.meter .meter-fill {
+  fill: var(--accent);
+}
+
+svg.meter .meter-target {
+  fill: var(--text);
+}
+
+/* Status colours: distinct lightness; the legend carries the numbers. */
+:root {
+  --seg-known: #6fcf97;
+  --seg-familiar: #3c9fc4;
+  --seg-learning: #eabf4a;
+  --seg-problem: #ff6f6f;
+  --seg-new: #7d8390;
+  --seg-suspended: #464c58;
+}
+
+:root[data-theme="light"] {
+  --seg-known: #1d7a46;
+  --seg-familiar: #1f6fa8;
+  --seg-learning: #b58600;
+  --seg-problem: #c0262d;
+  --seg-new: #8a909b;
+  --seg-suspended: #c9ccd3;
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme]) {
+    --seg-known: #1d7a46;
+    --seg-familiar: #1f6fa8;
+    --seg-learning: #b58600;
+    --seg-problem: #c0262d;
+    --seg-new: #8a909b;
+    --seg-suspended: #c9ccd3;
+  }
+}
+
+.seg-known {
+  fill: var(--seg-known);
+  background: var(--seg-known);
+}
+
+.seg-familiar {
+  fill: var(--seg-familiar);
+  background: var(--seg-familiar);
+}
+
+.seg-learning {
+  fill: var(--seg-learning);
+  background: var(--seg-learning);
+}
+
+.seg-problem {
+  fill: var(--seg-problem);
+  background: var(--seg-problem);
+}
+
+.seg-new {
+  fill: var(--seg-new);
+  background: var(--seg-new);
+}
+
+.seg-suspended {
+  fill: var(--seg-suspended);
+  background: var(--seg-suspended);
+}
+
+ul.legend {
+  list-style: none;
+  padding: 0;
+  margin: 0.25rem 0 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 1rem;
+  font-size: 0.875rem;
+}
+
+ul.legend li {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.swatch {
+  display: inline-block;
+  width: 0.8rem;
+  height: 0.8rem;
+  border-radius: 0.2rem;
+}
+
+dl.status-terms {
+  margin: 0.75rem 0 0;
+  color: var(--muted);
+}
+
+dl.status-terms div {
+  display: flex;
+  gap: 0.5rem;
+}
+
+dl.status-terms dt {
+  font-weight: 600;
+  min-width: 6.5rem;
+  flex-shrink: 0;
+}
+
+dl.status-terms dd {
+  margin: 0;
+}
+
+ul.source-progress,
+ul.retention,
+ul.leeches,
+ul.conflicts {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+ul.source-progress > li + li,
+ul.retention > li + li {
+  margin-top: 1rem;
+}
+
+ul.source-progress p,
+ul.retention p {
+  margin: 0.25rem 0;
+}
+
+ul.leeches > li.card {
+  background: var(--surface-2);
+  margin: 0.75rem 0 0;
+}
+
+ul.leeches h3 a {
+  font-size: 1.1rem;
+}
+
+ul.reasons {
+  margin: 0.25rem 0;
+  padding-left: 1.25rem;
+}
+
+ul.conflicts li {
+  min-height: 2.75rem;
+  display: flex;
+  align-items: center;
+}
+
+/* Leech choices (Progress and practice). */
+/* Two columns on a phone: four choices fit in two rows. */
+.leech-actions .actions {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+  gap: 0.5rem;
+  margin: 0.5rem 0;
+}
+
+.leech-actions .actions button {
+  white-space: normal;
+  line-height: 1.25;
+  padding-left: 0.5rem;
+  padding-right: 0.5rem;
+}
+
+.leech-lower {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem;
+  margin: 0 0 0.5rem;
+}
+
+.leech-lower button {
+  min-width: 2.75rem;
+}
+
+.leech-panel {
+  border: 2px solid var(--rate-4);
+  border-radius: var(--radius);
+  padding: 0.75rem 1rem;
+  margin-bottom: 1rem;
+  background: var(--surface);
+}
+
+.leech-panel h2 {
+  margin: 0 0 0.25rem;
+}
+
+.leech-panel p {
+  margin: 0.35rem 0;
+}
+
+.leech-done {
+  font-weight: 600;
+}
+
+/* Settings: the feedback text to copy. */
+.feedback-export textarea {
+  margin-top: 0.5rem;
+}
+
+.exports .actions {
+  flex-wrap: wrap;
+}
