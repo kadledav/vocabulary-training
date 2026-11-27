@@ -3,7 +3,9 @@
 //! Subcommands:
 //! * `serve` (default): the HTTP front; it checks once that the engine
 //!   speaks (a self-test in an engine process), then serves HTTP. The engine
-//!   process runs only while there is work (`vocab_tts::worker`).
+//!   process runs only while there is work (`vocab_tts::worker`). SIGTERM
+//!   or Ctrl-C (also during the self-test) kills the engine process at once,
+//!   answers a request in progress with `503 shutting_down`, and exits.
 //! * `worker`: the engine process (started by `serve`, not by hand).
 //! * `healthcheck`: `GET /healthz` on the local listener; exit 0 when
 //!   healthy (the runtime image has no shell or curl).
@@ -13,6 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use vocab_tts::config::Config;
+use vocab_tts::engine::Cancel;
 use vocab_tts::http;
 use vocab_tts::speaker::Speaker;
 use vocab_tts::speech::{SpeakText, Speed, Voice};
@@ -126,10 +129,22 @@ fn serve() -> ExitCode {
         }
     };
     let result = runtime.block_on(async {
+        // Before anything else: a stop during the self-test must work too
+        // (as PID 1 of a container, a signal without a handler is ignored).
+        let stop = stop_requested()?;
         let worker = Worker::new(command, config.idle);
         worker.watch_idle();
         let speaker = Speaker::new(Arc::clone(&worker) as _, WAITING_REQUESTS);
-        if let Err(message) = self_test(&speaker).await {
+        let tested = tokio::select! {
+            tested = self_test(&speaker) => tested,
+            () = stop.cancelled() => {
+                speaker.shut_down();
+                worker.release().await;
+                tracing::info!("stopped during the start self-test");
+                return Ok(true);
+            }
+        };
+        if let Err(message) = tested {
             tracing::error!("{message}");
             return Ok(false);
         }
@@ -142,7 +157,17 @@ fn serve() -> ExitCode {
             idle_s = config.idle.as_secs(),
             "serving"
         );
-        http::serve(listener, http::app(speaker), shutdown_signal()).await?;
+        let shutdown = {
+            let speaker = Arc::clone(&speaker);
+            async move {
+                stop.cancelled().await;
+                // Stops the engine now: the request in progress gets its
+                // answer (503 shutting_down) before the connections close.
+                speaker.shut_down();
+            }
+        };
+        http::serve(listener, http::app(speaker), shutdown).await?;
+        worker.release().await;
         Ok::<_, std::io::Error>(true)
     });
     match result {
@@ -177,27 +202,34 @@ async fn self_test(speaker: &Arc<Speaker>) -> Result<(), String> {
     Ok(())
 }
 
-/// Resolves on SIGTERM (`docker stop`) or Ctrl-C.
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        if tokio::signal::ctrl_c().await.is_err() {
-            std::future::pending::<()>().await;
-        }
-    };
+/// Set on SIGTERM (`docker stop`) or Ctrl-C (SIGINT). The handlers are in
+/// place when this returns.
+fn stop_requested() -> std::io::Result<Cancel> {
+    let stop = Cancel::new();
     #[cfg(unix)]
-    let terminate = async {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut signal) => {
-                signal.recv().await;
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut terminate = signal(SignalKind::terminate())?;
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = terminate.recv() => {},
+                _ = interrupt.recv() => {},
             }
-            Err(_) => std::future::pending::<()>().await,
-        }
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-    tokio::select! {
-        () = ctrl_c => {},
-        () = terminate => {},
+            tracing::info!("shutdown requested");
+            stop.cancel();
+        });
     }
-    tracing::info!("shutdown requested");
+    #[cfg(not(unix))]
+    {
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                tracing::info!("shutdown requested");
+                stop.cancel();
+            }
+        });
+    }
+    Ok(stop)
 }

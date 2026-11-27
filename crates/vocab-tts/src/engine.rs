@@ -22,6 +22,7 @@ use tokio::sync::Notify;
 #[cfg(vocab_tts_engine)]
 mod kokoro;
 
+#[cfg(doc)]
 use crate::phonemize::Phonemes;
 use crate::postprocess::Pcm;
 use crate::speech::{Speed, Voice};
@@ -41,8 +42,9 @@ const SPEAKERS: usize = 54;
 pub const ENGINE_VERSION: &str = "kokoro-int8-multi-lang-v1_0+sherpa-onnx-2.0.1";
 
 /// Set when nobody waits for the audio any more (the request timed out or
-/// the client went away): work that has not started is skipped, and the
-/// engine stops after the chunk it is on (an engine process is stopped).
+/// the client went away), or when the service stops: work that has not
+/// started is skipped, and the pipeline stops after the chunk it is on (an
+/// engine process is stopped at once).
 #[derive(Debug, Clone, Default)]
 pub struct Cancel(Arc<CancelState>);
 
@@ -76,18 +78,15 @@ impl Cancel {
     }
 }
 
-/// Turns phonemes into samples. Implementations need not be thread-safe:
-/// callers serialise them (one synthesis at a time, see `speaker`).
+/// Turns phonemes into samples, one chunk ([`Phonemes::chunks`]) at a
+/// time: the pipeline (`speaker`) goes through the chunks, can stop between
+/// them, and joins their audio. Implementations need not be thread-safe:
+/// callers serialise them (one synthesis at a time).
 pub trait Synthesizer: Send {
-    /// Speak `phonemes` (not empty) with `voice` at `speed`; stop between
-    /// chunks once `cancel` is set (then [`EngineError::Cancelled`]).
-    fn synthesize(
-        &mut self,
-        phonemes: &Phonemes,
-        voice: Voice,
-        speed: Speed,
-        cancel: &Cancel,
-    ) -> Result<Pcm, EngineError>;
+    /// Speak one chunk of phoneme symbols (not empty) with `voice` at
+    /// `speed`, as a whole utterance (with the silence the model puts at its
+    /// start and end).
+    fn synthesize(&mut self, chunk: &str, voice: Voice, speed: Speed) -> Result<Pcm, EngineError>;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -100,8 +99,6 @@ pub enum EngineError {
     WrongModel { found: i32 },
     #[error("the engine produced no audio")]
     NoAudio,
-    #[error("nobody waits for the audio any more")]
-    Cancelled,
     #[error(
         "this build has no TTS engine (build with RUSTFLAGS=\"--cfg vocab_tts_engine\" and SHERPA_ONNX_LIB_DIR, see docker/Dockerfile.tts)"
     )]

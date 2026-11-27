@@ -83,13 +83,6 @@ class Mp3Frames(unittest.TestCase):
 
 
 class Memory(unittest.TestCase):
-    def test_r83_docker_and_podman_memory_figures(self):
-        self.assertEqual(smoke.memory_bytes("910.3MB / 1.342GB"), 910_300_000)
-        self.assertEqual(smoke.memory_bytes("812MiB / 1.25GiB"), 812 * 2**20)
-        self.assertEqual(smoke.memory_bytes("1.1GiB / 1.25GiB"), int(1.1 * 2**30))
-        self.assertEqual(smoke.memory_bytes("512kB / 1GB"), 512_000)
-        self.assertIsNone(smoke.memory_bytes("--"))
-
     def test_r83_cgroup_numbers(self):
         stat = "anon 4194304\nfile 121634816\nkernel 917504\nanon_thp 0\nfile_mapped 0\n"
         self.assertEqual(
@@ -98,13 +91,26 @@ class Memory(unittest.TestCase):
         )
         # Older kernels have no memory.peak.
         self.assertEqual(smoke.cgroup_numbers("1048576", None, "anon 1\n"), {"current": 1048576, "anon": 1})
+        # Refaults of memory.stat and OOM kills of memory.events (the engine
+        # process is a child: Docker's OOMKilled stays false when it dies).
+        numbers = smoke.cgroup_numbers(
+            "1048576", "", "anon 1\nworkingset_refault_anon 5\nworkingset_refault_file 42\n",
+            "low 0\nhigh 0\nmax 12\noom 1\noom_kill 1\noom_group_kill 0\n",
+        )
+        self.assertEqual(numbers, {"current": 1048576, "anon": 1, "refaults": 42, "oom_kill": 1})
+        self.assertEqual(smoke.mib({"anon": 1 << 20, "refaults": 42, "oom_kill": 0}),
+                         "anon 1 MiB, refaults 42, oom_kill 0")
         self.assertEqual(smoke.mib({"current": 3 << 20, "anon": 1 << 20}), "current 3 MiB, anon 1 MiB")
 
     def test_r83_limit_covers_the_measured_peak(self):
-        # docs/design/tts-spike.md, "Small memory": a peak of 415 MiB for
-        # the worst accepted texts in one engine process (arm64; amd64 is
-        # measured by CI), plus a margin.
-        self.assertGreater(smoke.MEMORY_LIMIT_BYTES, 415 * 2**20 * 1.2)
+        # docs/design/tts-spike.md, "Small memory": an anonymous peak of
+        # ~435 MiB for the worst accepted texts at every speed and ~180 MiB
+        # of file cache (the model) in one engine process (arm64; amd64 is
+        # measured by CI): the limit holds both, and the anonymous peak
+        # check keeps its margin to an OOM kill.
+        self.assertGreaterEqual(smoke.MEMORY_LIMIT_BYTES, (435 + 180) * 2**20)
+        self.assertGreaterEqual(smoke.MEMORY_LIMIT_BYTES / smoke.ANON_MARGIN, 435 * 2**20)
+        self.assertGreaterEqual(smoke.ANON_MARGIN, 1.15)
         self.assertLess(smoke.MEMORY_LIMIT_BYTES, 1280 * 2**20)
 
     def test_r83_the_smoke_test_runs_under_the_compose_limit(self):

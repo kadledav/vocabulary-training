@@ -6,7 +6,16 @@
 //! beyond is refused at once as busy, so a flood cannot queue unbounded
 //! work. A request keeps its slot until its work is finished, also when the
 //! client has gone (a timed-out request does not free capacity that is
-//! still in use); the work itself is cancelled.
+//! still in use); the work itself is cancelled. When the service stops
+//! ([`Speaker::shut_down`]), no new work starts and the work in progress is
+//! stopped at once.
+//!
+//! The pipeline ([`Local`]) bounds what one request may cost before the
+//! engine starts: the audio a text would make (estimated from its phonemes
+//! and the speed) must fit [`MAX_AUDIO_MS`], so every accepted text makes a
+//! clip the app keeps; while speaking, the audio made is checked against
+//! the same limit. The engine's memory is bounded by the chunk length
+//! (`phonemize`), which shrinks for slower speech.
 //!
 //! Where the work runs is a [`Backend`]: [`Local`] runs the pipeline in this
 //! process (the engine process itself, and the tests), `crate::worker` in
@@ -14,21 +23,23 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
-use crate::engine::{Cancel, EngineError, Synthesizer};
-use crate::phonemize::{Phonemizer, Tally};
-use crate::postprocess::{self, Clip, PostError};
+use crate::engine::{self, Cancel, EngineError, Synthesizer};
+use crate::phonemize::{Cut, Phonemes, Phonemizer, Tally};
+use crate::postprocess::{self, Clip, PostError, Seam};
 use crate::speech::{SpeakText, Speed, Voice};
 
 /// The queue in front of a [`Backend`], shared by all requests.
 pub struct Speaker {
     backend: Arc<dyn Backend>,
     slots: Arc<Semaphore>,
+    stopping: AtomicBool,
 }
 
 impl std::fmt::Debug for Speaker {
@@ -58,6 +69,10 @@ pub trait Backend: Send + Sync + std::fmt::Debug {
     fn running(&self) -> bool {
         true
     }
+
+    /// The service stops: work in progress ends at once with
+    /// [`SpeakError::ShuttingDown`], and so does any work after it.
+    fn shut_down(&self) {}
 }
 
 /// A spoken text with what the log may say about it.
@@ -84,23 +99,66 @@ pub enum SpeakError {
     Post(#[from] PostError),
     #[error("the synthesis task failed")]
     Task,
-    #[error("the text would take too long to speak ({0} phoneme symbols, at most {MAX_SYMBOLS})")]
-    TooLong(usize),
+    /// The text would make (estimated before, or made while speaking) more
+    /// than [`MAX_AUDIO_MS`] of audio.
+    #[error("the text would take too long to speak (~{0} ms of audio, at most {MAX_AUDIO_MS})")]
+    TooLong(u64),
     #[error("nobody waits for the audio any more")]
     Cancelled,
-    /// The engine process failed (it did not start, or it answered nonsense).
+    /// The engine process failed while speaking (it answered nonsense, or
+    /// gave no sign of life for too long).
     #[error("engine process: {0}")]
     Worker(String),
+    /// The engine cannot be started now (the model does not load, or the
+    /// engine process dies while loading, e.g. for lack of memory): nothing
+    /// to do with the text; worth trying again later.
+    #[error("the engine cannot be started: {0}")]
+    Unavailable(String),
+    /// The service is stopping: the work was stopped (nothing to do with
+    /// the text).
+    #[error("the service is shutting down")]
+    ShuttingDown,
     /// The engine process died while it worked on this text.
     #[error("the engine process died while speaking ({0})")]
     Crashed(String),
 }
 
-/// Most phoneme symbols one request may make (≈ 60 s of speech; a normal
-/// 600-character sentence has about 600). Spelled-out numbers or letters
-/// can multiply the symbols of a text: such a text is refused instead of
-/// keeping the engine busy for minutes.
-pub const MAX_SYMBOLS: usize = 900;
+/// Most audio one request may make, ms: the app keeps clips of up to 60 s;
+/// this leaves room for the padding and for the estimate being low.
+pub const MAX_AUDIO_MS: u64 = 50_000;
+/// The estimate of a text's audio before it is spoken, at normal speed:
+/// per symbol (a pause weighted, `Phonemes::weight`) and per chunk (the
+/// silence at its start and end). Measured with the int8 model (600
+/// characters of words, compounds, numbers, commas, ellipses, dashes,
+/// one-word sentences): 26–55 ms per weighted symbol and ~370 ms per chunk;
+/// the estimate is above every measured text (by 6–60 %). Whatever the
+/// estimate misses is caught while speaking.
+const ESTIMATE_MS_PER_SYMBOL: u64 = 58;
+const ESTIMATE_MS_PER_CHUNK: u64 = 400;
+
+/// The audio `phonemes` will make at `speed`, estimated (a little high).
+fn estimated_audio_ms(phonemes: &Phonemes, speed: Speed) -> u64 {
+    let normal = phonemes.weight() as u64 * ESTIMATE_MS_PER_SYMBOL
+        + phonemes.chunks().len() as u64 * ESTIMATE_MS_PER_CHUNK;
+    (normal as f64 / f64::from(speed.get())).ceil() as u64
+}
+
+/// How the engine's audio of two chunks is joined: tightly where the text
+/// runs on.
+fn seam(cut: Cut) -> Seam {
+    match cut {
+        Cut::Pause => Seam::Pause,
+        Cut::Words => Seam::Words,
+    }
+}
+
+/// The identity of the audio this service makes for a given phoneme
+/// sequence: engine, model and voices, and the post-processing. Part of the
+/// app's clip keys (`X-Engine`): a change makes the app generate its clips
+/// again.
+pub fn engine_version() -> String {
+    format!("{}+{}", engine::ENGINE_VERSION, postprocess::VERSION)
+}
 
 /// Cancels the work when the request that wants it is gone (dropped on
 /// timeout or disconnect; harmless after the work finished).
@@ -118,6 +176,7 @@ impl Speaker {
         Arc::new(Self {
             backend,
             slots: Arc::new(Semaphore::new(waiting + 1)),
+            stopping: AtomicBool::new(false),
         })
     }
 
@@ -131,6 +190,9 @@ impl Speaker {
         voice: Voice,
         speed: Speed,
     ) -> Result<Spoken, SpeakError> {
+        if self.stopping.load(Ordering::SeqCst) {
+            return Err(SpeakError::ShuttingDown);
+        }
         let permit = Arc::clone(&self.slots)
             .try_acquire_owned()
             .map_err(|_| SpeakError::Busy)?;
@@ -154,6 +216,13 @@ impl Speaker {
     /// See [`Backend::running`].
     pub fn engine_running(&self) -> bool {
         self.backend.running()
+    }
+
+    /// The service stops: refuse new work, stop the work in progress
+    /// (see [`Backend::shut_down`]).
+    pub fn shut_down(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
+        self.backend.shut_down();
     }
 }
 
@@ -179,14 +248,17 @@ impl Local {
         })
     }
 
-    /// The pipeline, on the calling thread, never cancelled.
+    /// The pipeline, on the calling thread, never cancelled;
+    /// `after_chunk` is called after each chunk the engine spoke (a sign of
+    /// life for whoever waits).
     pub fn speak_now(
         &self,
         text: &SpeakText,
         voice: Voice,
         speed: Speed,
+        after_chunk: &mut dyn FnMut(),
     ) -> Result<Spoken, SpeakError> {
-        self.speak_cancellable(text, voice, speed, &Cancel::new())
+        self.speak_cancellable(text, voice, speed, &Cancel::new(), after_chunk)
     }
 
     fn speak_cancellable(
@@ -195,34 +267,46 @@ impl Local {
         voice: Voice,
         speed: Speed,
         cancel: &Cancel,
+        after_chunk: &mut dyn FnMut(),
     ) -> Result<Spoken, SpeakError> {
         if cancel.is_cancelled() {
             return Err(SpeakError::Cancelled);
         }
-        let phonemes = self.phonemizer.phonemize(text, voice.accent());
+        let phonemes = self.phonemizer.phonemize_at(text, voice.accent(), speed);
         if phonemes.is_empty() {
             return Err(SpeakError::NothingToSay);
         }
-        if phonemes.symbol_count() > MAX_SYMBOLS {
-            return Err(SpeakError::TooLong(phonemes.symbol_count()));
+        let estimate = estimated_audio_ms(&phonemes, speed);
+        if estimate > MAX_AUDIO_MS {
+            return Err(SpeakError::TooLong(estimate));
         }
         let started = Instant::now();
-        let pcm = {
+        let mut parts = Vec::with_capacity(phonemes.chunks().len());
+        let mut audio_ms = 0;
+        {
             // A panic inside the engine aborts the process (release profile),
             // so a poisoned lock only happens in tests; the engine has no
             // state a failed call could leave half-changed.
             let mut engine = self.engine.lock().unwrap_or_else(PoisonError::into_inner);
-            // Waited for the engine: is anybody still waiting for this?
-            if cancel.is_cancelled() {
-                return Err(SpeakError::Cancelled);
+            for chunk in phonemes.chunks() {
+                // Between chunks: is anybody still waiting for this?
+                if cancel.is_cancelled() {
+                    return Err(SpeakError::Cancelled);
+                }
+                let part = engine.synthesize(chunk, voice, speed)?;
+                audio_ms += part.duration_ms();
+                if audio_ms > MAX_AUDIO_MS {
+                    return Err(SpeakError::TooLong(audio_ms));
+                }
+                parts.push(part);
+                after_chunk();
             }
-            engine
-                .synthesize(&phonemes, voice, speed, cancel)
-                .map_err(|err| match err {
-                    EngineError::Cancelled => SpeakError::Cancelled,
-                    other => SpeakError::Engine(other),
-                })?
-        };
+        }
+        if cancel.is_cancelled() {
+            return Err(SpeakError::Cancelled);
+        }
+        let seams: Vec<Seam> = phonemes.cuts().iter().map(|cut| seam(*cut)).collect();
+        let pcm = postprocess::join(parts, &seams)?;
         let synthesis_ms = elapsed_ms(started);
         let started = Instant::now();
         let clip = postprocess::to_mp3(pcm)?;
@@ -241,7 +325,7 @@ impl Backend for Local {
     fn speak(self: Arc<Self>, text: SpeakText, voice: Voice, speed: Speed, cancel: Cancel) -> Work {
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
-                self.speak_cancellable(&text, voice, speed, &cancel)
+                self.speak_cancellable(&text, voice, speed, &cancel, &mut || {})
             })
             .await
             .map_err(|_| SpeakError::Task)?
