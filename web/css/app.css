@@ -2090,6 +2090,23 @@ ul.conflicts li {
   margin: 0 0 0.25rem;
 }
 
+/* Folded (a typed card, a short screen): one line until opened. */
+.leech-panel.folded {
+  padding: 0 1rem;
+}
+
+.leech-panel.folded summary {
+  min-height: 2.75rem;
+  display: flex;
+  align-items: center;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.leech-panel.folded details[open] {
+  padding-bottom: 0.75rem;
+}
+
 .leech-panel p {
   margin: 0.35rem 0;
 }

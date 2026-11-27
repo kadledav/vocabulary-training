@@ -7,11 +7,28 @@
  * answer and the rating buttons stay below, so "Keep practising" is just
  * rating as usual. The word's usefulness and goal (which choices exist)
  * come from the word itself, fetched when the panel opens.
+ *
+ * On a typed card (the checked answer must stay in sight, often with the
+ * on-screen keyboard still open) and on a short screen the panel starts
+ * folded to one line that opens it.
  */
 
 import { getJson } from '../api.js';
 import { h, mount } from '../dom.js';
 import { leechActions } from '../leech.js';
+import { isTyped } from './model.js';
+
+/** Screens this short (or less) show the panel folded. */
+const SHORT_SCREEN = '(max-height: 560px)';
+
+/** Items whose folded panel the owner opened (it stays open when redrawn). */
+/** @type {Set<number>} */
+const opened = new Set();
+
+/** @param {Item} item */
+function folded(item) {
+  return isTyped(item) || (typeof matchMedia === 'function' && matchMedia(SHORT_SCREEN).matches);
+}
 
 /**
  * @typedef {import('../session.js').Item} Item
@@ -73,10 +90,7 @@ export function leechPanel(item, done, onDone, isCurrent) {
       ),
     );
   })();
-  return h(
-    'section',
-    { class: 'leech-panel', 'aria-labelledby': 'leech-title', 'data-testid': 'leech-panel' },
-    h('h2', { id: 'leech-title' }, 'This word keeps slipping'),
+  const content = [
     h('p', {}, 'You have forgotten it on several days. What would help?'),
     word.hint
       ? h('p', { class: 'leech-hint' }, 'Memory hint: ', h('span', { lang: 'en' }, word.hint))
@@ -90,5 +104,29 @@ export function leechPanel(item, done, onDone, isCurrent) {
       h('a', { href: `#/words/${word.id}` }, 'open the word'),
       ' to write a hint or fix a sentence. Then rate the card as usual.',
     ),
+  ];
+  if (folded(item)) {
+    return h(
+      'section',
+      { class: 'leech-panel folded', 'aria-label': 'This word keeps slipping', 'data-testid': 'leech-panel' },
+      h(
+        'details',
+        {
+          open: opened.has(item.item_id),
+          ontoggle: (/** @type {Event} */ e) => {
+            if (/** @type {HTMLDetailsElement} */ (e.currentTarget).open) opened.add(item.item_id);
+            else opened.delete(item.item_id);
+          },
+        },
+        h('summary', { 'data-testid': 'leech-open' }, 'This word keeps slipping: what would help?'),
+        content,
+      ),
+    );
+  }
+  return h(
+    'section',
+    { class: 'leech-panel', 'aria-labelledby': 'leech-title', 'data-testid': 'leech-panel' },
+    h('h2', { id: 'leech-title' }, 'This word keeps slipping'),
+    content,
   );
 }
