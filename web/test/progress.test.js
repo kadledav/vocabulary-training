@@ -54,9 +54,9 @@ test('R-55 reasons name the rule in plain words', () => {
   assert.match(reasonText({ ...card, reason: { kind: 'acknowledged' } }), /three weeks/);
 });
 
-test('R-55 leech choices follow the word: recognise-only for active words, suspend first when not useful', () => {
+test('R-55 leech choices follow the word: recognise-only for words with typed cards, suspend first when not useful', () => {
   assert.deepEqual(
-    leechChoices({ usefulness: 7, goal: 'active' }).map((c) => [c.action, c.primary]),
+    leechChoices({ usefulness: 7, goal: 'active', spelling: false }).map((c) => [c.action, c.primary]),
     [
       ['leech_keep', true],
       ['leech_recognise', false],
@@ -65,7 +65,7 @@ test('R-55 leech choices follow the word: recognise-only for active words, suspe
     ],
   );
   assert.deepEqual(
-    leechChoices({ usefulness: 3, goal: 'recognise' }).map((c) => [c.action, c.primary]),
+    leechChoices({ usefulness: 3, goal: 'recognise', spelling: false }).map((c) => [c.action, c.primary]),
     [
       ['leech_suspend', true],
       ['leech_keep', false],
@@ -73,8 +73,14 @@ test('R-55 leech choices follow the word: recognise-only for active words, suspe
     ],
   );
   assert.deepEqual(
-    leechChoices({ usefulness: 1, goal: 'recognise' }).map((c) => c.action),
+    leechChoices({ usefulness: 1, goal: 'recognise', spelling: false }).map((c) => c.action),
     ['leech_suspend', 'leech_keep'],
+  );
+  // A recognise-only word with spelling practice still types: "Recognise
+  // only" switches the spelling off too.
+  assert.deepEqual(
+    leechChoices({ usefulness: 6, goal: 'recognise', spelling: true }).map((c) => c.action),
+    ['leech_keep', 'leech_recognise', 'leech_usefulness', 'leech_suspend'],
   );
   assert.deepEqual(lowerUsefulness(4), [3, 2, 1]);
   assert.deepEqual(lowerUsefulness(1), []);

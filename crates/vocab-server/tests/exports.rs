@@ -271,9 +271,11 @@ const TABLES: [(&str, &str); 15] = [
 ];
 
 /// Tables the export leaves out on purpose (design §8.1): the account,
-/// the owner's short-lived Undo, the audio cache, what open blocks still
-/// hold, and the settings (exported as the effective `settings` member).
-/// A new table fails the test until it is put here or in [`TABLES`].
+/// the owner's short-lived Undo, the audio cache (regenerable from the
+/// words: `audio_clip` with M10's `spelled` and every other column,
+/// `audio_engine`), what open blocks still hold, and the settings
+/// (exported as the effective `settings` member). A new table fails the
+/// test until it is put here or in [`TABLES`].
 const NOT_EXPORTED: [&str; 8] = [
     "audio_clip",
     "audio_engine",
@@ -563,6 +565,72 @@ async fn r86_full_export_round_trip_into_a_fresh_database() {
             "{secret} in the export"
         );
     }
+
+    let target = env_fresh();
+    assert_round_trip(&env, &export, &target);
+}
+
+/// M10 in the full export (design §6.8, §8.1): a Spelling card and its
+/// review travel like any other card (the round trip covers them); the
+/// typed answer is exported as stored, without the invisible characters
+/// the owner's keyboard put in, as the word's history shows it.
+#[tokio::test]
+async fn r86_r58_spelling_cards_and_their_typed_answers_in_the_full_export() {
+    let env = env();
+    let mut whiskey = word("whiskey", 7, 3);
+    whiskey["spelling"] = json!(true);
+    env.import(BOOK, vec![whiskey]).await;
+    env.exec(
+        "UPDATE card SET state = 'review', format = 'sentence', stability = 40.0, \
+           difficulty = 5.0, due_day = '2026-12-30', last_review_day = '2026-11-01', \
+           introduced_day = '2026-10-01', reps = 4 WHERE kind = 'understand';
+         INSERT INTO card (word_id, kind, format, state, stability, difficulty, due_day, \
+           last_review_day, introduced_day, reps, created_at) \
+         SELECT id, 'spelling', 'spelling', 'review', 5.0, 5.0, '2026-11-20', '2026-11-15', \
+           '2026-10-20', 2, '2026-10-20T09:00:00Z' FROM word;",
+    );
+    let (status, start) = env.post("/api/sessions", &json!({ "kind": "start" })).await;
+    assert_eq!(status, StatusCode::OK, "{start}");
+    let item = &start["session"]["items"][0];
+    assert_eq!(item["card"]["kind"], "spelling", "{start}");
+    let session = start["session"]["id"].as_str().expect("id");
+    let (status, body) = env
+        .post(
+            &format!("/api/sessions/{session}/reviews"),
+            &json!({ "client_review_id": "00000000-0000-4000-8000-0000000000a1",
+                     "item_id": item["item_id"], "raw_grade": 4, "suggested_grade": 4,
+                     "typed_answer": "\u{200B}whis\u{00AD}key\u{2060}y", "answer_match": "none",
+                     "hint_used": false, "duration_ms": 900,
+                     "client_ts": "2026-11-20T09:00:00Z" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, _, bytes) = download(&env, "/api/export/full").await;
+    assert_eq!(status, StatusCode::OK);
+    let export: Value = serde_json::from_slice(&bytes).expect("complete JSON");
+    let column = |table: &str, name: &str| {
+        export[table]["columns"]
+            .as_array()
+            .expect("columns")
+            .iter()
+            .position(|c| c == name)
+            .unwrap_or_else(|| panic!("{table}.{name}"))
+    };
+    let kinds: Vec<&Value> = export["cards"]["rows"]
+        .as_array()
+        .expect("cards")
+        .iter()
+        .map(|r| &r[column("cards", "kind")])
+        .collect();
+    assert!(kinds.contains(&&json!("spelling")), "{kinds:?}");
+    let review = &export["reviews"]["rows"][0];
+    assert_eq!(review[column("reviews", "typed_answer")], "whiskeyy");
+    assert_eq!(review[column("reviews", "answer_match")], "none");
+    assert_eq!(review[column("reviews", "format")], "spelling");
+    let id = env.word_id("whiskey").await.get();
+    let (_, detail) = env.get(&format!("/api/words/{id}")).await;
+    assert_eq!(detail["history"][0]["typed_answer"], "whiskeyy", "{detail}");
 
     let target = env_fresh();
     assert_round_trip(&env, &export, &target);

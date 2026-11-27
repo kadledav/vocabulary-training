@@ -1286,9 +1286,18 @@ export function renderPractice(root, isCurrent) {
     if (item) {
       reopen(item);
       state.shownAt = state.phaseAt;
+      // The card shown after the choice (perhaps a Spelling question
+      // playing its word) is gone: its sound too.
+      stopClip();
     }
     toast.show({ text: 'Choice undone', ms: 2500 });
     render({ focus: true, scroll: true });
+    if (item) {
+      // Back on a Spelling question (its check was not made in this
+      // visit): the word plays again, or the status says why not.
+      loadClips();
+      soundQuestion();
+    }
   };
 
   /**

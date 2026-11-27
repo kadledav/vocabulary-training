@@ -31,7 +31,7 @@ export function undoLeechChoice(id, token) {
 /**
  * The choice buttons for word `word`.
  *
- * @param {{ id: number, headword: string, usefulness: number, goal: 'active' | 'recognise' }} word
+ * @param {{ id: number, headword: string, usefulness: number, goal: 'active' | 'recognise', spelling: boolean }} word
  * @param {(done: { action: LeechActionName, text: string, answer: ActionAnswer }) => void} onDone
  * @returns {HTMLElement}
  */

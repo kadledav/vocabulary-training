@@ -366,7 +366,9 @@ pub enum WordAction {
 pub enum LeechAction {
     /// Keep practising as before.
     Keep,
-    /// Goal `recognise` (owner override): the Produce card is suspended.
+    /// No typed cards: goal `recognise` (owner override) suspends the
+    /// Produce card, and spelling practice is switched off (the Spelling
+    /// card is suspended).
     RecogniseOnly,
     /// A lower usefulness (1 up to one below the current value): lower
     /// desired retention, later new-word order.
@@ -428,7 +430,8 @@ pub fn word_action(
 /// The owner's choice on a problem word's leech screen (design §6.5): the
 /// catalog change it asks for, then the acknowledgement of the word's
 /// flagged cards. The caller brings the cards in line afterwards (a goal
-/// switched to `recognise` suspends the Produce card).
+/// switched to `recognise` suspends the Produce card, spelling switched
+/// off the Spelling card).
 fn leech_action(
     tx: &Transaction<'_>,
     id: WordId,
@@ -439,7 +442,14 @@ fn leech_action(
     match choice {
         LeechAction::Keep => {}
         LeechAction::RecogniseOnly => {
-            catalog::update_word(tx, id, &serde_json::json!({ "goal": "recognise" }), stamp)?;
+            // No typing at all: the goal suspends the Produce card, the
+            // spelling switch the Spelling card (design §6.5).
+            let edit = if traits.spelling {
+                serde_json::json!({ "goal": "recognise", "spelling": false })
+            } else {
+                serde_json::json!({ "goal": "recognise" })
+            };
+            catalog::update_word(tx, id, &edit, stamp)?;
         }
         LeechAction::LowerUsefulness(value) => {
             if traits.usefulness <= 1 {

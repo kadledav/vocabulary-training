@@ -842,25 +842,44 @@ fn form_rows(conn: &Connection, condition: &str) -> Vec<String> {
     .collect()
 }
 
-/// Migrations 0006–0008 (M6, M7, M10; R-04, R-58, R-85) on a database of
-/// the released schema (version 5, v0.1.1) holding the synthetic fixture
-/// (words, forms, sentences, cards, reviews, clips, suggestions): every
-/// word's key is its first pack spelling, every stored form is kept and not
-/// removed, the id floors start at the stored ids, no stored clip claims to
-/// spell nothing out (unknown), the constraints hold.
-/// (The version-5 database is built from the migrations' SQL; the Rust data
-/// step of 0005 only re-keys sentences and plays no part here.)
+/// The migrations after the released schema (version 5, v0.1.1), by the
+/// version they bring the schema to.
+const AFTER_RELEASE: [(u32, &str); 4] = [
+    (6, include_str!("../migrations/0006_audio.sql")),
+    (7, include_str!("../migrations/0007_word_edits.sql")),
+    (8, include_str!("../migrations/0008_audio_spelled.sql")),
+    (9, include_str!("../migrations/0009_leech_ack_review.sql")),
+];
+
+/// A database at `version` (5, the released schema of v0.1.1, or a later
+/// one) holding the synthetic fixture; returns its forms and table counts.
+/// (Built from the migrations' SQL; the Rust data step of 0005 only
+/// re-keys sentences and plays no part here.)
+fn database_at(data: &Path, version: u32) -> (Vec<String>, Vec<(&'static str, i64)>) {
+    let conn = v4_database(data);
+    conn.execute_batch(include_str!("../migrations/0005_review_round_1.sql"))
+        .expect("migration");
+    for (to, sql) in AFTER_RELEASE {
+        if to <= version {
+            conn.execute_batch(sql).expect("migration");
+        }
+    }
+    conn.pragma_update(None, "user_version", version)
+        .expect("version");
+    (form_rows(&conn, "1"), table_counts(&conn))
+}
+
+/// Migrations 0006–0009 (M6, M7, M10, M9; R-04, R-55, R-58, R-85) on a
+/// database of the released schema (version 5, v0.1.1) holding the
+/// synthetic fixture (words, forms, sentences, cards, reviews, clips,
+/// suggestions): every word's key is its first pack spelling, every stored
+/// form is kept and not removed, the id floors start at the stored ids, no
+/// stored clip claims to spell nothing out (unknown), no card remembers a
+/// leech choice, the constraints hold.
 #[test]
 fn r04_r58_released_v5_database_with_data_migrates_to_the_latest() {
     let (_root, data) = data_dir();
-    let (forms_before, counts_before) = {
-        let conn = v4_database(&data);
-        conn.execute_batch(include_str!("../migrations/0005_review_round_1.sql"))
-            .expect("migration");
-        conn.pragma_update(None, "user_version", 5)
-            .expect("version");
-        (form_rows(&conn, "1"), table_counts(&conn))
-    };
+    let (forms_before, counts_before) = database_at(&data, 5);
     for (table, n) in &counts_before {
         assert!(*n > 0, "the fixture has {table}");
     }
@@ -902,6 +921,14 @@ fn r04_r58_released_v5_database_with_data_migrates_to_the_latest() {
         .expect("count");
     assert!(clips > 0, "the fixture has clips");
     assert_eq!(unknown, clips, "whether an old clip spells is unknown");
+    let acked: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM card WHERE leech_acked_after IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .expect("count");
+    assert_eq!(acked, 0, "no leech choice made before 0009");
     assert!(
         conn.execute("UPDATE audio_clip SET spelled = -1", [])
             .is_err(),
@@ -971,4 +998,52 @@ fn r04_r58_released_v5_database_with_data_migrates_to_the_latest() {
     assert!(floor("sentence") >= newest_sentence);
     assert!(pragma_rows(&conn, "foreign_key_check").is_empty());
     assert_eq!(pragma_rows(&conn, "integrity_check"), vec!["Text(\"ok\")"]);
+}
+
+/// Every schema since the release (5, v0.1.1) up to the one before this
+/// build's migrates to the latest without losing a row: the migrations
+/// run in order from wherever the database stands (R-85).
+#[test]
+fn r85_every_schema_since_the_release_migrates_to_the_latest() {
+    assert_eq!(
+        Db::schema_version(),
+        9,
+        "a new migration: add it to AFTER_RELEASE"
+    );
+    for version in 5..Db::schema_version() {
+        let (_root, data) = data_dir();
+        let (forms_before, counts_before) = database_at(&data, version);
+        drop(Db::open(&data).expect("migrates"));
+        let conn = inspect(&data);
+        let found: u32 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .expect("user_version");
+        assert_eq!(found, Db::schema_version(), "from {version}");
+        assert_eq!(form_rows(&conn, "1"), forms_before, "from {version}");
+        assert_eq!(
+            table_counts(&conn),
+            counts_before,
+            "from {version}: no row lost"
+        );
+        for (table, column) in [("audio_clip", "spelled"), ("card", "leech_acked_after")] {
+            let set: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE {column} IS NOT NULL"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or_else(|e| panic!("from {version}: {table}.{column}: {e}"));
+            assert_eq!(set, 0, "from {version}: {table}.{column} unknown");
+        }
+        assert!(pragma_rows(&conn, "foreign_key_check").is_empty());
+        assert_eq!(pragma_rows(&conn, "integrity_check"), vec!["Text(\"ok\")"]);
+        drop(conn);
+        // Opening again changes nothing.
+        drop(Db::open(&data).expect("reopens"));
+        assert_eq!(
+            table_counts(&inspect(&data)),
+            counts_before,
+            "from {version}"
+        );
+    }
 }

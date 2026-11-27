@@ -147,6 +147,9 @@ pub struct LeechEntry {
     pub word: catalog::ProblemWord,
     /// `recognise` or `active` (design §6.3).
     pub goal: &'static str,
+    /// Marked for spelling practice ("Recognise only" also switches it
+    /// off, design §6.5).
+    pub spelling: bool,
     /// The leech screen is due (a card is flagged, not yet acknowledged).
     pub flagged: bool,
     pub cards: Vec<LeechCard>,
@@ -267,6 +270,7 @@ pub fn progress(conn: &Connection, day: StudyDay) -> Result<ProgressView, StatsE
                 goal: traits
                     .get(&word.id)
                     .map_or("recognise", |t| t.effective_goal().as_str()),
+                spelling: traits.get(&word.id).is_some_and(|t| t.spelling),
                 flagged: cards
                     .iter()
                     .any(|c| !matches!(c.reason, LeechReason::Acknowledged)),

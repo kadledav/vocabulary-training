@@ -749,3 +749,256 @@ async fn r55_a_rating_after_the_choice_is_undone_first() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(leech_state(&env, "sierra"), chosen);
 }
+
+// ── problem words and Spelling cards (M9 with M10) ──────────────────────────
+
+/// `headword` known on its Understand card (due on `understand_due`),
+/// marked for spelling practice, with a reviewed Spelling card due today
+/// with `lapses` lapses and the leech state `leech`.
+async fn spelling_word(
+    env: &Env,
+    headword: &str,
+    understand_due: &str,
+    lapses: u32,
+    leech: &str,
+) -> i64 {
+    env.import(BOOK_A, vec![word(headword, 7, 3)]).await;
+    understand(
+        env,
+        headword,
+        40.0,
+        understand_due,
+        "2026-10-01",
+        6,
+        0,
+        "none",
+    );
+    env.exec(&format!(
+        "UPDATE word SET spelling = 1 WHERE headword = '{headword}';
+         INSERT INTO card (word_id, kind, format, state, stability, difficulty, due_day, \
+           last_review_day, introduced_day, reps, lapses, leech, created_at) \
+         SELECT id, 'spelling', 'spelling', 'review', 3.0, 6.0, '2026-11-20', '2026-11-17', \
+           '2026-10-20', 6, {lapses}, '{leech}', '2026-10-20T09:00:00Z' \
+         FROM word WHERE headword = '{headword}'"
+    ));
+    env.word_id(headword).await.get()
+}
+
+fn card_of(view: &Value, kind: &str) -> Value {
+    view["cards"]
+        .as_array()
+        .expect("cards")
+        .iter()
+        .find(|c| c["kind"] == kind)
+        .unwrap_or_else(|| panic!("{kind} card in {view}"))
+        .clone()
+}
+
+#[tokio::test]
+async fn r55_r58_a_word_whose_only_problem_card_is_its_spelling_card() {
+    let env = env();
+    let id = spelling_word(&env, "tango", "2026-12-20", 5, "flagged").await;
+    // A problem word everywhere, by its Spelling card alone.
+    assert!(problem_everywhere(&env, "tango").await);
+    let list = leech_list(&env).await;
+    assert_eq!(list[0]["spelling"], true);
+    assert_eq!(list[0]["goal"], "active");
+    assert_eq!(
+        list[0]["cards"],
+        json!([{ "kind": "spelling", "reason": { "kind": "lapses", "lapses": 5 },
+                 "lapses": 5, "stability": 3.0, "last_review_day": "2026-11-17" }])
+    );
+    // "Keep practising" acknowledges it: still a problem (not remembered
+    // for three weeks yet). The spelling switch off ends it, on again
+    // brings it back, everywhere.
+    let (status, _) = action(&env, id, json!({ "action": "leech_keep" })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(problem_everywhere(&env, "tango").await);
+    let patch = |spelling: bool| {
+        let env = &env;
+        async move {
+            env.request(
+                "PATCH",
+                &format!("/api/words/{id}"),
+                Some(&json!({ "spelling": spelling })),
+            )
+            .await
+            .0
+        }
+    };
+    assert_eq!(patch(false).await, StatusCode::OK);
+    assert!(!problem_everywhere(&env, "tango").await);
+    let (_, p) = env.get("/api/progress").await;
+    assert_eq!(p["totals"]["problem"], 0);
+    assert_eq!(p["totals"]["known"], 1, "shown by its Understand card");
+    assert_eq!(patch(true).await, StatusCode::OK);
+    assert!(problem_everywhere(&env, "tango").await);
+    // Remembered for three weeks: no problem any more.
+    env.exec("UPDATE card SET stability = 21.0 WHERE kind = 'spelling'");
+    assert!(!problem_everywhere(&env, "tango").await);
+}
+
+#[tokio::test]
+async fn r55_r58_recognise_only_over_a_spelling_problem_means_no_typing_at_all() {
+    let env = env();
+    let id = spelling_word(&env, "uniform", "2026-12-20", 5, "flagged").await;
+    add_card(&env, "uniform", "produce", "cloze", "none");
+    let (status, view) = action(&env, id, json!({ "action": "leech_recognise" })).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["effective_goal"], "recognise");
+    assert_eq!(view["spelling"], false);
+    assert_eq!(card_of(&view, "spelling")["suspended"], true);
+    assert_eq!(card_of(&view, "spelling")["leech"], "acknowledged");
+    assert_eq!(card_of(&view, "produce")["suspended"], true);
+    assert!(!problem_everywhere(&env, "uniform").await);
+    // Its Undo brings back the goal, the spelling practice and the flag.
+    let token = view["undo"].as_str().expect("token").to_owned();
+    let (status, view) = undo_choice(&env, id, &token).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["effective_goal"], "active");
+    assert_eq!(view["spelling"], true);
+    assert_eq!(card_of(&view, "spelling")["suspended"], false);
+    assert_eq!(card_of(&view, "spelling")["leech"], "flagged");
+    assert_eq!(card_of(&view, "produce")["suspended"], false);
+    assert!(problem_everywhere(&env, "uniform").await);
+    // A recognise-only word with spelling practice is offered the choice
+    // too (the Progress entry says so): it switches the spelling off.
+    env.exec("UPDATE word SET goal = 'recognise' WHERE headword = 'uniform'");
+    assert_eq!(leech_list(&env).await[0]["goal"], "recognise");
+    assert_eq!(leech_list(&env).await[0]["spelling"], true);
+    let (status, view) = action(&env, id, json!({ "action": "leech_recognise" })).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["spelling"], false);
+    assert!(!problem_everywhere(&env, "uniform").await);
+}
+
+/// Rate the next item of `session` (a Spelling card): `typed` as typed.
+async fn rate_spelling(env: &Env, session: &str, grade: u8, typed: &str) -> Value {
+    let (_, current) = env.get("/api/sessions/current").await;
+    let item = current["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|i| i["answered"].is_null())
+        .expect("an item to rate")
+        .clone();
+    assert_eq!(item["card"]["kind"], "spelling", "{item}");
+    let n = env.int("SELECT COUNT(*) FROM review_log");
+    let (status, body) = env
+        .post(
+            &format!("/api/sessions/{session}/reviews"),
+            &json!({
+                "client_review_id": format!("00000000-0000-4000-8000-{n:012}"),
+                "item_id": item["item_id"],
+                "raw_grade": grade,
+                "suggested_grade": if grade >= 4 { 4 } else { 2 },
+                "typed_answer": typed,
+                "answer_match": if grade >= 4 { "none" } else { "exact" },
+                "hint_used": false,
+                "duration_ms": 1000,
+                "client_ts": "2026-11-20T09:00:00Z",
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body
+}
+
+#[tokio::test]
+async fn r55_r58_a_spelling_rating_and_the_choice_after_it_are_undone_last_first() {
+    let env = env();
+    let (status, _) = env
+        .request("PATCH", "/api/settings", Some(&json!({ "new_per_day": 0 })))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    // Three lapses: the failed Spelling rating flags it.
+    let id = spelling_word(&env, "victor", "2026-12-20", 3, "none").await;
+    let spelling_state = || {
+        env.sql()
+            .query_row(
+                "SELECT c.state || ' lapses=' || c.lapses || ' ' || c.leech || ' suspended=' || \
+                   c.suspended || ' spelling=' || w.spelling \
+                 FROM card c JOIN word w ON w.id = c.word_id \
+                 WHERE w.headword = 'victor' AND c.kind = 'spelling'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("state")
+    };
+    let before = spelling_state();
+    let (status, start) = env.post("/api/sessions", &json!({ "kind": "start" })).await;
+    assert_eq!(status, StatusCode::OK, "{start}");
+    let session = start["session"]["id"].as_str().expect("id").to_owned();
+    let rated = rate_spelling(&env, &session, 5, "victer").await;
+    assert_eq!(rated["review"]["leech_flagged"], true, "{rated}");
+    assert!(spelling_state().contains("flagged"));
+    let (status, view) = action(&env, id, json!({ "action": "leech_recognise" })).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    let token = view["undo"].as_str().expect("token").to_owned();
+    // The rating's Undo first is refused; the choice's, then the
+    // rating's, restore the card exactly.
+    let (status, body) = undo_rating(&env, &session).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "leech_choice_first");
+    let (status, body) = undo_choice(&env, id, &token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = undo_rating(&env, &session).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(spelling_state(), before);
+}
+
+#[tokio::test]
+async fn r72_r58_progress_and_today_agree_on_understand_produce_and_spelling_cards() {
+    let env = env();
+    let (status, _) = env
+        .request("PATCH", "/api/settings", Some(&json!({ "new_per_day": 0 })))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    // whiskey: Understand due today, Produce due tomorrow, Spelling due
+    // today (a problem card). xray: Understand due on the 22nd, Spelling
+    // due today and tomorrow's Produce waiting for its first review.
+    spelling_word(&env, "whiskey", "2026-11-20", 5, "flagged").await;
+    env.exec(
+        "INSERT INTO card (word_id, kind, format, state, stability, difficulty, due_day, \
+           last_review_day, introduced_day, reps, created_at) \
+         SELECT id, 'produce', 'cloze', 'review', 9.0, 5.0, '2026-11-21', '2026-11-12', \
+           '2026-11-01', 3, '2026-11-01T09:00:00Z' FROM word WHERE headword = 'whiskey'",
+    );
+    spelling_word(&env, "xray", "2026-11-22", 0, "none").await;
+    env.exec(
+        "INSERT INTO card (word_id, kind, state, due_day, created_at) \
+         SELECT id, 'produce', 'new', '2026-11-21', '2026-11-19T09:00:00Z' \
+         FROM word WHERE headword = 'xray'",
+    );
+    let (_, p) = env.get("/api/progress").await;
+    let (_, today) = env.get("/api/today").await;
+    // One card per word today: whiskey (one of its two due cards) and
+    // xray's Spelling card.
+    assert_eq!(today["due_now"], 2, "{today}");
+    assert_eq!(p["due_now"], today["due_now"], "Progress = Today");
+    // The forecast counts reviewed cards of every kind; the first-time
+    // Produce card waits outside it (design §6.6).
+    let days = |v: &Value| -> Vec<i64> {
+        v["forecast"]
+            .as_array()
+            .expect("forecast")
+            .iter()
+            .map(|f| f["due"].as_i64().expect("due"))
+            .collect()
+    };
+    assert_eq!(days(&today)[..3], [1, 1, 0], "{today}");
+    assert_eq!(days(&p)[..7], days(&today)[..], "the first 7 days agree");
+    assert_eq!(p["due_next_7_days"], 2);
+    // Statuses: whiskey is a problem word by its Spelling card, xray is
+    // known; "can produce" counts whiskey's Produce card (9 days).
+    let t = &p["totals"];
+    assert_eq!(counts(t), [2, 0, 0, 0, 1, 1, 0, 1], "{t}");
+    // Retention lists the Spelling kind once its cards exist.
+    let kinds: Vec<&str> = p["retention"]["kinds"]
+        .as_array()
+        .expect("kinds")
+        .iter()
+        .map(|k| k["kind"].as_str().expect("kind"))
+        .collect();
+    assert_eq!(kinds, ["understand", "produce", "spelling"]);
+}

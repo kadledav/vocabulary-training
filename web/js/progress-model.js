@@ -14,7 +14,7 @@ import { plural } from './words-model.js';
  * @typedef {{ kind: 'understand' | 'produce' | 'spelling', reason: LeechReason, lapses: number,
  *             stability: number | null, last_review_day: string | null }} LeechCard
  * @typedef {{ id: number, headword: string, czech: string[], usefulness: number, hint: string | null,
- *             confusables: string[], sources: string[], goal: 'active' | 'recognise', flagged: boolean,
+ *             confusables: string[], sources: string[], goal: 'active' | 'recognise', spelling: boolean, flagged: boolean,
  *             cards: LeechCard[] }} LeechEntry
  * @typedef {{ words: number, new: number, learning: number, familiar: number, known: number,
  *             problem: number, suspended: number, can_produce: number }} StatusCounts
@@ -98,18 +98,20 @@ export function reasonText(card) {
 }
 
 /**
- * The leech screen's choices for a word (design §6.5): recognise-only only
- * for an `active` word, lower usefulness only above 1. With usefulness ≤ 4
- * "Suspend" is the suggested choice, otherwise "Keep practising".
+ * The leech screen's choices for a word (design §6.5): recognise-only (no
+ * typed cards: goal `recognise`, spelling practice off) only for an
+ * `active` word or one marked for spelling practice, lower usefulness only
+ * above 1. With usefulness ≤ 4 "Suspend" is the suggested choice,
+ * otherwise "Keep practising".
  *
- * @param {{ usefulness: number, goal: 'active' | 'recognise' }} word
+ * @param {{ usefulness: number, goal: 'active' | 'recognise', spelling: boolean }} word
  * @returns {{ action: LeechActionName, label: string, primary: boolean }[]}
  */
 export function leechChoices(word) {
   const suspendFirst = word.usefulness <= 4;
   /** @type {{ action: LeechActionName, label: string, primary: boolean }[]} */
   const choices = [{ action: 'leech_keep', label: 'Keep practising', primary: !suspendFirst }];
-  if (word.goal === 'active') choices.push({ action: 'leech_recognise', label: 'Recognise only (no typing)', primary: false });
+  if (word.goal === 'active' || word.spelling) choices.push({ action: 'leech_recognise', label: 'Recognise only (no typing)', primary: false });
   if (word.usefulness > 1) choices.push({ action: 'leech_usefulness', label: 'Lower usefulness', primary: false });
   choices.push({ action: 'leech_suspend', label: 'Suspend word', primary: suspendFirst });
   return suspendFirst ? [choices[choices.length - 1], ...choices.slice(0, -1)] : choices;

@@ -5,8 +5,9 @@
  * word keeps slipping, its memory hint (or that none exists yet), the
  * words it is easily confused with, and the choices of `leech.js`. The
  * answer and the rating buttons stay below, so "Keep practising" is just
- * rating as usual. The word's usefulness and goal (which choices exist)
- * come from the word itself, fetched when the panel opens.
+ * rating as usual. The word's usefulness, goal and spelling practice
+ * (which choices exist) come from the word itself, fetched when the panel
+ * opens.
  *
  * On a typed card (the checked answer must stay in sight, often with the
  * on-screen keyboard still open) and on a short screen the panel starts
@@ -36,10 +37,10 @@ function folded(item) {
  */
 
 /**
- * The word's usefulness and goal, asked once per word while the panel is
+ * The word's usefulness, goal and spelling practice, asked once per word while the panel is
  * redrawn (More, help); forgotten when a choice changes them.
  *
- * @type {Map<number, Promise<import('../api.js').ApiResult<{ usefulness: number, effective_goal: 'active' | 'recognise' }>>>}
+ * @type {Map<number, Promise<import('../api.js').ApiResult<{ usefulness: number, effective_goal: 'active' | 'recognise', spelling: boolean | null }>>>}
  */
 const facts = new Map();
 
@@ -82,7 +83,13 @@ export function leechPanel(item, done, onDone, isCurrent) {
     mount(
       choices,
       leechActions(
-        { id: word.id, headword: word.headword, usefulness: answer.data.usefulness, goal: answer.data.effective_goal },
+        {
+          id: word.id,
+          headword: word.headword,
+          usefulness: answer.data.usefulness,
+          goal: answer.data.effective_goal,
+          spelling: answer.data.spelling === true,
+        },
         ({ action, text, answer: done }) => {
           facts.delete(word.id);
           onDone({ action, text, undo: typeof done.undo === 'string' ? done.undo : null });

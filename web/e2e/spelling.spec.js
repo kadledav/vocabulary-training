@@ -559,3 +559,103 @@ test.describe('with a TTS service', () => {
     expect(await spoken(page)).toEqual(['glimmerous']);
   });
 });
+
+/**
+ * Flag the Spelling card of `headword` (a reviewed card that keeps
+ * slipping, due today): the leech panel opens on its answer side.
+ *
+ * @param {import('./fixtures.js').App} app
+ * @param {string} headword
+ */
+function flagSpelling(app, headword) {
+  const db = new DatabaseSync(app.dbPath);
+  db.prepare(
+    `UPDATE card SET state = 'review', format = 'spelling', stability = 2.0, difficulty = 6.0, reps = 6, lapses = 4,
+       leech = 'flagged', last_review_day = '2026-10-01', introduced_day = '2026-09-01'
+     WHERE kind = 'spelling' AND word_id = (SELECT id FROM word WHERE headword = ?)`,
+  ).run(headword);
+  db.close();
+}
+
+test('R-55 R-58 on a flagged Spelling card the folded leech panel leaves the letter diff and the rating bar in sight', async ({ page, app, pageErrors }, info) => {
+  test.skip(info.project.name !== 'webkit-phone', 'the on-screen keyboard is a phone matter');
+  void pageErrors;
+  await waitingSpelling(app, ['glimmerous', 'brontle']);
+  flagSpelling(app, 'glimmerous');
+  await startSpellingBlock(page, app, { touch: true });
+  // The keyboard open: 375 × 420 is what is left.
+  await page.setViewportSize({ width: 375, height: 420 });
+  await input(page).tap();
+  await input(page).fill('glimerous');
+  await page.getByTestId('check').tap();
+  await expect(page.getByTestId('check-result')).toHaveAttribute('data-match', 'none');
+  await expect(page.getByTestId('spell-diff')).toBeInViewport();
+  await expect(page.locator('button.rate').first()).toBeInViewport();
+  await expect(page.locator('button.rate').last()).toBeInViewport();
+  const panel = page.getByTestId('leech-panel');
+  await expect(panel.getByTestId('leech-open')).toBeVisible();
+  await expect(panel.getByTestId('leech-recognise')).toBeHidden();
+  expect((await panel.boundingBox())?.height ?? 999).toBeLessThan(80);
+  await panel.getByTestId('leech-open').tap();
+  await expect(panel.locator('.actions > button')).toHaveText(['Keep practising', 'Recognise only (no typing)', 'Lower usefulness', 'Suspend word']);
+});
+
+test('R-55 R-58 a choice on a Spelling card and its rating are undone last first; the next Spelling question still sounds', async ({ page, app, pageErrors }) => {
+  void pageErrors;
+  await waitingSpelling(app, ['glimmerous', 'brontle']);
+  flagSpelling(app, 'glimmerous');
+  const id = (await app.api('GET', '/api/words?q=glimmerous'))[0].id;
+  const word = () => app.api('GET', `/api/words/${id}`);
+  await startSpellingBlock(page, app);
+  // glimmerous (a due review) comes before brontle (first time).
+  await expect(page.getByTestId('progress')).toHaveText('1 / 2');
+  await expect(page.getByTestId('listen-status')).toHaveText('Tap ▶ Listen to hear the word.');
+  await input(page).fill('glimerous');
+  await page.getByTestId('check').click();
+  await expect(page.getByTestId('spell-diff')).toBeVisible();
+  const panel = page.getByTestId('leech-panel');
+  await panel.getByTestId('leech-open').click();
+
+  // "Recognise only (no typing)" switches the spelling off: the card
+  // leaves the block, brontle's question comes and asks for a tap.
+  await panel.getByTestId('leech-recognise').click();
+  await expect(page.getByTestId('toast')).toContainText('Now recognise-only');
+  await expectQuestion(page, 'brontle');
+  await expect(page.getByTestId('listen-status')).toHaveText('Tap ▶ Listen to hear the word.');
+  let w = await word();
+  expect([w.spelling, w.effective_goal, w.cards.find((/** @type {any} */ c) => c.kind === 'spelling').suspended]).toEqual([false, 'recognise', true]);
+
+  // ↶ undoes the choice: back on glimmerous's checked answer with the
+  // choices; the spelling practice is back.
+  await expect(page.getByTestId('undo')).toHaveAttribute('aria-label', 'Undo the problem-word choice (U)');
+  await page.getByTestId('undo').click();
+  await expect(page.getByTestId('toast')).toContainText('Choice undone');
+  await expect(page.getByTestId('spell-diff')).toBeVisible();
+  await expect(page.getByTestId('listen-status')).toHaveCount(0);
+  // The panel stays open as the owner left it.
+  await expect(panel.getByTestId('leech-recognise')).toBeVisible();
+  w = await word();
+  expect([w.spelling, w.effective_goal, w.cards.find((/** @type {any} */ c) => c.kind === 'spelling').leech]).toEqual([true, 'active', 'flagged']);
+
+  // Keep practising, rate: the next Spelling question sounds as before.
+  await panel.getByTestId('leech-keep').click();
+  await expect(page.getByTestId('leech-done')).toContainText('Kept as it is.');
+  await advanceClock(page, 650);
+  await page.getByRole('button', { name: /^Rate 3,/ }).click();
+  await expect(page.getByTestId('toast')).toContainText('Rated 3');
+  await expectQuestion(page, 'brontle');
+  await expect(page.getByTestId('listen-status')).toHaveText('Tap ▶ Listen to hear the word.');
+
+  // ↶ takes back the rating first (back on the checked answer), then the
+  // choice; the card is flagged again.
+  await expect(page.getByTestId('undo')).toHaveAttribute('aria-label', 'Undo last rating (U)');
+  await page.getByTestId('undo').click();
+  await expect(page.getByTestId('toast')).toContainText('Rating undone');
+  await expect(page.getByTestId('spell-diff')).toBeVisible();
+  await expect(page.getByTestId('leech-done')).toContainText('Kept as it is.');
+  await page.getByTestId('undo').click();
+  await expect(page.getByTestId('toast')).toContainText('Choice undone');
+  await expect(panel.getByTestId('leech-open')).toBeVisible();
+  w = await word();
+  expect(w.cards.find((/** @type {any} */ c) => c.kind === 'spelling').leech).toBe('flagged');
+});

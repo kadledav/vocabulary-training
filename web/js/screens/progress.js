@@ -163,7 +163,7 @@ export function renderProgress(root, isCurrent) {
     const actions = h('div', { class: 'leech-choices' });
     mount(
       actions,
-      leechActions({ id: entry.id, headword: entry.headword, usefulness: entry.usefulness, goal: entry.goal }, (done) => {
+      leechActions({ id: entry.id, headword: entry.headword, usefulness: entry.usefulness, goal: entry.goal, spelling: entry.spelling }, (done) => {
         const token = done.answer.undo;
         toast.show({
           text: `${entry.headword}: ${done.text}`,

@@ -1062,6 +1062,7 @@ mod tests {
             leech: crate::scheduler::LeechState::None,
             leech_lapses_at_ack: 0,
             suspended: false,
+            leech_acked_after: None,
         }
     }
 

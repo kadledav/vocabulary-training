@@ -44,6 +44,11 @@ tracing-subscriber.workspace = true
 vocab-pack.workspace = true
 
 [dev-dependencies]
+# float_roundtrip: the full-export round-trip test reads every number back
+# exactly as written (the default parser may miss the last bit of a
+# float, e.g. a card's stability). Tests only: the app never parses an
+# export.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 # io-util: AsyncRead/AsyncWrite helpers for raw-socket connection tests.
 tokio = { workspace = true, features = ["io-util"] }
 tower.workspace = true
