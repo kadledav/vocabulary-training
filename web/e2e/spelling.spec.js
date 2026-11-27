@@ -352,6 +352,114 @@ function installAutoplayRule() {
   HTMLMediaElement.prototype.pause = function pause() {};
 }
 
+/**
+ * Wait until the TTS service has made every clip.
+ *
+ * @param {import('./fixtures.js').App} app
+ */
+async function clipsReady(app) {
+  await expect
+    .poll(async () => {
+      const status = await app.api('GET', '/api/audio/status');
+      return status.enabled && status.connected && status.pending === 0 ? status.ready : 0;
+    }, { timeout: 30_000 })
+    .toBeGreaterThan(10);
+}
+
+test('R-58 after a reload, Undo back to a Spelling question plays it or says to tap; never stuck', async ({ page, app, pageErrors }) => {
+  void pageErrors;
+  await waitingSpelling(app, ['glimmerous', 'brontle']);
+  await startSpellingBlock(page, app);
+  await expect(page.getByTestId('listen-status')).toHaveText('Tap ▶ Listen to hear the word.');
+  await input(page).fill('glimmerous');
+  await page.getByTestId('check').click();
+  await advanceClock(page, 650);
+  await page.getByRole('button', { name: /^Rate 2,/ }).click();
+  await expect(page.getByTestId('toast')).toContainText('Rated 2');
+  // The reload forgets this visit's check: Undo returns to the question.
+  await page.reload();
+  await freezeClock(page);
+  await advanceClock(page, 300);
+  await expect(page.getByTestId('listen-status')).toHaveText('Tap ▶ Listen to hear the word.');
+  await page.locator('.practice-body').focus();
+  await page.keyboard.press('u');
+  await expect(page.getByTestId('toast')).toContainText('Rating undone');
+  await expectQuestion(page, 'glimmerous');
+  await expect(page.getByTestId('listen-status')).toHaveText('Tap ▶ Listen to hear the word.');
+});
+
+test('R-58 R-70 Enter on ▶ Listen plays the word and leaves the focus on it', async ({ page, app, pageErrors }, info) => {
+  test.skip(info.project.name !== 'chromium-desktop', 'keyboard focus runs on the desktop');
+  void pageErrors;
+  await waitingSpelling(app, ['glimmerous']);
+  await startSpellingBlock(page, app);
+  const listen = page.getByTestId('listen');
+  await listen.focus();
+  await page.keyboard.press('Enter');
+  await expect(page.getByTestId('listen-status')).toHaveText('Type the word you heard. Replay it as often as you like.');
+  await expect(listen).toBeFocused();
+  await expect.poll(() => spoken(page)).toEqual(['glimmerous']);
+});
+
+test.describe('with a TTS service that spells a word out', () => {
+  /** @type {Awaited<ReturnType<typeof startFakeTts>>} */
+  let tts;
+  test.beforeAll(async () => {
+    tts = await startFakeTts({ spelled: ['quabble'] });
+  });
+  test.afterAll(async () => {
+    await tts.close();
+  });
+  test.use({ ttsUrl: async ({}, use) => use(tts.url) });
+
+  test('R-58 a clip that spells the word out is never the question; speech says it as a word; the answer side plays it', async ({ page, app, pageErrors }) => {
+    void pageErrors;
+    await clipsReady(app);
+    const rows = await app.api('GET', '/api/words?q=quabble');
+    const id = rows.find((/** @type {{ headword: string }} */ r) => r.headword === 'quabble').id;
+    const clips = await app.api('GET', `/api/audio/words/${id}`);
+    expect(clips.word).toMatchObject({ ready: true, approximate: true, whole_words: false });
+    await page.addInitScript(installAutoplayRule);
+    await waitingSpelling(app, ['quabble']);
+    const played = () => page.evaluate(() => /** @type {any} */ (window).played.slice());
+    await startSpellingBlock(page, app);
+    await expectQuestion(page, 'quabble');
+    // No clip by itself: the browser's speech waits for a tap.
+    await expect(page.getByTestId('listen-status')).toHaveText('Tap ▶ Listen to hear the word.');
+    await expect(page.getByTestId('listen')).not.toHaveAttribute('data-approximate');
+    await page.getByTestId('listen').click();
+    await expect.poll(() => spoken(page)).toEqual(['quabble']);
+    await page.getByTestId('replay').click();
+    await expect.poll(() => spoken(page)).toEqual(['quabble', 'quabble']);
+    expect(await played()).toEqual([]);
+    // Once answered, the clip is the word's sound as anywhere else (marked).
+    await input(page).fill('quabble');
+    await page.getByTestId('check').click();
+    await expect(page.getByTestId('check-result')).toHaveAttribute('data-match', 'exact');
+    const playWord = page.getByRole('button', { name: 'Play word' });
+    await playWord.click();
+    await expect.poll(played).toHaveLength(1);
+    await expect(playWord).toHaveAttribute('data-approximate', '');
+    expect(await spoken(page)).toEqual(['quabble', 'quabble']);
+  });
+
+  test('R-58 R-41 a spelling clip and no speech: the Czech cue is the question', async ({ page, app, pageErrors }) => {
+    void pageErrors;
+    await clipsReady(app);
+    await page.addInitScript(installAutoplayRule);
+    await page.addInitScript(() => {
+      delete (/** @type {any} */ (window)).speechSynthesis;
+      delete (/** @type {any} */ (window)).SpeechSynthesisUtterance;
+    });
+    await waitingSpelling(app, ['quabble']);
+    await startSpellingBlock(page, app);
+    await expect(page.getByTestId('listen-status')).toHaveText('No sound for this word on this device: spell it from the Czech below.');
+    await page.getByTestId('listen').click();
+    await expect(page.getByTestId('listen-status')).toHaveText('No sound for this word on this device: spell it from the Czech below.');
+    expect(await page.evaluate(() => /** @type {any} */ (window).played.slice())).toEqual([]);
+  });
+});
+
 test.describe('with a TTS service', () => {
   /** @type {Awaited<ReturnType<typeof startFakeTts>>} */
   let tts;
@@ -365,12 +473,7 @@ test.describe('with a TTS service', () => {
 
   test('R-58 R-40 the word’s clip plays by itself; where autoplay is refused ▶ Listen asks for a tap', async ({ page, app, pageErrors }) => {
     void pageErrors;
-    await expect
-      .poll(async () => {
-        const status = await app.api('GET', '/api/audio/status');
-        return status.enabled && status.connected && status.pending === 0 ? status.ready : 0;
-      }, { timeout: 30_000 })
-      .toBeGreaterThan(10);
+    await clipsReady(app);
     await page.addInitScript(installAutoplayRule);
     await waitingSpelling(app, ['glimmerous', 'brontle']);
     const played = () => page.evaluate(() => /** @type {any} */ (window).played.slice());
@@ -403,5 +506,33 @@ test.describe('with a TTS service', () => {
     await expect.poll(played).toHaveLength(2);
     await expect(page.getByTestId('listen-status')).toHaveText('Type the word you heard. Replay it as often as you like.');
     expect(await spoken(page)).toEqual([]);
+  });
+
+  test('R-58 a tap on ▶ Listen before the clip information arrived plays one voice, not two', async ({ page, app, pageErrors }) => {
+    void pageErrors;
+    await clipsReady(app);
+    await page.addInitScript(installAutoplayRule);
+    await waitingSpelling(app, ['glimmerous']);
+    /** @type {() => void} */
+    let release = () => {};
+    const gate = new Promise((resolve) => (release = () => resolve(undefined)));
+    await page.route('**/api/audio/words/**', async (route) => {
+      await gate;
+      await route.continue();
+    });
+    await startSpellingBlock(page, app);
+    await expect(page.getByTestId('listen-status')).toHaveText('Getting the sound…');
+    await page.getByTestId('listen').click();
+    await expect.poll(() => spoken(page)).toEqual(['glimmerous']);
+    await expect(page.getByTestId('listen-status')).toHaveText('Type the word you heard. Replay it as often as you like.');
+    release();
+    // The information arrives; the auto-play it was waiting for is gone.
+    await page.waitForResponse('**/api/audio/words/**');
+    await advanceClock(page, 1000);
+    expect(await page.evaluate(() => /** @type {any} */ (window).played.slice())).toEqual([]);
+    // The next tap plays the clip (one voice: speech stops).
+    await page.getByTestId('listen').click();
+    await expect.poll(() => page.evaluate(() => /** @type {any} */ (window).played.length)).toBe(1);
+    expect(await spoken(page)).toEqual(['glimmerous']);
   });
 });

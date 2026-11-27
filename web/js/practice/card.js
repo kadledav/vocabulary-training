@@ -178,6 +178,29 @@ const LISTEN_TEXT = {
   none: 'No sound for this word on this device: spell it from the Czech below.',
 };
 
+/** @param {ListenState} listen */
+const needsTap = (listen) => listen === 'tap';
+/** @param {ListenState} listen */
+const listenAttention = (listen) => listen === 'tap' || listen === 'none';
+
+/**
+ * Show a new sound state on the Spelling question under `root` in place:
+ * the status line and the mark on ▶ Listen change, the button itself stays
+ * (with its focus, its playing state and its title).
+ *
+ * @param {Element} root
+ * @param {ListenState} listen
+ */
+export function showListen(root, listen) {
+  const button = root.querySelector('[data-testid="listen"]');
+  const status = root.querySelector('[data-testid="listen-status"]');
+  button?.classList.toggle('needs-tap', needsTap(listen));
+  if (status) {
+    status.classList.toggle('attention', listenAttention(listen));
+    if (status.textContent !== LISTEN_TEXT[listen]) status.textContent = LISTEN_TEXT[listen];
+  }
+}
+
 /**
  * The question side of a Spelling card (design §7.1 screen 3b): ▶ Listen
  * (it plays by itself where the browser allows it; when it cannot, the
@@ -200,7 +223,7 @@ export function spellingQuestion(item, { onListen, listen }) {
         'button',
         {
           type: 'button',
-          class: `play play-word listen-big${listen === 'tap' ? ' needs-tap' : ''}`,
+          class: `play play-word listen-big${needsTap(listen) ? ' needs-tap' : ''}`,
           'aria-label': 'Listen to the word (R)',
           title: 'Listen to the word (R)',
           'data-testid': 'listen',
@@ -209,7 +232,7 @@ export function spellingQuestion(item, { onListen, listen }) {
         h('span', { 'aria-hidden': 'true' }, '▶'),
         ' Listen',
       ),
-      h('p', { class: `listen-status${listen === 'tap' || listen === 'none' ? ' attention' : ''}`, role: 'status', 'data-testid': 'listen-status' }, LISTEN_TEXT[listen]),
+      h('p', { class: `listen-status${listenAttention(listen) ? ' attention' : ''}`, role: 'status', 'data-testid': 'listen-status' }, LISTEN_TEXT[listen]),
     ),
     item.word.czech.length > 0
       ? h(

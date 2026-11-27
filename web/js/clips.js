@@ -6,8 +6,10 @@
  *
  * - `clipsFor(wordId)` asks the server once per word which clips are
  *   ready (`GET /api/audio/words/{id}`); answers are cached for the page.
- * - `clipUrl(info, what, sentenceId)` picks the URL to play, or null: then
+ * - `clipFor(info, what, sentenceId)` picks the clip to play, or null: then
  *   the caller falls back to the browser's speech (R-41).
+ * - `promptClipFor(info)` picks the word's clip for a Spelling question,
+ *   only one known to say no word letter by letter (R-58).
  * - `playClip(url, …)` must run directly in the tap or key handler (iOS):
  *   it never awaits before `play()`.
  * - `preloadClips(info)` lets the browser fetch the next card's clips.
@@ -17,7 +19,7 @@ import { getJson } from './api.js';
 import { h } from './dom.js';
 
 /**
- * @typedef {{ url: string | null, ready: boolean, other_voice: boolean, approximate: boolean }} ClipRef
+ * @typedef {{ url: string | null, ready: boolean, other_voice: boolean, approximate: boolean, whole_words: boolean }} ClipRef
  * @typedef {{ id: number } & ClipRef} SentenceClip
  * @typedef {{ enabled: false } | { enabled: true, word: ClipRef, sentences: SentenceClip[] }} WordClips
  * @typedef {'playing' | 'failed'} PlayResult
@@ -82,6 +84,22 @@ export function clipFor(info, what, sentenceId = null) {
   if (!info || !info.enabled) return null;
   const clip = what === 'word' ? info.word : info.sentences.find((s) => s.id === sentenceId);
   return clip && clip.ready && typeof clip.url === 'string' && clip.url.startsWith('/api/audio/clips/') ? clip : null;
+}
+
+/**
+ * The word's clip as the prompt of a Spelling question, or null. The TTS
+ * service reads a word that is in no dictionary letter by letter — exactly
+ * the rare or invented words that get spelling practice — and such a clip
+ * would say the answer. Only a clip the server knows to have every word
+ * spoken as a word (`whole_words`) qualifies; one it knows nothing about
+ * (made by an older version) does not.
+ *
+ * @param {WordClips | null | undefined} info
+ * @returns {ClipRef | null}
+ */
+export function promptClipFor(info) {
+  const clip = clipFor(info, 'word');
+  return clip && clip.whole_words === true ? clip : null;
 }
 
 /** @type {HTMLAudioElement | null} */

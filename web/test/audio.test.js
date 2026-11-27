@@ -4,7 +4,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { clipFor } from '../js/clips.js';
+import { clipFor, promptClipFor } from '../js/clips.js';
+import { promptSpeech } from '../js/practice/model.js';
 import { audioStatusText } from '../js/screens/settings.js';
 
 const ready = (/** @type {string} */ hash) => ({
@@ -12,8 +13,9 @@ const ready = (/** @type {string} */ hash) => ({
   ready: true,
   other_voice: false,
   approximate: false,
+  whole_words: true,
 });
-const notReady = { url: null, ready: false, other_voice: false, approximate: false };
+const notReady = { url: null, ready: false, other_voice: false, approximate: false, whole_words: false };
 
 test('R-40 a ready clip plays from the server', () => {
   /** @type {import('../js/clips.js').WordClips} */
@@ -52,4 +54,33 @@ test('R-40 Settings says how far the audio is and what is approximate', () => {
     /cache is full \(2\.0 GiB of 2\.0 GiB\)/,
   );
   assert.match(audioStatusText({ ...counts, storage: 'disk_low' }), /disk is nearly full/);
+});
+
+test('R-58 a Spelling prompt plays only a clip known to say no word letter by letter', () => {
+  const clip = ready('a'.repeat(32));
+  /** @param {import('../js/clips.js').ClipRef} word */
+  const info = (word) => /** @type {import('../js/clips.js').WordClips} */ ({ enabled: true, word, sentences: [] });
+  assert.equal(promptClipFor(info(clip))?.url, clip.url);
+  // Spelled out, or not known (a clip of an older version): never a prompt...
+  assert.equal(promptClipFor(info({ ...clip, whole_words: false })), null);
+  assert.equal(promptClipFor(info(/** @type {any} */ ({ ...clip, whole_words: undefined }))), null);
+  // ...but still the word's clip everywhere else, approximate or not.
+  assert.equal(clipFor(info({ ...clip, whole_words: false, approximate: true }), 'word')?.url, clip.url);
+  assert.equal(promptClipFor(info(notReady)), null);
+  assert.equal(promptClipFor({ enabled: false }), null);
+  assert.equal(promptClipFor(null), null);
+});
+
+test('R-58 the speech fallback of a Spelling prompt does not spell either', () => {
+  /** @param {string} headword @param {string | null} [speak] */
+  const word = (headword, speak = null) => /** @type {any} */ ({ headword, speak });
+  assert.equal(promptSpeech(word('Zibberate')), 'zibberate');
+  // Capitals are read as letters by speech engines.
+  assert.equal(promptSpeech(word('ZIBB')), 'zibb');
+  assert.equal(promptSpeech(word('glimmer', 'GLIM-er')), 'glim-er');
+  assert.equal(promptSpeech(word('pore over')), 'pore over');
+  assert.equal(promptSpeech(word('a cappella')), 'a cappella');
+  // Single letters say the answer: no speech.
+  for (const text of ['z x c', 'Z-X-C', 'z.x.c.', 'Z X']) assert.equal(promptSpeech(word('zxc', text)), null, text);
+  assert.equal(promptSpeech(word('\u200b')), null);
 });

@@ -36,7 +36,7 @@
  * the owner retries the same rating or first finds out what was saved.
  */
 
-import { clipFor, clipsFor, playClip, preloadClips, primeClips, stopClip } from '../clips.js';
+import { clipFor, clipsFor, playClip, preloadClips, primeClips, promptClipFor, stopClip } from '../clips.js';
 import { h, mount } from '../dom.js';
 import { keyAction, keyTarget } from '../keys.js';
 import {
@@ -46,6 +46,7 @@ import {
   produceQuestion,
   questionView,
   revealLabel,
+  showListen,
   spellingQuestion,
   spellingResult,
   typedHint,
@@ -77,6 +78,7 @@ import {
   moreOpenOnReveal,
   plainText,
   progress,
+  promptSpeech,
   wordSpeech,
 } from '../practice/model.js';
 import { clearDraft, loadDraft, saveDraft } from '../practice/draft.js';
@@ -490,15 +492,26 @@ export function renderPractice(root, isCurrent) {
    */
   const playButtons = (what) => [...screen.querySelectorAll(`button.play-${what}`)];
 
+  /** Is the Spelling question of the current item on screen? */
+  const spellingPrompt = () => state.phase === 'question' && state.item !== null && isSpelling(state.item);
+
   /** @param {import('../clips.js').WordClips} info */
   const markApproximate = (info) => {
     if (!info.enabled || !info.word.approximate) return;
+    // A Spelling question plays no clip that is not a prompt clip.
+    if (spellingPrompt() && !promptClipFor(info)) return;
     for (const word of playButtons('word')) {
       if (word.hasAttribute('data-approximate')) continue;
       word.setAttribute('data-approximate', '');
       word.setAttribute('title', `${word.getAttribute('title') ?? 'Play word'} — approximate pronunciation`);
     }
   };
+
+  /**
+   * Counts the Spelling prompt's sound requests: an auto-play still
+   * waiting for the clip information gives up when a tap came after it.
+   */
+  let promptTurn = 0;
 
   /**
    * Speak `text` with the browser (the fallback, R-41).
@@ -524,6 +537,12 @@ export function renderPractice(root, isCurrent) {
    * synchronously in the tap or key handler (iOS starts media only there).
    * `clipOnly`: auto-play, which never falls back to speech.
    *
+   * The word of a Spelling question plays only a clip that says no word
+   * letter by letter, and speech only when it would not spell either
+   * ([`promptClipFor`], [`promptSpeech`]; R-58). A tap before the clip
+   * information arrived cancels the question's pending auto-play and
+   * speaks at once: one voice at a time.
+   *
    * @param {string} text
    * @param {'sentence' | 'word'} what
    * @param {number | null} sentenceId
@@ -532,9 +551,15 @@ export function renderPractice(root, isCurrent) {
   const play = (text, what, sentenceId, clipOnly = false) => {
     const buttons = playButtons(what);
     const item = state.item;
-    const clip = item ? clipFor(clips.get(item.word.id), what, sentenceId) : null;
+    const prompt = what === 'word' && spellingPrompt();
+    if (prompt) promptTurn++;
+    const info = item ? clips.get(item.word.id) : null;
+    const clip = !item ? null : prompt ? promptClipFor(info) : clipFor(info, what, sentenceId);
+    const fallback = prompt && item ? promptSpeech(item.word) : text;
     if (!clip || clip.url === null) {
-      if (!clipOnly) spoken(speakFallback(text, buttons));
+      if (clipOnly) return;
+      if (fallback === null) setListen('none');
+      else spoken(speakFallback(fallback, buttons));
       return;
     }
     stopSpeaking();
@@ -551,7 +576,9 @@ export function renderPractice(root, isCurrent) {
         buttons.forEach((b) => b.classList.remove('loading', 'playing'));
         buttons.forEach((b) => b.classList.add('failed'));
         setTimeout(() => buttons.forEach((b) => b.classList.remove('failed')), 2_000);
-        if (!clipOnly) spoken(speakFallback(text, buttons));
+        if (clipOnly) return;
+        if (fallback === null) setListen('none');
+        else spoken(speakFallback(fallback, buttons));
       },
     });
   };
@@ -564,11 +591,12 @@ export function renderPractice(root, isCurrent) {
   const setListen = (listen) => {
     if (state.listen === listen) return;
     state.listen = listen;
-    if (state.phase === 'question' && state.item && isSpelling(state.item)) renderBody();
+    // In place: rebuilding the card would drop the focus on ▶ Listen.
+    if (spellingPrompt()) showListen(body, listen);
   };
   /** The word's sound started: the Spelling question has been heard. */
   const heard = () => {
-    if (state.phase === 'question' && state.item && isSpelling(state.item)) setListen('heard');
+    if (spellingPrompt()) setListen('heard');
   };
   /**
    * What the browser's speech did for the word: a Spelling question with
@@ -578,7 +606,7 @@ export function renderPractice(root, isCurrent) {
    */
   const spoken = (result) => {
     if (result === 'speaking') heard();
-    else if (state.phase === 'question' && state.item && isSpelling(state.item)) setListen('none');
+    else if (spellingPrompt()) setListen('none');
   };
 
   /**
@@ -587,18 +615,21 @@ export function renderPractice(root, isCurrent) {
    * element — which an earlier tap unlocked on iOS. Where the browser still
    * refuses, ▶ Listen is marked for a tap; without a clip the browser's
    * speech waits for that tap (it may not start by itself); with neither
-   * the Czech cue is all there is.
+   * the Czech cue is all there is. Only a clip and speech that do not
+   * spell the word out count (R-58). A tap on ▶ in the meantime takes over
+   * (`promptTurn`).
    *
    * @param {Item} item
    */
   const autoplayPrompt = (item) => {
-    const still = () => state.item?.item_id === item.item_id && state.phase === 'question';
+    const turn = ++promptTurn;
+    const still = () => state.item?.item_id === item.item_id && state.phase === 'question' && promptTurn === turn;
     void clipsFor(item.word.id).then((info) => {
       clips.set(item.word.id, info);
       if (!still()) return;
-      const clip = clipFor(info, 'word', null);
+      const clip = promptClipFor(info);
       if (!clip || clip.url === null) {
-        setListen(speechOk ? 'tap' : 'none');
+        setListen(speechOk && promptSpeech(item.word) !== null ? 'tap' : 'none');
         return;
       }
       setListen('playing');
@@ -862,6 +893,9 @@ export function renderPractice(root, isCurrent) {
     renderHelp();
     renderBody();
     renderBottom();
+    // The play buttons are new: mark them again from what is known.
+    const info = state.item ? clips.get(state.item.word.id) : null;
+    if (info) markApproximate(info);
     if (scroll) window.scrollTo(0, 0);
     if (!focus) return;
     // A Produce question: straight into the answer field.
@@ -946,7 +980,16 @@ export function renderPractice(root, isCurrent) {
     stopClip();
     render({ focus: true, scroll: true });
     loadClips();
-    if (state.item && state.phase === 'question' && isSpelling(state.item)) autoplayPrompt(state.item);
+    soundQuestion();
+  };
+
+  /**
+   * A Spelling question just came on screen (the next card, an undo back
+   * to it, a rating to give again): its word plays, or the status says
+   * why not — never left at "Getting the sound…".
+   */
+  const soundQuestion = () => {
+    if (state.item && spellingPrompt()) autoplayPrompt(state.item);
   };
 
   /**
@@ -988,8 +1031,6 @@ export function renderPractice(root, isCurrent) {
     // Auto-play (off by default): the word's recorded clip, started by the
     // reveal tap or key itself; never browser speech.
     if (state.settings.autoplay) play(wordSpeech(word), 'word', null, true);
-    const info = clips.get(word.id);
-    if (info) markApproximate(info);
   };
 
   // ── Produce: check, hint, I don't know, rate myself, also accept ─────────
@@ -1327,6 +1368,8 @@ export function renderPractice(root, isCurrent) {
     }
     reopen(again);
     render();
+    loadClips();
+    soundQuestion();
     announce('The rating was not saved. Rate the word again.');
   };
 
@@ -1365,7 +1408,10 @@ export function renderPractice(root, isCurrent) {
       setPhase('complete');
     }
     toast.show({ text: 'Rating undone', ms: 2500 });
+    stopClip();
     render({ focus: true, scroll: true });
+    loadClips();
+    soundQuestion();
   };
 
   /** The study day rolled over: this block is gone; Today says why (bug 12). */

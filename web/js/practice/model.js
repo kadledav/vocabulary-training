@@ -14,6 +14,8 @@
  * @typedef {import('../marked.js').TextParts} TextParts
  */
 
+import { removeInvisible } from '../grading.js';
+
 /**
  * The next item to answer (queue order), or `null` when all are rated.
  *
@@ -53,6 +55,24 @@ export function plainText(parts) {
  */
 export function wordSpeech(word) {
   return word.speak && word.speak.trim() !== '' ? word.speak : word.headword;
+}
+
+/**
+ * What the browser's speech says as a Spelling question's prompt, or null
+ * when it would spell the word out (R-58): the word's speech text in lower
+ * case — speech engines read a word in capitals ("ZIBB") letter by letter
+ * — and nothing at all when that text is single letters ("z x c",
+ * "z-x-c", "z.x.c."), which says the answer.
+ *
+ * @param {Word} word
+ * @returns {string | null}
+ */
+export function promptSpeech(word) {
+  const text = removeInvisible(wordSpeech(word)).toLocaleLowerCase('en').trim();
+  const parts = text.split(/[\s\p{P}]+/u).filter((part) => part !== '');
+  if (parts.length === 0) return null;
+  if (parts.length > 1 && parts.every((part) => [...part].length === 1)) return null;
+  return text;
 }
 
 /**
