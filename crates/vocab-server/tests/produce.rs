@@ -616,6 +616,16 @@ async fn r56_typed_review_details_are_validated() {
         json!({ "answer_match": "none", "typed_answer": long }),
         json!({ "answer_match": "fuzzy", "typed_answer": "tv01" }),
         json!({ "answer_match": "exact", "typed_answer": 5 }),
+        // Only invisible characters: blank.
+        json!({ "answer_match": "exact", "typed_answer": "\u{FEFF}", "suggested_grade": 2 }),
+        json!({ "answer_match": "none", "typed_answer": "\u{200B}\u{2060} ", "suggested_grade": 4 }),
+        // A suggestion that contradicts the match (design §6.8).
+        json!({ "answer_match": "skipped", "suggested_grade": 2 }),
+        json!({ "answer_match": "skipped", "hint_used": true, "suggested_grade": 2 }),
+        json!({ "answer_match": "exact", "typed_answer": "tv01", "suggested_grade": 4 }),
+        json!({ "answer_match": "exact", "typed_answer": "tv01", "hint_used": true, "suggested_grade": 2 }),
+        json!({ "answer_match": "none", "typed_answer": "tv", "suggested_grade": 2 }),
+        json!({ "answer_match": "dont_know", "suggested_grade": 2 }),
     ] {
         let (status, body) = review(&env, &block, 2, extra.clone()).await;
         assert!(
@@ -633,6 +643,31 @@ async fn r56_typed_review_details_are_validated() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn r56_answer_details_that_agree_are_taken() {
+    let env = env();
+    env.import("test-novel", words("ta", 1)).await;
+    waiting_produce(&env, "2026-12-30", "2026-11-20");
+    let block = start_block(&env).await;
+    for extra in [
+        json!({ "answer_match": "exact", "typed_answer": "ta01", "suggested_grade": 2 }),
+        // The right word in another form (design §6.8).
+        json!({ "answer_match": "exact", "typed_answer": "ta01", "suggested_grade": 3 }),
+        json!({ "answer_match": "exact", "typed_answer": "ta01", "hint_used": true, "suggested_grade": 3 }),
+        json!({ "answer_match": "none", "typed_answer": "x", "hint_used": true, "suggested_grade": 4 }),
+        json!({ "answer_match": "dont_know", "hint_used": true, "suggested_grade": 5 }),
+        json!({ "answer_match": "skipped", "hint_used": true }),
+        json!({ "answer_match": "skipped" }),
+    ] {
+        let (status, body) = review(&env, &block, 3, extra.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{extra} -> {body}");
+        let (status, body) = env
+            .post(&format!("/api/sessions/{}/undo", sid(&block)), &json!({}))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
 }
 
 #[tokio::test]

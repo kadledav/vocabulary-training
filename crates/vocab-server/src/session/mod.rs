@@ -150,6 +150,21 @@ pub struct RateInput {
 /// Longest accepted typed answer.
 const TYPED_ANSWER_MAX: usize = 300;
 
+/// The suggested grades that agree with how a typed answer compared
+/// (design §6.8): the target span of the sentence → 2 (3 after the hint);
+/// the right word in another form or an accepted answer that is not the
+/// sentence's own (also stored as `exact`) → 3; no match → 4; "I don't
+/// know" → 5; "I'll just rate myself" → none.
+fn suggestions_for(answer: AnswerMatch, hint_used: bool) -> &'static [u8] {
+    match answer {
+        AnswerMatch::Exact if hint_used => &[3],
+        AnswerMatch::Exact => &[2, 3],
+        AnswerMatch::None => &[4],
+        AnswerMatch::DontKnow => &[5],
+        AnswerMatch::Skipped => &[],
+    }
+}
+
 /// Is `text` a UUID in canonical form (8-4-4-4-12 hex digits, any case)?
 fn is_uuid(text: &str) -> bool {
     let groups: Vec<&str> = text.split('-').collect();
@@ -175,7 +190,13 @@ impl RateInput {
                     "typed_answer is longer than {TYPED_ANSWER_MAX} characters"
                 )));
             }
-            if typed.trim().is_empty() || typed.chars().any(char::is_control) {
+            // Blank also when only invisible characters (a zero-width space,
+            // a byte-order mark) were typed: the pack's own notion of them.
+            if typed
+                .chars()
+                .all(|c| c.is_whitespace() || vocab_pack::keys::is_invisible(c))
+                || typed.chars().any(char::is_control)
+            {
                 return Err(SessionError::Invalid(
                     "typed_answer must be text without control characters, not blank".to_owned(),
                 ));
@@ -203,6 +224,14 @@ impl RateInput {
                 ));
             }
             _ => {}
+        }
+        if let (Some(answer), Some(suggested)) = (self.answer_match, self.suggested_grade)
+            && !suggestions_for(answer, self.hint_used).contains(&suggested.get())
+        {
+            return Err(SessionError::Invalid(
+                "suggested_grade does not agree with answer_match and hint_used (design §6.8)"
+                    .to_owned(),
+            ));
         }
         if let Some(ts) = &self.client_ts
             && ts.parse::<crate::clock::Timestamp>().is_err()
