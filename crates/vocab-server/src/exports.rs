@@ -20,7 +20,7 @@ use crate::catalog::{
 };
 use crate::clock::{Moment, StudyDay};
 use crate::db::{Db, TableError, TableSink};
-use crate::{importer, scheduler, settings, stats};
+use crate::{importer, scheduler, session, settings, stats};
 
 /// `format` of the feedback export.
 pub const FEEDBACK_FORMAT: &str = "vocab-feedback";
@@ -190,6 +190,7 @@ pub fn write_full(conn: &Connection, out: impl Write, now: &Moment) -> Result<()
     catalog::export(conn, &mut tables)?;
     importer::export(conn, &mut tables)?;
     scheduler::export(conn, &mut tables)?;
+    session::export(conn, &mut tables)?;
     tables.out.write_all(b"\n}\n")?;
     tables.out.flush()?;
     Ok(())

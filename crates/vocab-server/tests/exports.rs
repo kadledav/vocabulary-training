@@ -252,7 +252,7 @@ async fn r57_r86_exports_need_a_session_and_refuse_cross_site_requests() {
 // ── the full export ─────────────────────────────────────────────────────────
 
 /// Exported table → database table.
-const TABLES: [(&str, &str); 13] = [
+const TABLES: [(&str, &str); 15] = [
     ("sources", "source"),
     ("words", "word"),
     ("word_sources", "word_source"),
@@ -262,10 +262,27 @@ const TABLES: [(&str, &str); 13] = [
     ("word_overrides", "word_override"),
     ("field_conflicts", "field_conflict"),
     ("word_pack_spellings", "word_pack_spelling"),
+    ("id_floors", "id_floor"),
     ("pack_imports", "pack_import"),
     ("cards", "card"),
     ("reviews", "review_log"),
     ("fsrs_params", "fsrs_params"),
+    ("practice_sessions", "practice_session"),
+];
+
+/// Tables the export leaves out on purpose (design §8.1): the account,
+/// the owner's short-lived Undo, the audio cache, what open blocks still
+/// hold, and the settings (exported as the effective `settings` member).
+/// A new table fails the test until it is put here or in [`TABLES`].
+const NOT_EXPORTED: [&str; 8] = [
+    "audio_clip",
+    "audio_engine",
+    "auth_owner",
+    "auth_session",
+    "auth_throttle",
+    "session_item",
+    "setting",
+    "word_undo",
 ];
 
 /// Columns the export leaves out on purpose (design §8.1), and the value a
@@ -366,6 +383,37 @@ fn assert_round_trip(source: &Env, export: &Value, target: &Env) {
         .expect("fk check");
     assert_eq!(violations, 0, "the restored rows reference each other");
     let from = source.sql();
+    // Every table is a conscious decision, and so is every column.
+    let mut stmt = from
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+        .expect("tables");
+    let all: Vec<String> = stmt
+        .query_map([], |row| row.get(0))
+        .expect("tables")
+        .map(|t| t.expect("table"))
+        .collect();
+    let mut decided: Vec<&str> = TABLES.iter().map(|(_, t)| *t).collect();
+    decided.extend(NOT_EXPORTED);
+    decided.sort_unstable();
+    assert_eq!(all, decided, "every table exported or left out on purpose");
+    for (name, table) in TABLES {
+        let mut exported: Vec<String> = export[name]["columns"]
+            .as_array()
+            .expect("columns")
+            .iter()
+            .map(|c| c.as_str().expect("column").to_owned())
+            .collect();
+        exported.sort();
+        let mut columns: Vec<String> = columns_of(&from, table)
+            .into_iter()
+            .filter(|c| !LEFT_OUT.iter().any(|(t, col, _)| *t == table && col == c))
+            .collect();
+        columns.sort();
+        assert_eq!(
+            exported, columns,
+            "{name}: every column but the left-out ones"
+        );
+    }
     for (_, table) in TABLES {
         let columns: Vec<String> = columns_of(&from, table)
             .into_iter()
@@ -419,6 +467,28 @@ async fn r86_full_export_round_trip_into_a_fresh_database() {
     .await;
     env.request("PATCH", "/api/settings", Some(&json!({ "block_size": 15 })))
         .await;
+    // A deleted word (its id is never handed out again) and a leech
+    // choice (the card remembers which ratings came before it).
+    env.import(BOOK, vec![word("victor", 4, 2)]).await;
+    let victor = env.word_id("victor").await.get();
+    let (status, _) = env
+        .request("DELETE", &format!("/api/words/{victor}"), Some(&json!({})))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let sierra = env.word_id("sierra").await.get();
+    env.exec("UPDATE card SET leech = 'flagged' WHERE kind = 'understand' AND word_id = (SELECT id FROM word WHERE headword = 'sierra')");
+    let (status, _) = env
+        .post(
+            &format!("/api/words/{sierra}/actions"),
+            &json!({ "action": "leech_keep" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        env.int("SELECT COUNT(*) FROM card WHERE leech_acked_after IS NOT NULL"),
+        1
+    );
+    assert!(env.int("SELECT COUNT(*) FROM id_floor") > 0);
 
     let (status, headers, bytes) = download(&env, "/api/export/full").await;
     assert_eq!(status, StatusCode::OK);
@@ -468,6 +538,17 @@ async fn r86_full_export_round_trip_into_a_fresh_database() {
         "undone ratings are kept, marked"
     );
     assert_eq!(column("before_json"), None, "the undo snapshot is left out");
+    // Every review's block is in the export.
+    let session_at = column("session_id").expect("session_id column");
+    let blocks: Vec<&Value> = export["practice_sessions"]["rows"]
+        .as_array()
+        .expect("blocks")
+        .iter()
+        .map(|row| &row[0])
+        .collect();
+    for row in reviews["rows"].as_array().expect("rows") {
+        assert!(blocks.contains(&&row[session_at]), "{row}: its block");
+    }
     // Nothing of the account, the audio cache or open practice blocks.
     for secret in [
         "password",

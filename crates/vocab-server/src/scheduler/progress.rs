@@ -126,7 +126,7 @@ pub fn export(conn: &Connection, sink: &mut dyn TableSink) -> Result<(), TableEr
         "cards",
         "SELECT id, word_id, kind, format, state, stability, difficulty, due_day, \
          last_review_day, last_review_at, introduced_day, reps, lapses, consecutive_fives, leech, \
-         leech_lapses_at_ack, suspended, created_at FROM card ORDER BY id",
+         leech_lapses_at_ack, suspended, created_at, leech_acked_after FROM card ORDER BY id",
     )?;
     write_table(
         conn,

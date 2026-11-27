@@ -246,36 +246,62 @@ pub fn feedback_items(conn: &Connection) -> rusqlite::Result<CatalogFeedback> {
     })
 }
 
-/// The catalog's tables for the full export (design §8.1), every column,
-/// in id order: the vocabulary as stored, the owner's changes included.
+/// The catalog's tables for the full export (design §8.1), in a stable
+/// order: the vocabulary as stored, the owner's changes included, and the
+/// id floors (so a restore never hands out a deleted word's id again).
+/// Each column is named: a new column is in the export only once it is
+/// added here (the round-trip test fails until then).
 pub fn export(conn: &Connection, sink: &mut dyn TableSink) -> Result<(), TableError> {
-    const TABLES: [(&str, &str); 9] = [
-        ("sources", "SELECT * FROM source ORDER BY id"),
-        ("words", "SELECT * FROM word ORDER BY id"),
+    const TABLES: [(&str, &str); 10] = [
+        (
+            "sources",
+            "SELECT id, slug, type, title, author, series, series_number, url, \
+             reading_position, reading_position_exported_at, created_at, updated_at, \
+             title_defaulted FROM source ORDER BY id",
+        ),
+        (
+            "words",
+            "SELECT id, headword, headword_key, grammar, pronunciation, speak, meaning, \
+             usefulness, goal, hint, spelling_note, note, icon, low_priority, included, \
+             suspended, created_at, updated_at, spelling FROM word ORDER BY id",
+        ),
         (
             "word_sources",
-            "SELECT * FROM word_source ORDER BY word_id, source_id",
+            "SELECT word_id, source_id, seq, tag_kind, tag_text, first_pack_import_id, \
+             last_pack_import_id FROM word_source ORDER BY word_id, source_id",
         ),
         (
             "word_items",
-            "SELECT * FROM word_item ORDER BY word_id, kind, position, value_key",
+            "SELECT word_id, kind, value, value_key, position, origin, removed \
+             FROM word_item ORDER BY word_id, kind, position, value_key",
         ),
         (
             "word_forms",
-            "SELECT * FROM word_form ORDER BY word_id, position, form_key",
+            "SELECT word_id, form, form_key, common, position, removed \
+             FROM word_form ORDER BY word_id, position, form_key",
         ),
-        ("sentences", "SELECT * FROM sentence ORDER BY id"),
+        (
+            "sentences",
+            "SELECT id, word_id, en_marked, cs_marked, en_key, origin, location, source_id, \
+             hidden, edited, position, pack_import_id, created_at, updated_at \
+             FROM sentence ORDER BY id",
+        ),
         (
             "word_overrides",
-            "SELECT * FROM word_override ORDER BY word_id, field",
+            "SELECT word_id, field, set_at FROM word_override ORDER BY word_id, field",
         ),
         (
             "field_conflicts",
-            "SELECT * FROM field_conflict ORDER BY id",
+            "SELECT id, word_id, field, current_value, incoming_value, pack_import_id, status, \
+             created_at, resolved_at FROM field_conflict ORDER BY id",
         ),
         (
             "word_pack_spellings",
-            "SELECT * FROM word_pack_spelling ORDER BY word_id, key",
+            "SELECT key, word_id, headword FROM word_pack_spelling ORDER BY word_id, key",
+        ),
+        (
+            "id_floors",
+            "SELECT name, last_id FROM id_floor ORDER BY name",
         ),
     ];
     for (name, sql) in TABLES {

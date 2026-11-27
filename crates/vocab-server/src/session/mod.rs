@@ -354,3 +354,19 @@ pub enum SessionError {
     #[error("database: {0}")]
     Sqlite(#[from] rusqlite::Error),
 }
+
+/// The practice blocks for the full export (design §8.1): `reviews` name
+/// their block (`session_id`). The blocks' items are left out (what a
+/// block still holds is no history).
+pub fn export(
+    conn: &rusqlite::Connection,
+    sink: &mut dyn crate::db::TableSink,
+) -> Result<(), crate::db::TableError> {
+    crate::db::write_table(
+        conn,
+        sink,
+        "practice_sessions",
+        "SELECT id, study_day, scope_source_id, block_no, block_size, status, started_at, \
+         finished_at, kind FROM practice_session ORDER BY started_at, id",
+    )
+}
