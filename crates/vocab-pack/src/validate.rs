@@ -39,6 +39,20 @@ pub const HINT_ADVICE_CHARS: usize = 120;
 /// Fewer valid sentences than this → word-only Understand card.
 pub const MIN_SENTENCES_FOR_SENTENCE_CARD: usize = 3;
 
+// Character limits of word and sentence fields (design §5.2), shared by the
+// pack validation and the owner's edits in the app (R-04, R-25).
+const HEADWORD_MAX: usize = 100;
+/// `grammar`, `pronunciation`, `speak`, `spelling_note`.
+const SHORT_TEXT_MAX: usize = 200;
+const MEANING_MAX: usize = 1500;
+const HINT_MAX: usize = 300;
+const NOTE_MAX: usize = 6000;
+const ICON_MAX: usize = 40;
+/// One item of `czech`, `accepted`, `confusables`.
+const ITEM_MAX: usize = 200;
+const FORM_MAX: usize = 100;
+const SENTENCE_TEXT_MAX: usize = 600;
+
 const PACK_KEYS: &[&str] = &[
     "format",
     "format_version",
@@ -441,37 +455,12 @@ fn word(index: usize, value: &Value) -> WordResult {
     };
     f.unknown(w, &base, WORD_KEYS);
 
-    // Blank also when only invisible characters are left: such a headword
-    // has an empty identity key and would merge with every other one.
-    let headword = f
-        .required_text(w, &base, "headword", 1, 100)
-        .map(|h| h.trim().to_owned())
-        .filter(|h| {
-            let ok = !headword_key(h).is_empty();
-            if !ok {
-                f.error(
-                    format!("{base}/headword"),
-                    IssueCode::Invalid,
-                    "headword is blank (it has no visible character).",
-                );
-            }
-            ok
-        });
-    let grammar = f.optional_text(w, &base, "grammar", 200);
+    let headword = headword(&mut f, w, &base);
+    let grammar = f.optional_text(w, &base, "grammar", SHORT_TEXT_MAX);
     let forms = forms(&mut f, w, &base);
-    let pronunciation = f.optional_text(w, &base, "pronunciation", 200);
-    let speak = f.optional_text(w, &base, "speak", 200);
-    let meaning = f.required_text(w, &base, "meaning", 1, 1500).filter(|m| {
-        let ok = !is_blank(m);
-        if !ok {
-            f.error(
-                format!("{base}/meaning"),
-                IssueCode::Invalid,
-                "meaning is blank (it has no visible character).",
-            );
-        }
-        ok
-    });
+    let pronunciation = f.optional_text(w, &base, "pronunciation", SHORT_TEXT_MAX);
+    let speak = f.optional_text(w, &base, "speak", SHORT_TEXT_MAX);
+    let meaning = meaning(&mut f, w, &base);
     let czech = f.text_list(w, &base, "czech", true);
     if czech.as_ref().is_some_and(Vec::is_empty) {
         f.error(
@@ -481,23 +470,12 @@ fn word(index: usize, value: &Value) -> WordResult {
         );
     }
     let usefulness = f.required_int(w, &base, "usefulness", 1, 10);
-    let goal = match w.get("goal") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(g)) if Goal::parse(g).is_some() => Goal::parse(g),
-        Some(_) => {
-            f.error(
-                format!("{base}/goal"),
-                IssueCode::Invalid,
-                format!("goal must be one of {}.", Goal::ALL.join(", ")),
-            );
-            None
-        }
-    };
+    let goal = goal(&mut f, w, &base);
     let accepted = f.text_list(w, &base, "accepted", false).unwrap_or_default();
     let confusables = f
         .text_list(w, &base, "confusables", false)
         .unwrap_or_default();
-    let hint = f.optional_text(w, &base, "hint", 300);
+    let hint = f.optional_text(w, &base, "hint", HINT_MAX);
     if hint
         .as_ref()
         .is_some_and(|h| h.chars().count() > HINT_ADVICE_CHARS)
@@ -520,7 +498,7 @@ fn word(index: usize, value: &Value) -> WordResult {
             None
         }
     };
-    let spelling_note = f.optional_text(w, &base, "spelling_note", 200);
+    let spelling_note = f.optional_text(w, &base, "spelling_note", SHORT_TEXT_MAX);
     if spelling_note.is_some() && spelling != Some(true) {
         f.warn(
             format!("{base}/spelling_note"),
@@ -528,9 +506,9 @@ fn word(index: usize, value: &Value) -> WordResult {
             "spelling_note is given but spelling is not true.",
         );
     }
-    let note = f.optional_text(w, &base, "note", 6000);
+    let note = f.optional_text(w, &base, "note", NOTE_MAX);
     let tag = tag(&mut f, w, &base);
-    let icon = f.optional_text(w, &base, "icon", 40);
+    let icon = f.optional_text(w, &base, "icon", ICON_MAX);
     let seq = match w.get("seq") {
         None | Some(Value::Null) => None,
         Some(v) => match integer(v) {
@@ -640,6 +618,57 @@ fn word(index: usize, value: &Value) -> WordResult {
     }
 }
 
+/// The headword: 1–100 characters, trimmed, with a visible character.
+/// Blank also when only invisible characters are left: such a headword has
+/// an empty identity key and would merge with every other one.
+fn headword(f: &mut Findings, w: &Map<String, Value>, base: &str) -> Option<String> {
+    f.required_text(w, base, "headword", 1, HEADWORD_MAX)
+        .map(|h| h.trim().to_owned())
+        .filter(|h| {
+            let ok = !headword_key(h).is_empty();
+            if !ok {
+                f.error(
+                    format!("{base}/headword"),
+                    IssueCode::Invalid,
+                    "headword is blank (it has no visible character).",
+                );
+            }
+            ok
+        })
+}
+
+/// The meaning: 1–1500 characters with a visible character.
+fn meaning(f: &mut Findings, w: &Map<String, Value>, base: &str) -> Option<String> {
+    f.required_text(w, base, "meaning", 1, MEANING_MAX)
+        .filter(|m| {
+            let ok = !is_blank(m);
+            if !ok {
+                f.error(
+                    format!("{base}/meaning"),
+                    IssueCode::Invalid,
+                    "meaning is blank (it has no visible character).",
+                );
+            }
+            ok
+        })
+}
+
+/// The goal; absent or `null` = not given (an invalid value is an error).
+fn goal(f: &mut Findings, w: &Map<String, Value>, base: &str) -> Option<Goal> {
+    match w.get("goal") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(g)) if Goal::parse(g).is_some() => Goal::parse(g),
+        Some(_) => {
+            f.error(
+                format!("{base}/goal"),
+                IssueCode::Invalid,
+                format!("goal must be one of {}.", Goal::ALL.join(", ")),
+            );
+            None
+        }
+    }
+}
+
 fn forms(f: &mut Findings, w: &Map<String, Value>, base: &str) -> Option<Vec<PackForm>> {
     let pointer = format!("{base}/forms");
     let items = match w.get("forms") {
@@ -672,7 +701,7 @@ fn forms(f: &mut Findings, w: &Map<String, Value>, base: &str) -> Option<Vec<Pac
         };
         f.unknown(obj, &item_base, FORM_KEYS);
         let form = f
-            .required_text(obj, &item_base, "form", 1, 100)
+            .required_text(obj, &item_base, "form", 1, FORM_MAX)
             .filter(|form| {
                 let blank = form.trim().is_empty();
                 if blank {
@@ -811,7 +840,7 @@ fn sentence(f: &mut Findings, value: &Value, base: &str) -> Option<PackSentence>
 }
 
 fn marked_text(f: &mut Findings, s: &Map<String, Value>, base: &str, key: &str) -> Option<String> {
-    let text = f.required_text(s, base, key, 1, 600)?;
+    let text = f.required_text(s, base, key, 1, SENTENCE_TEXT_MAX)?;
     match marked::split(&text) {
         Ok(_) => Some(text),
         Err(err) => {
@@ -822,6 +851,154 @@ fn marked_text(f: &mut Findings, s: &Map<String, Value>, base: &str, key: &str) 
             );
             None
         }
+    }
+}
+
+// ── owner edits (R-04, R-25) ────────────────────────────────────────────────
+
+/// The word fields the owner may change in the app (R-04), by their storage
+/// name: every scalar field of a pack word. List fields (`czech`,
+/// `accepted`, `confusables`, `forms`) are edited item by item
+/// ([`owner_list_item`], [`owner_form`]); sentences by [`owner_sentence`].
+pub const OWNER_WORD_FIELDS: [&str; 12] = [
+    "headword",
+    "grammar",
+    "pronunciation",
+    "speak",
+    "meaning",
+    "usefulness",
+    "goal",
+    "hint",
+    "spelling",
+    "spelling_note",
+    "note",
+    "icon",
+];
+
+/// Most characters of an optional text field the owner edits.
+fn owner_text_max(field: &str) -> usize {
+    match field {
+        "hint" => HINT_MAX,
+        "note" => NOTE_MAX,
+        "icon" => ICON_MAX,
+        _ => SHORT_TEXT_MAX,
+    }
+}
+
+/// An edit of word fields by the owner: a JSON object `{field: value, …}`
+/// of [`OWNER_WORD_FIELDS`], checked with the same rules as a pack word
+/// (design §5.2). Returns the normalised values in the order of
+/// [`OWNER_WORD_FIELDS`]; `null` (or a blank text) clears an optional field
+/// (`goal: null` = derive from usefulness). `headword`, `meaning`,
+/// `usefulness` and `spelling` cannot be cleared. Unknown fields are errors
+/// here: the app sends only what it knows.
+pub fn owner_word_edit(value: &Value) -> Result<Vec<(&'static str, Value)>, Vec<Issue>> {
+    let mut f = Findings::default();
+    let Some(obj) = value.as_object() else {
+        f.error("", IssueCode::Invalid, "The edit must be a JSON object.");
+        return Err(f.errors);
+    };
+    for key in obj.keys() {
+        if !OWNER_WORD_FIELDS.contains(&key.as_str()) {
+            f.error(
+                format!("/{}", escape_pointer(key)),
+                IssueCode::UnknownProperty,
+                format!("\"{}\" is not a field that can be edited.", printable(key)),
+            );
+        }
+    }
+    if obj.is_empty() {
+        f.error("", IssueCode::Missing, "Nothing to change.");
+    }
+    let mut out = Vec::new();
+    for field in OWNER_WORD_FIELDS {
+        let Some(given) = obj.get(field) else {
+            continue;
+        };
+        let before = f.errors.len();
+        let value = match field {
+            "headword" => headword(&mut f, obj, "").map(Value::String),
+            "meaning" => meaning(&mut f, obj, "").map(|m| Value::String(m.trim().to_owned())),
+            "usefulness" => f.required_int(obj, "", field, 1, 10).map(Value::from),
+            "goal" => Some(
+                goal(&mut f, obj, "").map_or(Value::Null, |g| Value::String(g.as_str().to_owned())),
+            ),
+            "spelling" => match given {
+                Value::Bool(b) => Some(Value::Bool(*b)),
+                _ => {
+                    f.error(
+                        "/spelling",
+                        IssueCode::Invalid,
+                        "spelling must be true or false.",
+                    );
+                    None
+                }
+            },
+            _ => Some(
+                f.optional_text(obj, "", field, owner_text_max(field))
+                    .map_or(Value::Null, |t| Value::String(t.trim().to_owned())),
+            ),
+        };
+        if f.errors.len() == before
+            && let Some(value) = value
+        {
+            out.push((field, value));
+        }
+    }
+    if f.errors.is_empty() {
+        Ok(out)
+    } else {
+        Err(f.errors)
+    }
+}
+
+/// One owner text item of `czech`, `accepted` or `confusables`: 1–200
+/// characters with a visible character; returned trimmed and NFC-normalised.
+pub fn owner_list_item(text: &str) -> Result<String, Issue> {
+    owner_item(text, ITEM_MAX)
+}
+
+/// One owner form (`forms[].form`): 1–100 characters with a visible
+/// character; returned trimmed and NFC-normalised.
+pub fn owner_form(text: &str) -> Result<String, Issue> {
+    owner_item(text, FORM_MAX)
+}
+
+fn owner_item(text: &str, max: usize) -> Result<String, Issue> {
+    let mut f = Findings::default();
+    let value = f.text(text.trim(), "/value", "value", 1, max);
+    match value {
+        Some(value) if !is_blank(&value) => Ok(value),
+        _ => Err(f.errors.into_iter().next().unwrap_or(Issue {
+            pointer: "/value".to_owned(),
+            code: IssueCode::Invalid,
+            message: "value is blank (it has no visible character).".to_owned(),
+        })),
+    }
+}
+
+/// A sentence the owner corrected (R-25): `en` and `cs` with the same rules
+/// as a pack sentence (one `[[…]]` span each, at most 600 characters, a
+/// Czech translation with letters). Returned NFC-normalised.
+pub fn owner_sentence(en: &str, cs: &str) -> Result<(String, String), Vec<Issue>> {
+    let mut f = Findings::default();
+    let mut obj = Map::new();
+    obj.insert("en".to_owned(), Value::String(en.to_owned()));
+    obj.insert("cs".to_owned(), Value::String(cs.to_owned()));
+    let en = marked_text(&mut f, &obj, "", "en");
+    let cs = marked_text(&mut f, &obj, "", "cs");
+    if let Some(cs) = &cs
+        && !strip_markers(cs).chars().any(char::is_alphabetic)
+    {
+        f.error(
+            "/cs",
+            IssueCode::Invalid,
+            "cs must be a Czech translation (it contains no letters).",
+        );
+    }
+    match (en, cs) {
+        (Some(en), Some(cs)) if f.errors.is_empty() => Ok((en, cs)),
+        _ => Err(f.errors),
     }
 }
 
@@ -1020,7 +1197,7 @@ impl Findings {
                     format!("A blank item of {key} is ignored."),
                 ),
                 Value::String(s) => {
-                    if let Some(t) = self.text(s, &item_pointer, key, 1, 200) {
+                    if let Some(t) = self.text(s, &item_pointer, key, 1, ITEM_MAX) {
                         out.push(t);
                     }
                 }
@@ -1247,5 +1424,90 @@ mod tests {
         assert_eq!(integer(&serde_json::json!(7.0)), Some(7));
         assert_eq!(integer(&serde_json::json!(7.5)), None);
         assert_eq!(integer(&serde_json::json!("7")), None);
+    }
+
+    #[test]
+    fn r04_owner_edit_uses_the_pack_rules_and_normalises() {
+        let edit = owner_word_edit(&serde_json::json!({
+            "note": "  A test note\r\nline two  ",
+            "meaning": " Invented meaning. ",
+            "goal": null,
+            "usefulness": 7,
+            "spelling": true,
+            "hint": "",
+            "headword": "  Test-lull ",
+        }))
+        .expect("valid edit");
+        assert_eq!(
+            edit,
+            vec![
+                ("headword", serde_json::json!("Test-lull")),
+                ("meaning", serde_json::json!("Invented meaning.")),
+                ("usefulness", serde_json::json!(7)),
+                ("goal", Value::Null),
+                ("hint", Value::Null),
+                ("spelling", serde_json::json!(true)),
+                ("note", serde_json::json!("A test note\nline two")),
+            ],
+            "field order, trimming, line breaks, blank = cleared"
+        );
+    }
+
+    #[test]
+    fn r04_owner_edit_refuses_what_a_pack_may_not_carry() {
+        for (edit, pointer) in [
+            (serde_json::json!({}), ""),
+            (serde_json::json!([]), ""),
+            (serde_json::json!({ "seq": 3 }), "/seq"),
+            (serde_json::json!({ "headword": " \u{200b} " }), "/headword"),
+            (serde_json::json!({ "headword": null }), "/headword"),
+            (serde_json::json!({ "meaning": "   " }), "/meaning"),
+            (
+                serde_json::json!({ "meaning": "x".repeat(1501) }),
+                "/meaning",
+            ),
+            (serde_json::json!({ "usefulness": 11 }), "/usefulness"),
+            (serde_json::json!({ "usefulness": null }), "/usefulness"),
+            (serde_json::json!({ "goal": "produce" }), "/goal"),
+            (serde_json::json!({ "spelling": null }), "/spelling"),
+            (serde_json::json!({ "hint": "x".repeat(301) }), "/hint"),
+            (serde_json::json!({ "note": "bell\u{7}" }), "/note"),
+            (serde_json::json!({ "icon": 3 }), "/icon"),
+        ] {
+            let errors = owner_word_edit(&edit).expect_err(&edit.to_string());
+            assert_eq!(errors[0].pointer, pointer, "{edit}");
+        }
+        assert!(owner_word_edit(&serde_json::json!({ "note": "x".repeat(6000) })).is_ok());
+    }
+
+    #[test]
+    fn r04_owner_items_and_forms_are_bounded_and_visible() {
+        assert_eq!(owner_list_item("  ukolébat "), Ok("ukolébat".to_owned()));
+        assert!(owner_list_item(" \u{feff} ").is_err());
+        assert!(owner_list_item("").is_err());
+        assert!(owner_list_item(&"x".repeat(201)).is_err());
+        assert!(owner_list_item(&"x".repeat(200)).is_ok());
+        assert_eq!(owner_form("lulled"), Ok("lulled".to_owned()));
+        assert!(owner_form(&"x".repeat(101)).is_err());
+    }
+
+    #[test]
+    fn r25_owner_sentence_keeps_the_marker_rule() {
+        assert!(owner_sentence("The sea [[lulled]] us.", "Moře nás [[ukolébalo]].").is_ok());
+        for (en, cs, pointer) in [
+            ("The sea lulled us.", "Moře nás [[ukolébalo]].", "/en"),
+            (
+                "The [[sea]] [[lulled]] us.",
+                "Moře nás [[ukolébalo]].",
+                "/en",
+            ),
+            ("The sea [[lulled]] us.", "[[123]]", "/cs"),
+            ("The sea [[lulled]] us.", "", "/cs"),
+        ] {
+            let errors = owner_sentence(en, cs).expect_err(en);
+            assert_eq!(errors[0].pointer, pointer, "{en} / {cs}");
+        }
+        let long = format!("[[a]]{}", "b".repeat(600));
+        assert!(owner_sentence(&long, "[[a]]").is_err());
     }
 }
