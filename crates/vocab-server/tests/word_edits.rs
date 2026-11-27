@@ -918,3 +918,33 @@ async fn r04_owner_accepted_answers_and_the_packs_are_one_list() {
         ["lulls"]
     );
 }
+
+/// Author's edge case (b): a later pack that brings exactly the owner's
+/// corrected sentence recognises it and adds no copy.
+#[tokio::test]
+async fn r25_a_pack_with_the_owners_corrected_sentence_adds_no_copy() {
+    let env = env();
+    env.import(BOOK, vec![word("lull", 7, 3)]).await;
+    let id = id_of(&env, "lull").await;
+    let sentence = detail(&env, id).await["sentences"][0]["id"]
+        .as_i64()
+        .expect("sentence");
+    let en = "The owner's own [[lull]] line.";
+    let cs = "Vlastní řádek s [[lull]].";
+    let (status, view) = env
+        .request(
+            "PATCH",
+            &format!("/api/sentences/{sentence}"),
+            Some(&json!({ "en": en, "cs": cs })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    let mut pack = word("lull", 7, 3);
+    pack["sentences"]
+        .as_array_mut()
+        .expect("sentences")
+        .push(json!({ "en": en, "cs": cs, "origin": "example" }));
+    env.import(BOOK, vec![pack]).await;
+    let view = detail(&env, id).await;
+    assert_eq!(view["sentences"].as_array().expect("s").len(), 3, "{view}");
+}

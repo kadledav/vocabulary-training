@@ -24,7 +24,7 @@ use std::collections::{HashMap, HashSet};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::Serialize;
 use serde_json::Value;
-use vocab_pack::keys::{item_key, span_key};
+use vocab_pack::keys::{item_key, sentence_key, span_key};
 use vocab_pack::types::{PackSentence, PackWord, TagKind};
 
 use super::identity::{find_word, record_pack_spelling};
@@ -284,12 +284,12 @@ fn plan(conn: &Connection, source: SourceId, word: &PackWord) -> rusqlite::Resul
     )?;
     let new_forms = new_forms(word, &known_forms);
 
-    let known_sentences = known_sentences(conn, id)?;
+    let (known_sentences, by_key) = known_sentences(conn, id)?;
     let mut new_sentences = Vec::new();
     let mut updated_sentences = Vec::new();
     let mut sentences_known = 0;
     for (i, sentence) in word.sentences.iter().enumerate() {
-        match known_sentences.get(&sentence.key) {
+        match by_key.get(&sentence.key).map(|&at| &known_sentences[at]) {
             None => new_sentences.push(i),
             // A correction (another translation, another span) reaches the
             // app; what the owner edited or hid stays his.
@@ -392,25 +392,39 @@ impl KnownSentence {
     }
 }
 
+/// The word's sentences, and which one a sentence key names: the key it
+/// was stored with (the pack's text; kept when the owner edits it) and the
+/// key of its text now, so a pack that brings exactly the owner's
+/// corrected text recognises it instead of adding it again.
 fn known_sentences(
     conn: &Connection,
     id: WordId,
-) -> rusqlite::Result<HashMap<String, KnownSentence>> {
+) -> rusqlite::Result<(Vec<KnownSentence>, HashMap<String, usize>)> {
     let mut stmt = conn.prepare(
-        "SELECT en_key, id, en_marked, cs_marked, edited OR hidden FROM sentence WHERE word_id = ?1",
+        "SELECT en_key, id, en_marked, cs_marked, edited OR hidden FROM sentence \
+         WHERE word_id = ?1 ORDER BY id",
     )?;
-    stmt.query_map([id.0], |row| {
-        Ok((
-            row.get(0)?,
-            KnownSentence {
-                id: row.get(1)?,
-                en: row.get(2)?,
-                cs: row.get(3)?,
-                owner_changed: row.get(4)?,
-            },
-        ))
-    })?
-    .collect()
+    let rows: Vec<(String, KnownSentence)> = stmt
+        .query_map([id.0], |row| {
+            Ok((
+                row.get(0)?,
+                KnownSentence {
+                    id: row.get(1)?,
+                    en: row.get(2)?,
+                    cs: row.get(3)?,
+                    owner_changed: row.get(4)?,
+                },
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut by_key = HashMap::new();
+    for (at, (key, _)) in rows.iter().enumerate() {
+        by_key.insert(key.clone(), at);
+    }
+    for (at, (_, known)) in rows.iter().enumerate() {
+        by_key.entry(sentence_key(&known.en)).or_insert(at);
+    }
+    Ok((rows.into_iter().map(|(_, known)| known).collect(), by_key))
 }
 
 // ── public operations ───────────────────────────────────────────────────────
