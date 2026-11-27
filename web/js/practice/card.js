@@ -6,14 +6,17 @@
  * "More"). Produce (wireframes 4, 4b; R-56): the sentence with the word
  * blanked and the Czech sentence as the cue — no audio, it would say the
  * answer — and on the answer side the check result above the same answer
- * view. All pack text is inserted as text (R-84) with its language marked.
+ * view. Spelling (R-58): the word's audio with a big ▶ Listen and the
+ * Czech gloss as the cue — nothing that shows how the word is written —
+ * and on the answer side a letter-by-letter diff and the spelling note.
+ * All pack text is inserted as text (R-84) with its language marked.
  */
 
 import { h } from '../dom.js';
 import { markedText } from '../marked.js';
 import { displayIcon } from '../icon.js';
 import { caption, exampleSentence } from './model.js';
-import { expectedAnswer } from '../grading.js';
+import { diffSummary, expectedAnswer, spellingDiff } from '../grading.js';
 
 /**
  * @typedef {import('../session.js').Item} Item
@@ -21,7 +24,15 @@ import { expectedAnswer } from '../grading.js';
  * @typedef {{ speechOk: boolean, onSpeakSentence: () => void, onSpeakWord: () => void }} Audio
  * @typedef {import('../grading.js').Check} Check
  * @typedef {'offer' | 'saving' | 'saved' | 'failed'} AcceptState
+ * @typedef {import('../grading.js').DiffColumn} DiffColumn
+ * @typedef {'waiting' | 'playing' | 'heard' | 'tap' | 'none'} ListenState
+ *   The Spelling prompt: its sound is on its way or starting by itself; it
+ *   played; it could not start by itself (tap ▶); this device has no sound
+ *   for the word.
  */
+
+/** @type {Record<string, string>} */
+const MODE_NAMES = { understand: 'Understand', produce: 'Produce', spelling: 'Spelling' };
 
 /**
  * A ▶ control (browser speech, started only by a tap: R-41).
@@ -50,7 +61,7 @@ function modeLine(item) {
   return h(
     'p',
     { class: 'mode' },
-    h('span', { class: 'mode-name', 'data-testid': 'mode' }, item.card.kind === 'produce' ? 'Produce' : 'Understand'),
+    h('span', { class: 'mode-name', 'data-testid': 'mode' }, MODE_NAMES[item.card.kind] ?? 'Understand'),
     item.card.is_new ? h('span', { class: 'badge badge-new' }, 'New') : null,
     item.card.is_repeat ? h('span', { class: 'badge' }, 'Again') : null,
   );
@@ -154,6 +165,145 @@ export function produceQuestion(item) {
           h('span', { class: 'cz-tag', 'aria-hidden': 'true' }, 'CZ'),
           h('p', { class: 'sentence-cs', lang: 'cs' }, item.word.czech.join(', ')),
         ),
+  );
+}
+
+/** What the line under the Spelling prompt's ▶ says. */
+/** @type {Record<ListenState, string>} */
+const LISTEN_TEXT = {
+  waiting: 'Getting the sound…',
+  playing: 'Listen…',
+  heard: 'Type the word you heard. Replay it as often as you like.',
+  tap: 'Tap ▶ Listen to hear the word.',
+  none: 'No sound for this word on this device: spell it from the Czech below.',
+};
+
+/**
+ * The question side of a Spelling card (design §7.1 screen 3b): ▶ Listen
+ * (it plays by itself where the browser allows it; when it cannot, the
+ * button is marked and says to tap it) and the Czech gloss as the cue for
+ * which word is meant. Nothing shows how the word is written: no headword,
+ * no sentence, no pronunciation respelling, no meaning.
+ *
+ * @param {Item} item
+ * @param {{ onListen: () => void, listen: ListenState }} prompt
+ */
+export function spellingQuestion(item, { onListen, listen }) {
+  return h(
+    'div',
+    { class: 'item item-question spelling' },
+    modeLine(item),
+    h(
+      'div',
+      { class: 'listen' },
+      h(
+        'button',
+        {
+          type: 'button',
+          class: `play play-word listen-big${listen === 'tap' ? ' needs-tap' : ''}`,
+          'aria-label': 'Listen to the word (R)',
+          title: 'Listen to the word (R)',
+          'data-testid': 'listen',
+          onclick: onListen,
+        },
+        h('span', { 'aria-hidden': 'true' }, '▶'),
+        ' Listen',
+      ),
+      h('p', { class: `listen-status${listen === 'tap' || listen === 'none' ? ' attention' : ''}`, role: 'status', 'data-testid': 'listen-status' }, LISTEN_TEXT[listen]),
+    ),
+    item.word.czech.length > 0
+      ? h(
+          'div',
+          { class: 'cz-box', 'data-testid': 'gloss-cue' },
+          h('span', { class: 'cz-tag', 'aria-hidden': 'true' }, 'CZ'),
+          h('p', { class: 'sentence-cs', lang: 'cs' }, item.word.czech.join(', ')),
+        )
+      : null,
+  );
+}
+
+/** How a letter shows in the diff: a space as ␣, a gap as ·. */
+/** @param {string | null} ch */
+function diffLetter(ch) {
+  if (ch === null) return '·';
+  return ch === ' ' ? '␣' : ch;
+}
+
+/** The symbol under a column: not colour alone (design §6.8). */
+/** @type {Record<import('../grading.js').DiffMark, string>} */
+const DIFF_SYMBOL = { same: '\u00a0', wrong: '×', missing: '+', extra: '−' };
+
+/**
+ * The letter-by-letter diff (design §6.8): one column per letter, what was
+ * typed above the word's spelling, a symbol under every difference and
+ * colour on top. The grid is for the eyes; a screen reader gets the same in
+ * words.
+ *
+ * @param {readonly DiffColumn[]} diff
+ */
+export function spellingDiffView(diff) {
+  return h(
+    'div',
+    { class: 'spell-diff-box' },
+    h(
+      'div',
+      { class: 'spell-diff', 'aria-hidden': 'true', 'data-testid': 'spell-diff' },
+      h('span', { class: 'diff-col diff-labels' }, h('span', {}, 'typed'), h('span', {}, 'word'), h('span', {}, '\u00a0')),
+      diff.map((column) =>
+        h(
+          'span',
+          { class: `diff-col diff-${column.mark}`, 'data-mark': column.mark },
+          h('span', { class: 'diff-typed mono', lang: 'en' }, diffLetter(column.typed)),
+          h('span', { class: 'diff-correct mono', lang: 'en' }, diffLetter(column.correct)),
+          h('span', { class: 'diff-mark' }, DIFF_SYMBOL[column.mark]),
+        ),
+      ),
+    ),
+    h('p', { class: 'sr-only' }, diffSummary(diff)),
+    h('p', { class: 'diff-legend muted small', 'aria-hidden': 'true' }, '× wrong letter · + missing · − extra'),
+  );
+}
+
+/**
+ * The answer of a Spelling card: what the strict check found — ✓ Correct
+ * spelling, or ✗ Not quite with the letter diff and "Just a typo? Choose
+ * 3." — or the spelling after "I don't know" / "I'll just rate myself",
+ * then the pack's spelling note (the trap).
+ *
+ * @param {Item} item
+ * @param {Check} check
+ */
+export function spellingResult(item, check) {
+  const word = item.word.headword;
+  const note = item.word.spelling_note
+    ? h('p', { class: 'spelling-note', lang: 'en', 'data-testid': 'spelling-note' }, h('strong', {}, 'Trap: '), item.word.spelling_note)
+    : null;
+  const spelled = h('p', { class: 'spelled mono', lang: 'en', 'data-testid': 'expected' }, word);
+  if (check.match === 'exact') {
+    return h(
+      'div',
+      { class: 'check check-ok', 'data-testid': 'check-result', 'data-match': 'exact' },
+      h('p', { class: 'check-title' }, h('span', { 'aria-hidden': 'true' }, '✓ '), 'Correct spelling'),
+      spelled,
+      note,
+    );
+  }
+  if (check.match === 'none') {
+    return h(
+      'div',
+      { class: 'check check-miss', 'data-testid': 'check-result', 'data-match': 'none' },
+      h('p', { class: 'check-title' }, h('span', { 'aria-hidden': 'true' }, '✗ '), 'Not quite'),
+      spellingDiffView(spellingDiff(check.typed ?? '', word)),
+      h('p', { class: 'muted small' }, 'Just a typo? Choose 3.'),
+      note,
+    );
+  }
+  return h(
+    'div',
+    { class: 'check', 'data-testid': 'check-result', 'data-match': check.match },
+    h('p', { class: 'check-title' }, 'The spelling:'),
+    spelled,
+    note,
   );
 }
 
@@ -275,6 +425,7 @@ export function questionView(item, audio) {
  * @param {Item} item
  */
 export function criterion(item) {
+  if (item.card.kind === 'spelling') return 'Type the word you hear: every letter counts.';
   if (item.card.kind === 'produce') return 'Type the English word for the blank: the Czech sentence is your cue.';
   return item.card.format === 'sentence' && item.sentence
     ? 'Rate the highlighted word: would you have understood it here, without help?'

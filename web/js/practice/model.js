@@ -86,24 +86,47 @@ export function moreOpenOnReveal(item) {
 }
 
 /**
- * Is the item a typed card (Produce: the owner types the English word for
- * the blanked sentence, R-56)?
+ * Is the item a typed card — Produce (the owner types the English word for
+ * the blanked sentence, R-56) or Spelling (he types the word he hears,
+ * R-58)?
  *
  * @param {Item} item
  */
 export function isTyped(item) {
+  return item.card.kind === 'produce' || item.card.kind === 'spelling';
+}
+
+/**
+ * Is the item a Spelling card (R-58): the question is the word's audio,
+ * the answer is checked strictly, letter by letter?
+ *
+ * @param {Item} item
+ */
+export function isSpelling(item) {
+  return item.card.kind === 'spelling';
+}
+
+/**
+ * Has the typed card a hint (first letter and letter count)? Produce only:
+ * on a Spelling card it would give the spelling away.
+ *
+ * @param {Item} item
+ */
+export function hasHint(item) {
   return item.card.kind === 'produce';
 }
 
 /**
  * Is "More" open when a typed card's answer shows? After a miss or "I
- * don't know" the note opens (research §3); a correct answer moves on.
+ * don't know" the note opens (research §3); a correct answer moves on. A
+ * Spelling card keeps it closed: its letter diff and spelling note are
+ * what matters there.
  *
  * @param {Item} item
  * @param {import('../grading.js').AnswerMatch} match
  */
 export function moreOpenAfterCheck(item, match) {
-  return hasMore(item) && (match === 'none' || match === 'dont_know');
+  return !isSpelling(item) && hasMore(item) && (match === 'none' || match === 'dont_know');
 }
 
 /**

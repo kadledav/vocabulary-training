@@ -131,6 +131,27 @@ export function playClip(url, speed, events = {}) {
   if (playing && typeof playing.catch === 'function') playing.catch(() => finish(true));
 }
 
+let primed = false;
+
+/**
+ * Unlock the shared media element in a tap or key handler, once: iOS lets
+ * an element that started playing inside a gesture play again later from
+ * script, so a Spelling card that comes up after a saved rating can play
+ * its word by itself. Plays nothing (muted, paused at once, no source)
+ * and leaves a clip that is playing alone.
+ */
+export function primeClips() {
+  if (primed || stopCurrent) return;
+  primed = true;
+  if (!player) player = h('audio', { preload: 'auto' });
+  const audio = player;
+  audio.muted = true;
+  const playing = audio.play();
+  if (playing && typeof playing.catch === 'function') playing.catch(() => {});
+  audio.pause();
+  audio.muted = false;
+}
+
 /** Stop the clip that is playing, if any. */
 export function stopClip() {
   if (stopCurrent) stopCurrent();

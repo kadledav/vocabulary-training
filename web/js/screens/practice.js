@@ -1,8 +1,8 @@
 // @ts-check
 /**
- * Practice — Understand and Produce (design §7.1 screens 2/2b/3, §6.8,
- * §7.2–§7.5; research wireframes 2, 3, 2b, 4, 4b; R-52, R-53, R-54, R-56,
- * R-60, R-62, R-70).
+ * Practice — Understand, Produce and Spelling (design §7.1 screens
+ * 2/2b/3/3b, §6.8, §7.2–§7.5; research wireframes 2, 3, 2b, 4, 4b; R-52,
+ * R-53, R-54, R-56, R-58, R-60, R-62, R-70).
  *
  * Produce: the owner types the English word for the blanked sentence (the
  * answer field and its buttons sit in the bottom bar, which the on-screen
@@ -11,6 +11,14 @@
  * suggested grade; his 1–5 rating is the final word. What he typed stays
  * (also across a reload) until the card is checked, and goes with the
  * rating, so a failed post never loses it.
+ *
+ * Spelling: the same answer field and buttons (no hint); the question is
+ * the word's audio — it starts by itself where the browser lets it (the
+ * shared media element was unlocked by an earlier tap), else ▶ Listen is
+ * marked and says to tap it; a ▶ also sits next to the field, so it stays
+ * in reach above the on-screen keyboard. The check is strict and the answer
+ * side shows the letter diff and the spelling note. Without any sound on
+ * this device the Czech gloss is the cue (never a dead end).
  *
  * Question side → reveal → answer side → rate 1–5. Every rating is posted
  * at once (idempotent by its client UUID); a 4/5 keeps the answer on screen
@@ -31,24 +39,39 @@
 import { clipFor, clipsFor, playClip, preloadClips, stopClip } from '../clips.js';
 import { h, mount } from '../dom.js';
 import { keyAction, keyTarget } from '../keys.js';
-import { answerView, checkResult, criterion, produceQuestion, questionView, revealLabel, typedHint } from '../practice/card.js';
+import {
+  answerView,
+  checkResult,
+  criterion,
+  produceQuestion,
+  questionView,
+  revealLabel,
+  spellingQuestion,
+  spellingResult,
+  typedHint,
+} from '../practice/card.js';
 import {
   TYPED_MAX,
   answersFor,
   canAddAccepted,
+  checkSpelling,
   checkTyped,
   checkable,
+  diffSummary,
   dontKnow,
   expectedAnswer,
   hint,
   selfRated,
+  spellingDiff,
   typedText,
 } from '../grading.js';
 import {
   afterRating,
   currentItem,
   exampleSentence,
+  hasHint,
   hasMore,
+  isSpelling,
   isTyped,
   moreOpenAfterCheck,
   moreOpenOnReveal,
@@ -84,6 +107,7 @@ import { Toast } from '../toast.js';
  * @typedef {import('../rating.js').Grade} Grade
  * @typedef {import('../grading.js').Check} Check
  * @typedef {import('../practice/card.js').AcceptState} AcceptState
+ * @typedef {import('../practice/card.js').ListenState} ListenState
  * @typedef {import('../session.js').AnswerDetails} AnswerDetails
  * @typedef {{ itemId: number, grade: Grade, id: string, details: AnswerDetails | null }} PendingRating
  * @typedef {{ ok: false, status: number, code: string, message: string }} Failure
@@ -92,12 +116,12 @@ import { Toast } from '../toast.js';
 /** Keyboard shortcuts listed in the help panel (design §7.3). */
 const SHORTCUTS = [
   ['Space / Enter', 'show the answer · next'],
-  ['Enter', 'Produce: check · accept the suggested grade'],
+  ['Enter', 'Produce, Spelling: check · accept the suggested grade'],
   ['H', 'Produce: hint (outside the answer field)'],
   ['1 – 5', 'rate (1 = best)'],
   ['U', 'undo the last rating'],
   ['M', 'more: note, forms, sentences'],
-  ['S / R', 'speak sentence / word'],
+  ['S / R', 'speak sentence / word (Spelling: R or ▶ replays the word)'],
   ['E', 'word detail'],
   ['Esc', 'close the help · pause the block'],
   ['?', 'this help'],
@@ -206,7 +230,7 @@ export function renderPractice(root, isCurrent) {
    *           phaseKey: string | null, pending: PendingRating | null, unsure: (PendingRating & { why: string }) | null,
    *           settings: import('../settings.js').Settings, revealTap: { x: number, y: number, t: number } | null,
    *           chosen: Grade | null, typed: string, hintShown: boolean, check: Check | null,
-   *           accept: AcceptState | null, typedNote: string }} */
+   *           accept: AcceptState | null, typedNote: string, listen: ListenState }} */
   const state = {
     session: null,
     item: null,
@@ -232,6 +256,8 @@ export function renderPractice(root, isCurrent) {
     check: null,
     accept: null,
     typedNote: '',
+    // Spelling: where the question's sound stands.
+    listen: 'waiting',
   };
   /** Check results of this visit by item (undo returns to the checked answer). */
   /** @type {Map<number, Check>} */
@@ -456,10 +482,19 @@ export function renderPractice(root, isCurrent) {
     }
   };
 
+  /**
+   * The ▶ controls of `what` on screen (a Spelling question has two: ▶
+   * Listen on the card and ▶ next to the answer field).
+   *
+   * @param {'sentence' | 'word'} what
+   */
+  const playButtons = (what) => [...screen.querySelectorAll(`button.play-${what}`)];
+
   /** @param {import('../clips.js').WordClips} info */
   const markApproximate = (info) => {
-    const word = body.querySelector('button.play-word');
-    if (word && info.enabled && info.word.approximate && !word.hasAttribute('data-approximate')) {
+    if (!info.enabled || !info.word.approximate) return;
+    for (const word of playButtons('word')) {
+      if (word.hasAttribute('data-approximate')) continue;
       word.setAttribute('data-approximate', '');
       word.setAttribute('title', `${word.getAttribute('title') ?? 'Play word'} — approximate pronunciation`);
     }
@@ -469,17 +504,18 @@ export function renderPractice(root, isCurrent) {
    * Speak `text` with the browser (the fallback, R-41).
    *
    * @param {string} text
-   * @param {Element | null} button
+   * @param {Element[]} buttons
    */
-  const speakFallback = (text, button) => {
+  const speakFallback = (text, buttons) => {
     // Never two sounds at once: a clip still playing (another button's)
     // stops before the browser speaks.
     stopClip();
     const result = speak(text, { voice: state.settings.voice, speed: state.settings.speed }, {
-      onStart: () => button?.classList.add('playing'),
-      onEnd: () => button?.classList.remove('playing'),
+      onStart: () => buttons.forEach((b) => b.classList.add('playing')),
+      onEnd: () => buttons.forEach((b) => b.classList.remove('playing')),
     });
     afterSpeak(result);
+    return result;
   };
 
   /**
@@ -494,35 +530,98 @@ export function renderPractice(root, isCurrent) {
    * @param {boolean} [clipOnly]
    */
   const play = (text, what, sentenceId, clipOnly = false) => {
-    const button = body.querySelector(`button.play-${what}`);
+    const buttons = playButtons(what);
     const item = state.item;
     const clip = item ? clipFor(clips.get(item.word.id), what, sentenceId) : null;
     if (!clip || clip.url === null) {
-      if (!clipOnly) speakFallback(text, button);
+      if (!clipOnly) spoken(speakFallback(text, buttons));
       return;
     }
     stopSpeaking();
-    button?.classList.remove('failed');
-    button?.classList.add('loading');
+    buttons.forEach((b) => b.classList.remove('failed'));
+    buttons.forEach((b) => b.classList.add('loading'));
     playClip(clip.url, state.settings.speed === '0.75' ? 0.75 : 1, {
       onStart: () => {
-        button?.classList.remove('loading');
-        button?.classList.add('playing');
+        buttons.forEach((b) => b.classList.remove('loading'));
+        buttons.forEach((b) => b.classList.add('playing'));
+        if (what === 'word') heard();
       },
-      onEnd: () => button?.classList.remove('loading', 'playing'),
+      onEnd: () => buttons.forEach((b) => b.classList.remove('loading', 'playing')),
       onFail: () => {
-        button?.classList.remove('loading', 'playing');
-        button?.classList.add('failed');
-        setTimeout(() => button?.classList.remove('failed'), 2_000);
-        if (!clipOnly) speakFallback(text, button);
+        buttons.forEach((b) => b.classList.remove('loading', 'playing'));
+        buttons.forEach((b) => b.classList.add('failed'));
+        setTimeout(() => buttons.forEach((b) => b.classList.remove('failed')), 2_000);
+        if (!clipOnly) spoken(speakFallback(text, buttons));
       },
+    });
+  };
+
+  /**
+   * Where the Spelling question's sound stands now (shown under ▶ Listen).
+   *
+   * @param {ListenState} listen
+   */
+  const setListen = (listen) => {
+    if (state.listen === listen) return;
+    state.listen = listen;
+    if (state.phase === 'question' && state.item && isSpelling(state.item)) renderBody();
+  };
+  /** The word's sound started: the Spelling question has been heard. */
+  const heard = () => {
+    if (state.phase === 'question' && state.item && isSpelling(state.item)) setListen('heard');
+  };
+  /**
+   * What the browser's speech did for the word: a Spelling question with
+   * no English voice on this device falls back to its Czech cue.
+   *
+   * @param {import('../speech.js').SpeakResult} result
+   */
+  const spoken = (result) => {
+    if (result === 'speaking') heard();
+    else if (state.phase === 'question' && state.item && isSpelling(state.item)) setListen('none');
+  };
+
+  /**
+   * The Spelling question plays its word by itself (design §7.4): the
+   * recorded clip, once its address has arrived, through the shared media
+   * element — which an earlier tap unlocked on iOS. Where the browser still
+   * refuses, ▶ Listen is marked for a tap; without a clip the browser's
+   * speech waits for that tap (it may not start by itself); with neither
+   * the Czech cue is all there is.
+   *
+   * @param {Item} item
+   */
+  const autoplayPrompt = (item) => {
+    const still = () => state.item?.item_id === item.item_id && state.phase === 'question';
+    void clipsFor(item.word.id).then((info) => {
+      clips.set(item.word.id, info);
+      if (!still()) return;
+      const clip = clipFor(info, 'word', null);
+      if (!clip || clip.url === null) {
+        setListen(speechOk ? 'tap' : 'none');
+        return;
+      }
+      setListen('playing');
+      const buttons = playButtons('word');
+      stopSpeaking();
+      playClip(clip.url, state.settings.speed === '0.75' ? 0.75 : 1, {
+        onStart: () => {
+          buttons.forEach((b) => b.classList.add('playing'));
+          heard();
+        },
+        onEnd: () => playButtons('word').forEach((b) => b.classList.remove('playing')),
+        onFail: () => {
+          playButtons('word').forEach((b) => b.classList.remove('playing'));
+          if (still() && state.listen !== 'heard') setListen('tap');
+        },
+      });
     });
   };
 
   const speakSentence = () => {
     const item = state.item;
     if (!item || state.phase === 'complete') return;
-    // A Produce question never plays anything: it would say the answer.
+    // A typed question plays no sentence: it would say the answer.
     if (state.phase === 'question' && isTyped(item)) return;
     const sentence =
       item.card.format === 'sentence' && item.sentence ? item.sentence : state.phase === 'question' ? null : exampleSentence(item);
@@ -532,7 +631,8 @@ export function renderPractice(root, isCurrent) {
   const speakWord = () => {
     const item = state.item;
     if (!item || state.phase === 'complete') return;
-    if (state.phase === 'question' && isTyped(item)) return;
+    // A Produce question plays nothing; a Spelling question is the word's sound.
+    if (state.phase === 'question' && isTyped(item) && !isSpelling(item)) return;
     // On the question side of a sentence card only the sentence plays.
     if (state.phase === 'question' && item.card.format === 'sentence' && item.sentence) return;
     play(wordSpeech(item.word), 'word', null);
@@ -634,10 +734,15 @@ export function renderPractice(root, isCurrent) {
       return;
     }
     if (state.phase === 'question') {
-      mount(body, isTyped(item) ? produceQuestion(item) : questionView(item, audio));
+      if (isSpelling(item)) mount(body, spellingQuestion(item, { onListen: speakWord, listen: state.listen }));
+      else mount(body, isTyped(item) ? produceQuestion(item) : questionView(item, audio));
       return;
     }
     const check = isTyped(item) ? state.check : null;
+    /** @type {Node | null} */
+    let lead = null;
+    if (check && isSpelling(item)) lead = spellingResult(item, check);
+    else if (check) lead = checkResult(item, check, { state: state.accept, onAccept: () => void acceptTyped() });
     mount(
       body,
       answerView(item, {
@@ -645,7 +750,7 @@ export function renderPractice(root, isCurrent) {
         moreOpen: state.moreOpen,
         showMore: hasMore(item),
         onToggleMore: () => toggleMore(true),
-        lead: check ? checkResult(item, check, { state: state.accept, onAccept: () => void acceptTyped() }) : null,
+        lead,
       }),
       state.phase === 'answer' && !state.unsure && state.legendAlways && !state.helpOpen ? legendLine() : null,
     );
@@ -673,24 +778,40 @@ export function renderPractice(root, isCurrent) {
     armGuard();
   };
 
-  /** The answer field, Check, Hint, I don't know and "I'll just rate myself". */
+  /**
+   * The answer field, Check, Hint (Produce), I don't know and "I'll just
+   * rate myself"; a Spelling card has ▶ next to the field instead of the
+   * hint, in reach above the on-screen keyboard.
+   */
   const drawTypedQuestion = () => {
     const hadFocus = document.activeElement === answerInput;
     const item = state.item;
+    const spelling = item !== null && isSpelling(item);
+    answerInput.placeholder = spelling ? 'Type the word you hear' : 'Type the English word';
+    answerInput.setAttribute('aria-label', spelling ? 'Your answer: spell the word you hear' : 'Your answer: the English word for the blank');
     mount(
       bottomContent,
-      state.hintShown && item ? typedHint(hint(expectedAnswer(item))) : null,
+      state.hintShown && item && hasHint(item) ? typedHint(hint(expectedAnswer(item))) : null,
       h(
         'div',
         { class: 'answer-row' },
+        spelling
+          ? h(
+              'button',
+              { type: 'button', class: 'play play-word replay', 'aria-label': 'Play the word again', title: 'Play the word again', 'data-testid': 'replay', onclick: () => speakWord() },
+              h('span', { 'aria-hidden': 'true' }, '▶'),
+            )
+          : null,
         answerInput,
         h('button', { type: 'button', class: 'primary check-button guarded', 'data-guarded': true, 'data-testid': 'check', onclick: () => checkAnswer() }, 'Check'),
       ),
       state.typedNote ? h('p', { class: 'typed-note', role: 'status', 'data-testid': 'typed-note' }, state.typedNote) : null,
       h(
         'div',
-        { class: 'typed-actions' },
-        h('button', { type: 'button', class: 'guarded', 'data-guarded': true, 'data-testid': 'hint-button', disabled: state.hintShown, title: 'Hint: first letter and letter count (H)', onclick: () => showHint() }, 'Hint'),
+        { class: `typed-actions${spelling ? ' two' : ''}` },
+        spelling
+          ? null
+          : h('button', { type: 'button', class: 'guarded', 'data-guarded': true, 'data-testid': 'hint-button', disabled: state.hintShown, title: 'Hint: first letter and letter count (H)', onclick: () => showHint() }, 'Hint'),
         h('button', { type: 'button', class: 'guarded', 'data-guarded': true, 'data-testid': 'dont-know', onclick: () => giveUp() }, 'I don’t know'),
         h(
           'button',
@@ -760,10 +881,11 @@ export function renderPractice(root, isCurrent) {
   const resetTyped = (item) => {
     const draft = item && isTyped(item) ? loadDraft(item.item_id) : null;
     state.typed = draft?.typed ?? '';
-    state.hintShown = draft?.hint ?? false;
+    state.hintShown = item !== null && hasHint(item) && (draft?.hint ?? false);
     state.check = null;
     state.accept = null;
     state.typedNote = '';
+    state.listen = 'waiting';
     answerInput.value = state.typed;
   };
 
@@ -775,7 +897,8 @@ export function renderPractice(root, isCurrent) {
    * @returns {AcceptState | null}
    */
   const acceptStateFor = (item, check) => {
-    if (!canAddAccepted(check)) return null;
+    // A misspelling is never an accepted answer.
+    if (isSpelling(item) || !canAddAccepted(check)) return null;
     return acceptedItems.has(item.item_id) ? 'saved' : 'offer';
   };
 
@@ -823,6 +946,7 @@ export function renderPractice(root, isCurrent) {
     stopClip();
     render({ focus: true, scroll: true });
     loadClips();
+    if (state.item && state.phase === 'question' && isSpelling(state.item)) autoplayPrompt(state.item);
   };
 
   /**
@@ -892,6 +1016,10 @@ export function renderPractice(root, isCurrent) {
     // Closes the on-screen keyboard: the answer side needs the screen.
     answerInput.blur();
     render({ focus: true, scroll: true });
+    if (isSpelling(item)) {
+      announceSpelling(item, check);
+      return;
+    }
     const answer = expectedAnswer(item);
     if (check.verdict === 'correct') announce('Correct: ', h('span', { lang: 'en' }, answer), '.');
     else if (check.verdict === 'right_word') announce('Right word. Here it is: ', h('span', { lang: 'en' }, answer), '.');
@@ -900,7 +1028,21 @@ export function renderPractice(root, isCurrent) {
     else announce('The answer: ', h('span', { lang: 'en' }, answer), '.');
   };
 
-  /** May the Produce question act now (not the second tap of a double tap)? */
+  /**
+   * Tell a screen reader what the Spelling check found, the differences in
+   * words.
+   *
+   * @param {Item} item
+   * @param {Check} check
+   */
+  const announceSpelling = (item, check) => {
+    const word = h('span', { lang: 'en' }, item.word.headword);
+    if (check.match === 'exact') announce('Correct spelling: ', word, '.');
+    else if (check.match === 'none') announce('Not quite: ', diffSummary(spellingDiff(check.typed ?? '', item.word.headword)), '. The spelling is ', word, '.');
+    else announce('The spelling: ', word, '.');
+  };
+
+  /** May the typed question act now (not the second tap of a double tap)? */
   const typedQuestionReady = () => state.phase === 'question' && state.item !== null && isTyped(state.item) && advanceReady();
 
   const checkAnswer = () => {
@@ -914,7 +1056,11 @@ export function renderPractice(root, isCurrent) {
       announce(state.typedNote);
       return;
     }
-    showChecked(checkTyped(typed, answersFor(item, alsoAccepted.get(item.word.id)), state.hintShown));
+    showChecked(
+      isSpelling(item)
+        ? checkSpelling(typed, item.word.headword)
+        : checkTyped(typed, answersFor(item, alsoAccepted.get(item.word.id)), state.hintShown),
+    );
   };
 
   const giveUp = () => {
@@ -928,7 +1074,7 @@ export function renderPractice(root, isCurrent) {
   /** The hint: first letter and letter count (it lowers a match to 3). */
   const showHint = () => {
     const item = state.item;
-    if (state.phase !== 'question' || !item || !isTyped(item) || state.hintShown) return;
+    if (state.phase !== 'question' || !item || !hasHint(item) || state.hintShown) return;
     state.hintShown = true;
     saveDraft(item.item_id, { typed: answerInput.value, hint: true, check: null });
     renderBody();

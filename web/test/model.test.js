@@ -10,20 +10,24 @@ import {
   caption,
   currentItem,
   exampleSentence,
+  hasHint,
   hasMore,
+  isSpelling,
+  isTyped,
+  moreOpenAfterCheck,
   moreOpenOnReveal,
   plainText,
   progress,
   wordSpeech,
 } from '../js/practice/model.js';
 
-/** @param {Partial<{ answered: any, is_new: boolean, sentence: any, other_sentences: any[], word: any }>} o */
+/** @param {Partial<{ answered: any, is_new: boolean, sentence: any, other_sentences: any[], word: any, kind: string }>} o */
 function item(o = {}) {
   return /** @type {import('../js/session.js').Item} */ ({
     item_id: Math.floor(Math.random() * 1e9),
     origin: 'new',
     answered: o.answered ?? null,
-    card: { id: 1, kind: 'understand', format: 'sentence', is_new: o.is_new ?? false, is_repeat: false, leech_flagged: false, last_failed: false },
+    card: { id: 1, kind: o.kind ?? 'understand', format: 'sentence', is_new: o.is_new ?? false, is_repeat: false, leech_flagged: false, last_failed: false },
     word: o.word ?? { headword: 'test-word', speak: null, note: '', hint: null, grammar: null, forms: [], tag: null },
     sentence: o.sentence ?? null,
     other_sentences: o.other_sentences ?? [],
@@ -92,4 +96,22 @@ test('R-74 only emoji icons are shown; icon-set names are not', () => {
   assert.equal(displayIcon('✨'), '✨');
   assert.equal(displayIcon('book-open'), null);
   assert.equal(displayIcon(null), null);
+});
+
+test('R-58 Produce and Spelling are typed cards; only Produce has a hint', () => {
+  assert.deepEqual(
+    ['understand', 'produce', 'spelling'].map((kind) => [isTyped(item({ kind })), isSpelling(item({ kind })), hasHint(item({ kind }))]),
+    [
+      [false, false, false],
+      [true, false, true],
+      [true, true, false],
+    ],
+  );
+});
+
+test('R-58 a missed Spelling card keeps "More" closed: the diff and the spelling note come first', () => {
+  const word = { headword: 'test-word', note: 'A note.', hint: null, grammar: null, forms: [], tag: null };
+  assert.equal(moreOpenAfterCheck(item({ kind: 'produce', word }), 'none'), true);
+  assert.equal(moreOpenAfterCheck(item({ kind: 'spelling', word }), 'none'), false);
+  assert.equal(moreOpenAfterCheck(item({ kind: 'spelling', word }), 'dont_know'), false);
 });

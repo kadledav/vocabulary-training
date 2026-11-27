@@ -1835,6 +1835,156 @@ button.accept-typed {
   overflow-wrap: anywhere;
 }
 
+/* ── Spelling card (design §7.1 screen 3b, §6.8; R-58) ──────────────────── */
+
+.listen {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 1.5rem 0 1rem;
+}
+
+button.listen-big {
+  min-width: 9rem;
+  min-height: 3.5rem;
+  padding: 0 1.5rem;
+  font-size: 1.25rem;
+  font-weight: 600;
+  gap: 0.5rem;
+}
+
+/* The sound could not start by itself: the button asks for a tap — a
+   thicker ring and a label, and a slow pulse where motion is welcome. */
+button.listen-big.needs-tap {
+  border-width: 3px;
+  border-color: var(--accent);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  button.listen-big.needs-tap {
+    animation: listen-pulse 1.6s ease-in-out infinite;
+  }
+}
+
+@keyframes listen-pulse {
+  50% {
+    box-shadow: 0 0 0 0.4rem color-mix(in srgb, var(--accent) 35%, transparent);
+  }
+}
+
+.listen-status {
+  margin: 0;
+  min-height: 1.5em;
+  color: var(--muted);
+  text-align: center;
+}
+
+.listen-status.attention {
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* ▶ next to the answer field: in reach above the on-screen keyboard. */
+.answer-row button.replay {
+  min-height: 3rem;
+  min-width: 3rem;
+}
+
+.keyboard-tight .answer-row button.replay {
+  min-height: 2.5rem;
+  min-width: 2.5rem;
+}
+
+.typed-actions.two {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.spelled {
+  margin: 0.35rem 0 0;
+  font-size: 1.375rem;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+/* The letter diff: one column per letter — typed above, the word below,
+   a symbol under each difference (× wrong, + missing, − extra), colour on
+   top of that, never alone. Columns wrap on a narrow screen. */
+.spell-diff {
+  display: flex;
+  flex-wrap: wrap;
+  row-gap: 0.4rem;
+  margin: 0.5rem 0 0.25rem;
+  font-size: 1.25rem;
+}
+
+.diff-col {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  min-width: 1.1em;
+  padding: 0 0.05em;
+}
+
+.diff-col > span {
+  height: 1.75rem;
+  line-height: 1.75rem;
+}
+
+.diff-labels {
+  align-items: flex-end;
+  padding-right: 0.5rem;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.diff-mark {
+  font-size: 0.875rem;
+  font-weight: 700;
+}
+
+.diff-same .diff-correct {
+  color: var(--muted);
+}
+
+.diff-wrong .diff-typed,
+.diff-extra .diff-typed {
+  color: var(--rate-5);
+  text-decoration: line-through;
+  text-decoration-thickness: 2px;
+}
+
+.diff-wrong .diff-correct,
+.diff-missing .diff-correct {
+  color: var(--ok);
+  font-weight: 700;
+  text-decoration: underline;
+  text-decoration-thickness: 2px;
+}
+
+.diff-wrong .diff-mark,
+.diff-extra .diff-mark {
+  color: var(--rate-5);
+}
+
+.diff-missing .diff-mark {
+  color: var(--ok);
+}
+
+.diff-missing .diff-typed,
+.diff-extra .diff-correct {
+  color: var(--muted);
+}
+
+.diff-legend {
+  margin: 0;
+}
+
+.spelling-note {
+  margin: 0.5rem 0 0;
+  overflow-wrap: anywhere;
+}
+
 /* The suggested grade of a typed card: a ring around the button. */
 button.rate.suggested {
   box-shadow: 0 0 0 3px var(--bg), 0 0 0 5px var(--rate);
