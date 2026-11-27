@@ -118,3 +118,30 @@ export function moreNewCount(today, perDay) {
 export function dayDone(today, blockSize) {
   return today.active_session === null && nextBlock(today, blockSize).total === 0;
 }
+
+/**
+ * What Today says about Produce cards waiting for their first time (design
+ * §17 M8): how many wait, how many today's limit lets in, or that they are
+ * held back with new words while reviews pile up. `null` when there is
+ * nothing to say (or an older server sent no counts).
+ *
+ * @param {Today} today
+ * @returns {string | null}
+ */
+export function typedLine(today) {
+  const typed = today.new_typed;
+  const waiting = today.typed_waiting ?? 0;
+  if (!typed) return null;
+  if (waiting === 0) {
+    return typed.introduced_today > 0 ? `${plural(typed.introduced_today, 'Produce card')} practised for the first time today.` : null;
+  }
+  const cards = plural(waiting, 'Produce card');
+  const verb = waiting === 1 ? 'waits' : 'wait';
+  if (typed.paused) return `${cards} ${verb} for the first time — held back until you catch up on reviews.`;
+  const comingToday = Math.min(waiting, typed.quota);
+  if (comingToday === waiting) return `${cards} ${verb} for the first time — ${waiting === 1 ? 'it comes' : 'all come'} today.`;
+  if (comingToday === 0) {
+    return `${cards} ${verb} for the first time — today’s ${typed.per_day} are done (limit in Settings); more tomorrow.`;
+  }
+  return `${cards} ${verb} for the first time — ${comingToday} today (limit ${typed.per_day} a day), the rest on later days.`;
+}

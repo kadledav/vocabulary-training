@@ -1,20 +1,26 @@
 // @ts-check
 /**
- * DOM of an Understand item (research wireframes 2, 3, 2b): the question
- * side (sentence with the word highlighted, or the word alone) and the
- * answer side (Czech sentence, word strip, gloss, meaning, "More"). All
- * pack text is inserted as text (R-84) with its language marked.
+ * DOM of a practice item. Understand (research wireframes 2, 3, 2b): the
+ * question side (sentence with the word highlighted, or the word alone)
+ * and the answer side (Czech sentence, word strip, gloss, meaning,
+ * "More"). Produce (wireframes 4, 4b; R-56): the sentence with the word
+ * blanked and the Czech sentence as the cue — no audio, it would say the
+ * answer — and on the answer side the check result above the same answer
+ * view. All pack text is inserted as text (R-84) with its language marked.
  */
 
 import { h } from '../dom.js';
 import { markedText } from '../marked.js';
 import { displayIcon } from '../icon.js';
 import { caption, exampleSentence } from './model.js';
+import { expectedAnswer } from '../grading.js';
 
 /**
  * @typedef {import('../session.js').Item} Item
  * @typedef {import('../session.js').Sentence} Sentence
  * @typedef {{ speechOk: boolean, onSpeakSentence: () => void, onSpeakWord: () => void }} Audio
+ * @typedef {import('../grading.js').Check} Check
+ * @typedef {'offer' | 'saving' | 'saved' | 'failed'} AcceptState
  */
 
 /**
@@ -44,7 +50,7 @@ function modeLine(item) {
   return h(
     'p',
     { class: 'mode' },
-    h('span', { class: 'mode-name' }, 'Understand'),
+    h('span', { class: 'mode-name', 'data-testid': 'mode' }, item.card.kind === 'produce' ? 'Produce' : 'Understand'),
     item.card.is_new ? h('span', { class: 'badge badge-new' }, 'New') : null,
     item.card.is_repeat ? h('span', { class: 'badge' }, 'Again') : null,
   );
@@ -106,6 +112,122 @@ function wordStrip(item, audio) {
 }
 
 /**
+ * The English sentence with the target blanked (the word is the answer).
+ *
+ * @param {Sentence} sentence
+ */
+function clozeSentence(sentence) {
+  const text = caption(sentence);
+  return h(
+    'div',
+    { class: 'sentence-block' },
+    h(
+      'p',
+      { class: 'sentence cloze', lang: 'en', 'data-testid': 'cloze' },
+      sentence.en.pre,
+      h('span', { class: 'blank', role: 'img', 'aria-label': 'blank' }, '\u2009'),
+      sentence.en.post,
+    ),
+    text ? h('p', { class: 'caption' }, `— ${text}`) : null,
+  );
+}
+
+/**
+ * The question side of a Produce card: the blanked sentence and the Czech
+ * sentence as the cue (the matching Czech words highlighted); without a
+ * sentence, the Czech gloss. The hint (first letter and letter count)
+ * shows once asked for.
+ *
+ * @param {Item} item
+ * @param {{ pattern: string, letters: number } | null} hint
+ */
+export function produceQuestion(item, hint) {
+  const sentence = item.sentence;
+  return h(
+    'div',
+    { class: 'item item-question produce' },
+    modeLine(item),
+    sentence ? clozeSentence(sentence) : null,
+    sentence
+      ? czechSentence(sentence)
+      : h(
+          'div',
+          { class: 'cz-box', 'data-testid': 'gloss-cue' },
+          h('span', { class: 'cz-tag', 'aria-hidden': 'true' }, 'CZ'),
+          h('p', { class: 'sentence-cs', lang: 'cs' }, item.word.czech.join(', ')),
+        ),
+    hint
+      ? h(
+          'p',
+          { class: 'typed-hint', 'data-testid': 'hint' },
+          h('span', { class: 'muted' }, 'Hint: '),
+          h('span', { class: 'mono', lang: 'en' }, hint.pattern),
+          h('span', { class: 'muted' }, ` (${hint.letters} ${hint.letters === 1 ? 'letter' : 'letters'})`),
+        )
+      : null,
+  );
+}
+
+/**
+ * What the check found, above the answer of a typed card (wireframe 4b):
+ * ✓ Correct; ✗ Not quite with the typed answer right above the expected
+ * one in the same monospace layout (a one-letter slip is easy to see) and
+ * "Just a typo? Choose 3."; the answer after "I don't know"; nothing
+ * after "I'll just rate myself". A missed typed answer can be added to the
+ * accepted answers from here.
+ *
+ * @param {Item} item
+ * @param {Check} check
+ * @param {{ state: AcceptState | null, onAccept: () => void }} accept
+ */
+export function checkResult(item, check, accept) {
+  const answer = expectedAnswer(item);
+  if (check.match === 'skipped') return null;
+  if (check.match === 'exact') {
+    return h(
+      'div',
+      { class: 'check check-ok', 'data-testid': 'check-result', 'data-match': 'exact' },
+      h('p', { class: 'check-title' }, h('span', { 'aria-hidden': 'true' }, '✓ '), 'Correct', check.hintUsed ? ' (with the hint)' : ''),
+    );
+  }
+  if (check.match === 'dont_know') {
+    return h(
+      'div',
+      { class: 'check check-miss', 'data-testid': 'check-result', 'data-match': 'dont_know' },
+      h('p', { class: 'check-title' }, 'The answer: ', h('span', { class: 'mono', lang: 'en' }, answer)),
+    );
+  }
+  /** @type {Node | null} */
+  let acceptLine = null;
+  if (accept.state === 'offer' || accept.state === 'failed') {
+    acceptLine = h(
+      'button',
+      { type: 'button', class: 'accept-typed', 'data-testid': 'accept-typed', onclick: accept.onAccept },
+      `Also accept “${check.typed}” next time`,
+    );
+  } else if (accept.state === 'saving') {
+    acceptLine = h('p', { class: 'muted small', role: 'status' }, 'Adding…');
+  } else if (accept.state === 'saved') {
+    acceptLine = h('p', { class: 'muted small', role: 'status', 'data-testid': 'accepted-note' }, `“${check.typed}” will be accepted next time.`);
+  }
+  return h(
+    'div',
+    { class: 'check check-miss', 'data-testid': 'check-result', 'data-match': 'none' },
+    h('p', { class: 'check-title' }, h('span', { 'aria-hidden': 'true' }, '✗ '), 'Not quite'),
+    h(
+      'dl',
+      { class: 'typed-vs' },
+      h('dt', {}, 'you typed:'),
+      h('dd', { class: 'mono', lang: 'en', 'data-testid': 'typed' }, check.typed ?? ''),
+      h('dt', {}, 'answer:'),
+      h('dd', { class: 'mono', lang: 'en', 'data-testid': 'expected' }, answer),
+    ),
+    h('p', { class: 'muted small' }, 'Just a typo? Choose 3.'),
+    acceptLine,
+  );
+}
+
+/**
  * The question side.
  *
  * @param {Item} item
@@ -134,6 +256,7 @@ export function questionView(item, audio) {
  * @param {Item} item
  */
 export function criterion(item) {
+  if (item.card.kind === 'produce') return 'Type the English word for the blank: the Czech sentence is your cue.';
   return item.card.format === 'sentence' && item.sentence
     ? 'Rate the highlighted word: would you have understood it here, without help?'
     : 'Rate the word: would you have known what it means, without help?';
@@ -207,10 +330,12 @@ function moreContent(item, shown) {
  * The answer side.
  *
  * @param {Item} item
- * @param {{ audio: Audio, moreOpen: boolean, onToggleMore: () => void, showMore: boolean }} options
+ * @param {{ audio: Audio, moreOpen: boolean, onToggleMore: () => void, showMore: boolean, lead?: Node | null }} options
+ *   `lead`: shown first (a typed card's check result)
  */
-export function answerView(item, { audio, moreOpen, onToggleMore, showMore }) {
-  const sentenceFormat = item.card.format === 'sentence' && item.sentence !== null;
+export function answerView(item, { audio, moreOpen, onToggleMore, showMore, lead = null }) {
+  // A Produce card's answer shows its sentence like a sentence card.
+  const sentenceFormat = (item.card.format === 'sentence' || item.card.format === 'cloze') && item.sentence !== null;
   const example = sentenceFormat ? item.sentence : exampleSentence(item);
   const toggle = showMore
     ? h(
@@ -229,6 +354,7 @@ export function answerView(item, { audio, moreOpen, onToggleMore, showMore }) {
     'div',
     { class: `item item-answer${sentenceFormat ? '' : ' word-only'}` },
     modeLine(item),
+    lead,
     sentenceFormat && example ? englishSentence(example, audio, true) : null,
     sentenceFormat && example ? czechSentence(example) : null,
     wordStrip(item, audio),

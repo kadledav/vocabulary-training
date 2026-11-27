@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { busyAnswer, busyWaitMs } from '../js/api.js';
-import { blockLabel, blockPreview, dayDone, dueTomorrow, moreNewCount, newWaiting, pausedForBacklog } from '../js/day-plan.js';
+import { blockLabel, blockPreview, dayDone, dueTomorrow, moreNewCount, newWaiting, pausedForBacklog, typedLine } from '../js/day-plan.js';
 import { describePointer } from '../js/import-issues.js';
 import { RATING_GUARD_MS, ratingGuardOpen, sameSpotTap } from '../js/rating.js';
 
@@ -95,4 +95,30 @@ test('busy servers are asked again after Retry-After; lock-outs and timeouts are
   assert.equal(busyWaitMs('5', 0), 5000);
   assert.equal(busyWaitMs('60', 0), 10_000);
   assert.equal(busyWaitMs(null, 1), 4000);
+});
+
+test('R-52 Today says how many Produce cards wait for their first time and how many come today', () => {
+  /** @param {number} waiting @param {Partial<import('../js/session.js').TypedAllowance>} [typed] */
+  const line = (waiting, typed = {}) =>
+    typedLine(
+      today({
+        typed_waiting: waiting,
+        new_typed: { per_day: 10, introduced_today: 0, left_today: 10, quota: 10, paused: false, ...typed },
+      }),
+    );
+  assert.equal(line(0), null);
+  assert.equal(line(0, { introduced_today: 3 }), '3 Produce cards practised for the first time today.');
+  assert.equal(line(1), '1 Produce card waits for the first time — it comes today.');
+  assert.equal(line(4), '4 Produce cards wait for the first time — all come today.');
+  assert.equal(line(90), '90 Produce cards wait for the first time — 10 today (limit 10 a day), the rest on later days.');
+  assert.equal(
+    line(90, { introduced_today: 4, left_today: 6, quota: 6 }),
+    '90 Produce cards wait for the first time — 6 today (limit 10 a day), the rest on later days.',
+  );
+  assert.equal(
+    line(80, { introduced_today: 10, left_today: 0, quota: 0 }),
+    '80 Produce cards wait for the first time — today’s 10 are done (limit in Settings); more tomorrow.',
+  );
+  assert.equal(line(5, { paused: true, quota: 0 }), '5 Produce cards wait for the first time — held back until you catch up on reviews.');
+  assert.equal(typedLine(today()), null, 'an older server without the counts');
 });

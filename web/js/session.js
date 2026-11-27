@@ -7,6 +7,13 @@
 import { getJson, postJson } from './api.js';
 
 /**
+ * How a typed card was answered (design §6.8), sent with its rating.
+ *
+ * @typedef {{ typedAnswer: string | null, answerMatch: import('./grading.js').AnswerMatch, hintUsed: boolean,
+ *             suggestedGrade: number | null }} AnswerDetails
+ */
+
+/**
  * @typedef {import('./marked.js').TextParts} TextParts
  * @typedef {{ id: number, en: TextParts, cs: TextParts, origin: string, location: string | null,
  *             source_id: number | null, source_title: string | null }} Sentence
@@ -14,7 +21,7 @@ import { getJson, postJson } from './api.js';
  *             grammar: string | null, czech: string[], meaning: string, forms: { form: string, common: boolean }[],
  *             note: string, hint: string | null, icon: string | null, spelling_note: string | null,
  *             confusables: string[], tag: { kind: string, text: string | null } | null }} Word
- * @typedef {{ id: number, kind: string, format: 'sentence' | 'word_only' | 'cloze' | 'spelling',
+ * @typedef {{ id: number, kind: 'understand' | 'produce' | 'spelling', format: 'sentence' | 'word_only' | 'cloze' | 'spelling',
  *             is_new: boolean, is_repeat: boolean, leech_flagged: boolean, last_failed: boolean }} ItemCard
  * @typedef {{ item_id: number, origin: 'due' | 'new' | 'repeat', answered: { review_id: number, raw_grade: number } | null,
  *             card: ItemCard, word: Word, sentence: Sentence | null, other_sentences: Sentence[],
@@ -33,12 +40,15 @@ import { getJson, postJson } from './api.js';
  *             word_count: number }} SourceSummary
  * @typedef {{ per_day: number, introduced_today: number, left_today: number, quota: number, paused: boolean,
  *             backlog: boolean, anyway_today: boolean, due_now: number }} NewAllowance
+ * @typedef {{ per_day: number, introduced_today: number, left_today: number, quota: number,
+ *             paused: boolean }} TypedAllowance
  * @typedef {{ study_day: string, scope_source_id: number | null, due_now: number, relearning: number,
  *             forecast: { day: string, due: number }[], new_available: number, new_words: NewAllowance,
  *             active_session: { id: string, scope_source_id: number | null, block_no: number, total: number,
  *             remaining: number } | null, finished_blocks: { total: number, today: number },
  *             sources: SourceSummary[], new_waiting?: number, new_left_today?: number,
- *             new_paused_reason?: 'backlog' | null, extra_available?: number, due_tomorrow?: number }} Today
+ *             new_paused_reason?: 'backlog' | null, extra_available?: number, due_tomorrow?: number,
+ *             new_typed?: TypedAllowance, typed_waiting?: number }} Today
  * @typedef {'start' | 'continue' | 'extra' | 'more_new'} StartKind
  * @typedef {import('./api.js').ApiResult<any>} AnyResult
  */
@@ -100,19 +110,41 @@ export function takeStarted() {
 }
 
 /**
+ * Post one rating; a typed card (Produce) also sends how it was answered.
+ *
  * @param {string} sessionId
- * @param {{ clientReviewId: string, itemId: number, grade: number, durationMs: number }} review
+ * @param {{ clientReviewId: string, itemId: number, grade: number, durationMs: number, details?: AnswerDetails | null }} review
  * @returns {Promise<import('./api.js').ApiResult<RateResult>>}
  */
-export function postRating(sessionId, { clientReviewId, itemId, grade, durationMs }) {
-  return postJson(`/api/sessions/${encodeURIComponent(sessionId)}/reviews`, {
+export function postRating(sessionId, { clientReviewId, itemId, grade, durationMs, details = null }) {
+  /** @type {Record<string, unknown>} */
+  const body = {
     client_review_id: clientReviewId,
     item_id: itemId,
     raw_grade: grade,
-    hint_used: false,
+    hint_used: details?.hintUsed ?? false,
     duration_ms: Math.max(0, Math.min(Math.round(durationMs), 3_600_000)),
     client_ts: new Date().toISOString(),
-  });
+  };
+  if (details) {
+    body.answer_match = details.answerMatch;
+    if (details.typedAnswer !== null) body.typed_answer = details.typedAnswer;
+    if (details.suggestedGrade !== null) body.suggested_grade = details.suggestedGrade;
+  }
+  return postJson(`/api/sessions/${encodeURIComponent(sessionId)}/reviews`, body);
+}
+
+/**
+ * "Also accept … next time": add the owner's typed answer to the word's
+ * accepted answers (stored as his own, design §6.8; the same call as in
+ * word detail).
+ *
+ * @param {number} wordId
+ * @param {string} value
+ * @returns {Promise<AnyResult>}
+ */
+export function acceptAnswer(wordId, value) {
+  return postJson(`/api/words/${encodeURIComponent(wordId)}/items`, { kind: 'accepted', value });
 }
 
 /**

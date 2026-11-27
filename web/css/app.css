@@ -1655,3 +1655,150 @@ button.danger.primary {
 .danger-zone {
   margin-bottom: 5rem;
 }
+
+/* ── Produce card (design §7.1 screen 3, research wireframes 4/4b) ─────── */
+
+/* The on-screen keyboard covers the bottom of the layout viewport; the bar
+   with the answer field moves up by that much (set from visualViewport). */
+.practice-bottom {
+  bottom: var(--keyboard-inset, 0px);
+}
+
+.mono {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+/* The blank in the sentence: a line the width of a short word. */
+.cloze .blank {
+  display: inline-block;
+  min-width: 4.5em;
+  margin: 0 0.15em;
+  border-bottom: 2px solid var(--accent);
+}
+
+.typed-hint {
+  margin: 0.5rem 0 0;
+  font-size: 1.125rem;
+}
+
+.typed-hint .mono {
+  letter-spacing: 0.05em;
+  white-space: pre-wrap;
+}
+
+.answer-row {
+  display: flex;
+  gap: 0.5rem;
+}
+
+/* 16 px at least, or iOS zooms the page when the field gets focus. */
+input.answer-input {
+  flex: 1;
+  min-width: 0;
+  min-height: 3rem;
+  font-size: max(1.125rem, 16px);
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  padding: 0.5rem 0.75rem;
+}
+
+button.check-button {
+  flex: none;
+  min-height: 3rem;
+  min-width: 5.5rem;
+  font-weight: 600;
+}
+
+.typed-note {
+  margin: 0.35rem 0 0;
+  font-size: 0.875rem;
+  color: var(--rate-3);
+}
+
+.typed-actions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.375rem;
+  margin-top: 0.5rem;
+}
+
+.typed-actions button {
+  min-width: 0;
+  padding: 0.25rem 0.375rem;
+  font-size: 0.875rem;
+  border-color: var(--border);
+  color: var(--text);
+}
+
+.typed-actions button[data-testid="hint-button"]:disabled {
+  color: var(--muted);
+}
+
+/* What the check found: colour, symbol and words (not colour alone). */
+.check {
+  margin: 0 0 0.75rem;
+  padding: 0.6rem 0.9rem;
+  border-radius: var(--radius);
+  background: var(--surface);
+  border-left: 0.3rem solid var(--border);
+}
+
+.check-ok {
+  border-left-color: var(--ok);
+}
+
+.check-miss {
+  border-left-color: var(--rate-4);
+}
+
+.check-title {
+  margin: 0;
+  font-size: 1.125rem;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.check-ok .check-title {
+  color: var(--ok);
+}
+
+/* "you typed" right above "answer", in the same monospace columns, so a
+   one-letter slip is easy to see. */
+dl.typed-vs {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 0.15rem 0.6rem;
+  margin: 0.4rem 0;
+  font-size: 1.125rem;
+}
+
+dl.typed-vs dt {
+  color: var(--muted);
+  font-size: 0.875rem;
+  align-self: center;
+}
+
+dl.typed-vs dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.check p.small {
+  margin: 0.25rem 0 0;
+}
+
+button.accept-typed {
+  margin-top: 0.4rem;
+  padding: 0.35rem 0.75rem;
+  min-height: 2.75rem;
+  text-align: left;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+/* The suggested grade of a typed card: a ring around the button. */
+button.rate.suggested {
+  box-shadow: 0 0 0 3px var(--bg), 0 0 0 5px var(--rate);
+}

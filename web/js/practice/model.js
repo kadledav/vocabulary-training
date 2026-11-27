@@ -86,6 +86,27 @@ export function moreOpenOnReveal(item) {
 }
 
 /**
+ * Is the item a typed card (Produce: the owner types the English word for
+ * the blanked sentence, R-56)?
+ *
+ * @param {Item} item
+ */
+export function isTyped(item) {
+  return item.card.kind === 'produce';
+}
+
+/**
+ * Is "More" open when a typed card's answer shows? After a miss or "I
+ * don't know" the note opens (research §3); a correct answer moves on.
+ *
+ * @param {Item} item
+ * @param {import('../grading.js').AnswerMatch} match
+ */
+export function moreOpenAfterCheck(item, match) {
+  return hasMore(item) && (match === 'none' || match === 'dont_know');
+}
+
+/**
  * After a rating: a fail (4/5) keeps the answer on screen with "More" open
  * until Next (research §3, §9); a pass moves on at once.
  *

@@ -10,7 +10,7 @@
  * when the connection comes back.
  */
 
-import { newWaiting, pausedForBacklog, plural } from '../day-plan.js';
+import { newWaiting, pausedForBacklog, plural, typedLine } from '../day-plan.js';
 import { h, keepFocus, mount } from '../dom.js';
 import { begin, nextSteps } from '../next-steps.js';
 import { takeNotice } from '../notice.js';
@@ -170,6 +170,9 @@ export function renderToday(root, isCurrent) {
         ),
       );
     }
+
+    const typed = typedLine(today);
+    if (typed) newLines.push(h('p', { class: 'muted', 'data-testid': 'typed-waiting' }, typed));
 
     keepFocus(view, () =>
       mount(
