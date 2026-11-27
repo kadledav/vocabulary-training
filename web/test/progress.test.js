@@ -35,14 +35,14 @@ test('R-72 retention says the measured share against the aim in words', () => {
   const r = { kind: /** @type {const} */ ('understand'), tested: 120, passed: 104, measured: 104 / 120, target: 0.9, few: false };
   assert.equal(
     retentionText(r),
-    'Understand: you remembered 104 of 120 cards (87%); the app aims for 90%. That is below the aim.',
+    'Understand: you remembered the word in 104 of 120 tests (87%); the app aims for 90%. That is below the aim.',
   );
   assert.match(retentionText({ ...r, passed: 109, measured: 109 / 120 }), /That is on target\.$/);
   assert.match(retentionText({ ...r, passed: 118, measured: 118 / 120 }), /That is above the aim\.$/);
-  assert.match(retentionText({ ...r, tested: 7, passed: 5, measured: 5 / 7, few: true }), /Too few reviews yet to compare\.$/);
+  assert.match(retentionText({ ...r, tested: 7, passed: 5, measured: 5 / 7, few: true }), /Too few tests yet to compare\.$/);
   assert.equal(
     retentionText({ kind: 'produce', tested: 0, passed: 0, measured: null, target: null, few: true }),
-    'Produce: no reviews of earlier-seen cards in these 30 days.',
+    'Produce: no tests in these 30 days.',
   );
   assert.equal(percentText(0.926), '93%');
 });

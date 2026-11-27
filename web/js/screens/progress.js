@@ -275,7 +275,7 @@ export function renderProgress(root, isCurrent) {
         h(
           'p',
           { class: 'muted small' },
-          `Counted over the last 30 days: every review of a card you had last seen on an earlier day. Remembered = rated 1–3. The aim is what the schedule plans for (higher for more useful words); the tick on each bar marks it.`,
+          `Counted over the last 30 days. A test is one review of a card you had last seen on an earlier day; a card that came up often counts once for each time. Remembered = rated 1–3. The aim is what the schedule plans for (higher for more useful words), worked out from each word's usefulness and goal as they are now, not as they were at each test; the tick on each bar marks it.`,
         ),
         p.retention.kinds.length === 0
           ? h('p', { class: 'muted' }, 'Nothing to measure yet.')

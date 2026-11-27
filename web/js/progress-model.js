@@ -70,10 +70,11 @@ export function percentText(share) {
 export function retentionText(r) {
   const label = kindLabel(r.kind);
   if (r.tested === 0 || r.measured === null || r.target === null) {
-    return `${label}: no reviews of earlier-seen cards in these 30 days.`;
+    return `${label}: no tests in these 30 days.`;
   }
-  const line = `${label}: you remembered ${r.passed} of ${plural(r.tested, 'card')} (${percentText(r.measured)}); the app aims for ${percentText(r.target)}.`;
-  if (r.few) return `${line} Too few reviews yet to compare.`;
+  // Tests, not cards: a card due often is tested several times.
+  const line = `${label}: you remembered the word in ${r.passed} of ${plural(r.tested, 'test')} (${percentText(r.measured)}); the app aims for ${percentText(r.target)}.`;
+  if (r.few) return `${line} Too few tests yet to compare.`;
   const gap = r.measured - r.target;
   if (Math.abs(gap) < 0.03) return `${line} That is on target.`;
   return gap < 0 ? `${line} That is below the aim.` : `${line} That is above the aim.`;

@@ -45,7 +45,7 @@ test('R-72 Progress shows each number with what it means', async ({ page, app, p
   await expect(book).toContainText('Reading position: Chapter 7');
   await expect(book).toContainText('4 words: 1 known, 1 familiar, 1 problem, 1 new.');
   await expect(page.getByTestId('retention-understand')).toContainText(
-    /^Understand: you remembered 1 of 2 cards \(50%\); the app aims for 9\d%\. Too few reviews yet to compare\.$/,
+    /^Understand: you remembered the word in 1 of 2 tests \(50%\); the app aims for 9\d%\. Too few tests yet to compare\.$/,
   );
   await expect(page.getByTestId('progress-activity')).toContainText('2 ratings and 1 new word.');
   // Charts are pictures of numbers that are also there as text.
