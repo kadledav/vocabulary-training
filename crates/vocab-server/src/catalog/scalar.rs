@@ -81,12 +81,39 @@ pub fn same(a: &Value, b: &Value) -> bool {
     }
 }
 
-pub fn to_sql(value: &Value) -> SqlValue {
+/// A JSON scalar as the SQL value of its column (`true` = 1).
+fn to_sql(value: &Value) -> SqlValue {
     match value {
         Value::Null => SqlValue::Null,
         Value::Bool(b) => SqlValue::Integer(i64::from(*b)),
         Value::Number(n) => n.as_i64().map_or(SqlValue::Null, SqlValue::Integer),
         Value::String(s) => SqlValue::Text(s.clone()),
         other => SqlValue::Text(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn r03_values_compare_as_the_merge_rule_says() {
+        assert!(same(&json!(" lull "), &json!("lull")));
+        assert!(same(&Value::Null, &json!("  ")), "blank = nothing stored");
+        assert!(same(&json!(7), &json!(7)));
+        assert!(!same(&json!(7), &json!(8)));
+        assert!(
+            !same(&json!("lull"), &json!("Lull")),
+            "case is a real change"
+        );
+        assert!(!same(&Value::Null, &json!("lull")));
+        assert!(is_empty(&Value::Null) && is_empty(&json!(" ")));
+        assert!(!is_empty(&json!(false)), "spelling false is a value");
+        assert_eq!(field("meaning"), Some("meaning"));
+        assert_eq!(field("headword"), None, "the identity is not a scalar");
+        assert_eq!(field("meaning; DROP TABLE word"), None);
+        assert_eq!(to_sql(&json!(true)), SqlValue::Integer(1));
     }
 }
