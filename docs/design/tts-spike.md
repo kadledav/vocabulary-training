@@ -358,3 +358,13 @@ protocol: anything else, also a partial line glued to the answer (which
 used to be skipped, so the request waited for the 600 s timeout), is an
 error at once.
 
+Two containers (app and TTS, 640m, `VOCAB_TTS_IDLE_SECONDS=30`): an import
+of 8 synthetic words with 3 sentences (32 clips); the TTS container
+restarted three times while a clip was being made (each time the request
+got `503 shutting_down` within 10 ms, the app waited 60 s); then its
+limit lowered to 150m (the engine process is killed while loading: four
+`503 engine_unavailable` in 200 s, one per minute, logged once by each
+side) and a second import of 16 clips; after the limit was restored the
+next try worked (42 s later). All 48 clips ready, none failed, no attempt
+and no crash counted on any of them.
+
